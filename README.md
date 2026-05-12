@@ -173,4 +173,4 @@ None are blockers for the Vue/Nuxt use case.
 
 ## License
 
-[MIT](./LICENSE). Take it, ship it, change it, sell it. Just don't sue me if you accidentally commit your `gate/data.json` to a public repo.
+[MIT](./LICENSE). Use it before you lose it. Just don't sue me if you accidentally commit your `gate/data.json` to a public repo.
