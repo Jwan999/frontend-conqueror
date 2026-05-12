@@ -144,17 +144,30 @@ No host-app auth integration required. The gate is the auth boundary.
 
 ---
 
+## Stack compatibility
+
+See [STACKS.md](./STACKS.md) for the full matrix of where this plugin works today, where it falls back, and what's tracked to lift each row up.
+
+Short version:
+
+- **Tier 1 (full Edit + TODO + Test):** Vue 3 + Vite, Nuxt 3/4, TS/JS object-literal i18n
+- **Tier 2 (Vue works, translations fall back):** vue-i18n JSON bundles, Laravel `lang/*.json`, Inertia + Vue
+- **Tier 3 (Test only — needs framework scanner):** React/Next, Svelte, Astro, Solid, Qwik
+- **Tier 4 (Test only — needs Laravel work):** Laravel + Blade, `lang/*.php`, Vue admin in Laravel apps
+- **Tier 5 (Test only by design):** Nova, Filament, Webflow, Shopify themes
+
 ## What it doesn't have (yet)
 
-Honest list:
+Honest list — all tracked, all linked from [STACKS.md](./STACKS.md):
 
-- **No magic-link email verification.** If a tester's email leaks, anyone who knows it can file issues from a known gate URL. v2 toggle: `requireMagicLink: true` with SMTP.
-- **No TOTP / 2FA** on the admin. Password is the only factor.
-- **No real-time mode-color sync** to running tabs. New colors appear on next page load.
-- **No JSON-based i18n scan** (Laravel `lang/en.json`, vue-i18n message bundles). Currently scans TS/JS object literals only.
-- **No source map for JSX/TSX/Svelte/Astro/Blade.** The annotation pass is Vue-only right now; other frameworks fall through to the v0 string-search fallback.
+- **No magic-link email verification.** Tracked in [#1](https://github.com/Jwan999/frontend-conqueror/issues/1).
+- **No TOTP / 2FA** on the admin. Tracked in [#2](https://github.com/Jwan999/frontend-conqueror/issues/2).
+- **No real-time mode-color sync** to running tabs. Tracked in [#3](https://github.com/Jwan999/frontend-conqueror/issues/3).
+- **No JSON-based i18n scan.** Tracked in [#4](https://github.com/Jwan999/frontend-conqueror/issues/4).
+- **No source map for JSX/TSX/Svelte/Astro.** Tracked in [#5](https://github.com/Jwan999/frontend-conqueror/issues/5).
+- **No Blade scanner or PHP-`lang` scanner.** Tracked in [#6](https://github.com/Jwan999/frontend-conqueror/issues/6).
 
-These are tracked. None are blockers for the use case above.
+None are blockers for the Vue/Nuxt use case.
 
 ---
 
