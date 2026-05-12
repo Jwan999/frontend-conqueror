@@ -1,0 +1,27 @@
+{
+  "name": "frontend-conqueror",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Edit text in your dev site. Drop TODOs from the browser. Let testers file Linear issues from production. Three modes, one overlay, no server lock-in.",
+  "license": "MIT",
+  "homepage": "https://github.com/jwan99/frontend-conqueror",
+  "workspaces": [
+    "plugin",
+    "agent",
+    "gate"
+  ],
+  "scripts": {
+    "agent": "node agent/server.js",
+    "gate": "node gate/server.js"
+  },
+  "keywords": [
+    "vite-plugin",
+    "nuxt",
+    "in-context-editing",
+    "i18n",
+    "linear",
+    "bug-reporting",
+    "qa",
+    "developer-tools"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "frontend-conqueror-agent",
+  "version": "0.3.0",
+  "private": true,
+  "description": "frontend-conqueror — Node WebSocket daemon. Applies overlay edits and TODO insertions to source files.",
+  "bin": {
+    "frontend-conqueror-agent": "server.js"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

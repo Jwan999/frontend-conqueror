@@ -1,0 +1,11 @@
+{
+  "name": "frontend-conqueror-plugin",
+  "version": "0.3.0",
+  "private": true,
+  "main": "index.js",
+  "type": "commonjs",
+  "description": "frontend-conqueror — Vite/Nuxt plugin that annotates templates and i18n usage so the overlay can edit, comment, or report-on source by exact byte range.",
+  "dependencies": {
+    "@babel/parser": "^7.25.0"
+  }
+}
