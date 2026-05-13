@@ -123,6 +123,10 @@ Open your dev site, press `Shift Shift`, pick a mode.
 
 ## Production deploy (Test mode only)
 
+> **Full step-by-step is in [DEPLOY.md](./DEPLOY.md)** — covers PM2, Docker, systemd, Caddy, nginx, plus per-stack wiring (Nuxt / Vite / Laravel-Blade). Copy-pasteable configs live in [examples/](./examples).
+
+Short summary:
+
 In production, only Test mode is reachable. The overlay is config-trimmed at load time so Edit and Dev TODO never appear in the palette, the agent WebSocket isn't attempted, and the i18n-map fetch is skipped.
 
 ```

@@ -1,0 +1,55 @@
+# docker-compose example: run the gate as a sidecar next to your app.
+#
+# Adapt the `app` service to your own image. The `gate` service is what's
+# specific to frontend-conqueror.
+
+services:
+  app:
+    # Your existing app — leave as-is.
+    image: my-app:latest
+    environment:
+      NODE_ENV: production
+      # Tell the app where the gate lives (publicly):
+      NUXT_PUBLIC_GATE_URL: https://gate.my-domain.com
+    ports:
+      - "3000:3000"
+
+  gate:
+    # The gate is zero-dependency, so we just need Node + the plugin source.
+    # Two common approaches:
+    #
+    #   (A) Mount node_modules from a build artifact:
+    #         image: node:22-alpine
+    #         command: node /app/node_modules/frontend-conqueror/gate/server.js
+    #         volumes:
+    #           - ./node_modules/frontend-conqueror:/app/node_modules/frontend-conqueror:ro
+    #
+    #   (B) Build a tiny image with just the gate:
+    #         FROM node:22-alpine
+    #         WORKDIR /app
+    #         RUN npm install github:Jwan999/frontend-conqueror#v0.4.0
+    #         CMD ["node", "node_modules/frontend-conqueror/gate/server.js"]
+    image: node:22-alpine
+    command: node /app/node_modules/frontend-conqueror/gate/server.js
+    volumes:
+      - ./node_modules/frontend-conqueror:/app/node_modules/frontend-conqueror:ro
+      - gate-data:/var/data
+    environment:
+      NODE_ENV: production
+      GATE_PORT: 54322
+      GATE_HOST: 0.0.0.0
+      GATE_PUBLIC_URL: https://gate.my-domain.com
+      GATE_PROJECT_NAME: my-app
+      GATE_DATA: /var/data/gate.json
+      # Set these in your .env file (not committed):
+      GATE_ADMIN_PASSWORD: ${GATE_ADMIN_PASSWORD}
+      GATE_JWT_SECRET: ${GATE_JWT_SECRET}
+    expose:
+      - "54322"
+    # If you don't have an external reverse proxy in this compose stack,
+    # you can publish the port directly. Most setups have an nginx/Caddy
+    # container in front; in that case, leave `ports` unmapped and use
+    # `expose` so only the proxy can reach it.
+
+volumes:
+  gate-data:

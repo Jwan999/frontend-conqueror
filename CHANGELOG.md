@@ -10,6 +10,25 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.4.1] — 2026-05-13
+
+### Added
+- **[DEPLOY.md](./DEPLOY.md)** — full step-by-step production deployment guide. Covers the gate-is-project-specific architecture, per-stack wiring (Nuxt / Vite / Laravel-Blade), three deploy targets (PM2 sidecar / Docker sidecar / systemd unit), reverse proxy (Caddy / nginx), first-time admin setup, and troubleshooting.
+- **[examples/](./examples)** directory with copy-pasteable, working config templates:
+  - `nuxt.config.example.js`, `vite.config.example.js`, `vite.config.laravel.example.js`
+  - `admin.blade.example.php` for Laravel views
+  - `ecosystem.config.example.cjs` for PM2
+  - `docker-compose.example.yml` for containerized deploys
+  - `frontend-conqueror-gate.service.example` for systemd
+  - `Caddyfile.example` + `nginx.example.conf` for reverse proxying
+  - `.env.example` for gate secrets
+
+### Changed
+- README now points at DEPLOY.md and examples/ instead of inlining a short production-deploy snippet.
+
+### Notes
+- No code changes; this is a docs + templates release. Adopters on v0.4.0 don't need to bump for functionality, but bumping picks up the examples.
+
 ## [0.4.0] — 2026-05-13
 
 ### Added
@@ -44,6 +63,7 @@ See [STACKS.md](./STACKS.md) for the full matrix.
 
 ---
 
-[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/Jwan999/frontend-conqueror/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Jwan999/frontend-conqueror/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Jwan999/frontend-conqueror/releases/tag/v0.3.0

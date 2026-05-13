@@ -1,0 +1,46 @@
+# systemd unit example for the frontend-conqueror gate.
+#
+# Save as: /etc/systemd/system/frontend-conqueror-gate.service
+# Then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now frontend-conqueror-gate
+
+[Unit]
+Description=frontend-conqueror gate (Test mode backend)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+
+# Adjust to wherever your app is installed:
+WorkingDirectory=/var/www/my-app
+ExecStart=/usr/bin/node node_modules/frontend-conqueror/gate/server.js
+
+# Environment. Secrets should live in EnvironmentFile, not here.
+Environment=NODE_ENV=production
+Environment=GATE_PORT=54322
+Environment=GATE_HOST=127.0.0.1
+Environment=GATE_PUBLIC_URL=https://gate.my-domain.com
+Environment=GATE_PROJECT_NAME=my-app
+Environment=GATE_DATA=/var/data/my-app-gate.json
+
+# Secrets — create this file with mode 600, owned by www-data:
+#   GATE_ADMIN_PASSWORD=...
+#   GATE_JWT_SECRET=...
+EnvironmentFile=/etc/frontend-conqueror-gate.env
+
+# Restart on crash, but back off so we don't spin.
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/data
+
+[Install]
+WantedBy=multi-user.target

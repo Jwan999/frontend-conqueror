@@ -1,0 +1,31 @@
+# Caddy v2 example: expose the gate at a public HTTPS hostname.
+#
+# Drop this into your Caddyfile (or include it from a sites-enabled dir).
+# Caddy auto-provisions a TLS cert via Let's Encrypt.
+
+gate.my-domain.com {
+    reverse_proxy 127.0.0.1:54322
+
+    # Optional: rate-limit if you're worried about scraping the login page.
+    # Requires the rate-limit Caddy plugin.
+    # @login path /<project-name>/login
+    # rate_limit @login {
+    #     events 30
+    #     period 1m
+    # }
+}
+
+# Optional: if you'd rather expose the gate at a subpath of your main domain
+# instead of a subdomain, use this pattern:
+#
+# my-domain.com {
+#     handle /__gate/* {
+#         uri strip_prefix /__gate
+#         reverse_proxy 127.0.0.1:54322
+#     }
+#     handle {
+#         reverse_proxy 127.0.0.1:3000   # your app
+#     }
+# }
+#
+# In that case, set GATE_PUBLIC_URL=https://my-domain.com/__gate.
