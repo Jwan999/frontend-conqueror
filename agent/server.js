@@ -3,11 +3,16 @@ const { WebSocketServer } = require('ws');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = 54321;
 const projectArg = process.argv[2];
+const portArg = process.argv[3];
+const PORT = portArg ? Number(portArg) : 54321;
 
 if (!projectArg) {
-  console.error('Usage: node server.js /path/to/project');
+  console.error('Usage: node server.js /path/to/project [port]');
+  process.exit(1);
+}
+if (Number.isNaN(PORT) || PORT <= 0) {
+  console.error(`Invalid port: ${portArg}`);
   process.exit(1);
 }
 

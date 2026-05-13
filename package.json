@@ -1,6 +1,6 @@
 {
   "name": "frontend-conqueror",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Edit text in your dev site. Drop TODOs from the browser. Let testers file Linear issues from production. Three modes, one overlay, no server lock-in.",
   "license": "MIT",
@@ -9,6 +9,23 @@
     "plugin",
     "agent",
     "gate"
+  ],
+  "exports": {
+    "./plugin": "./plugin/index.js",
+    "./agent": "./agent/server.js",
+    "./gate": "./gate/server.js",
+    "./overlay.js": "./overlay/overlay.js"
+  },
+  "files": [
+    "plugin",
+    "agent",
+    "gate",
+    "overlay",
+    "CHANGELOG.md",
+    "STACKS.md",
+    "CHECKLIST.md",
+    "LICENSE",
+    "README.md"
   ],
   "scripts": {
     "agent": "node agent/server.js",

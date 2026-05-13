@@ -14,6 +14,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 
 const OVERLAY_URL = '/__frontend-conqueror/overlay.js';
 const MAP_URL = '/__frontend-conqueror/map.json';
@@ -298,6 +299,11 @@ module.exports = function frontendConquerorPlugin(options = {}) {
     overlayFile: options.overlayFile || path.join(__dirname, '..', 'overlay', 'overlay.js'),
     autoInject: options.autoInject !== false,
     agentPort: options.agentPort || 54321,
+    // Auto-spawn the agent when the Vite dev server starts so devs don't have
+    // to run it in a second terminal. Set `autoStartAgent: false` to keep the
+    // old behavior (useful if you want to run the agent under a debugger).
+    autoStartAgent: options.autoStartAgent !== false,
+    agentPath: options.agentPath || path.join(__dirname, '..', 'agent', 'server.js'),
     // Test mode wiring: where the gate service lives + which key identifies
     // this project in the gate's allowlist database. Both required to activate
     // Test mode; without them the overlay shows a "configure gate" toast.
@@ -358,6 +364,28 @@ module.exports = function frontendConquerorPlugin(options = {}) {
     },
 
     configureServer(server) {
+      if (opt.autoStartAgent) {
+        if (!fs.existsSync(opt.agentPath)) {
+          console.warn(`[frontend-conqueror] agent not found at ${opt.agentPath} — Edit/TODO modes won't write to disk`);
+        } else {
+          const child = spawn(process.execPath, [opt.agentPath, projectRoot, String(opt.agentPort)], {
+            stdio: ['ignore', 'inherit', 'inherit'],
+            env: process.env,
+          });
+          child.on('error', (err) => {
+            console.warn(`[frontend-conqueror] agent failed to start: ${err.message}`);
+          });
+          const stop = () => {
+            try { if (!child.killed) child.kill(); } catch {}
+          };
+          server.httpServer?.once('close', stop);
+          process.once('exit', stop);
+          process.once('SIGINT', stop);
+          process.once('SIGTERM', stop);
+          console.log(`[frontend-conqueror] agent spawned (pid ${child.pid}, port ${opt.agentPort}, root ${projectRoot})`);
+        }
+      }
+
       server.middlewares.use(MAP_URL, (_req, res) => {
         const m = buildI18nMap();
         res.setHeader('Content-Type', 'application/json');

@@ -62,14 +62,39 @@ gate/     Node HTTP server. Holds the tester email allowlist + Linear API key,
 
 ---
 
-## Quick start (local dev)
+## Installing
+
+Pin to a tagged version so you get reproducible installs:
 
 ```bash
-# 1. From your project root, install the plugin
-npm install --save-dev /path/to/frontend-conqueror/plugin
+# Latest stable
+npm install --save-dev github:Jwan999/frontend-conqueror#v0.4.0
 
-# 2. Add it to your Vite or Nuxt config
-import frontendConquerorPlugin from 'frontend-conqueror-plugin'
+# Or track main if you want every commit (not recommended for shared projects)
+npm install --save-dev github:Jwan999/frontend-conqueror
+```
+
+## Updating
+
+The plugin uses standard semver: `MAJOR.MINOR.PATCH`.
+- **Patch** (`0.4.0` → `0.4.1`) — bug fixes, safe to take blindly
+- **Minor** (`0.4.0` → `0.5.0`) — new features, no breaking changes
+- **Major** (`0.x` → `1.0`) — breaking changes; read [CHANGELOG.md](./CHANGELOG.md) before bumping
+
+To pull a new version:
+
+```bash
+# Bump the pinned tag in your package.json (e.g. v0.4.0 → v0.4.1), then:
+npm install
+```
+
+To watch for new releases: hit the **Watch → Custom → Releases** button on [the repo](https://github.com/Jwan999/frontend-conqueror) — GitHub will email you each time a new version is tagged. All changes are documented in [CHANGELOG.md](./CHANGELOG.md).
+
+## Quick start (local dev)
+
+```js
+// vite.config.js or nuxt.config.ts
+import frontendConquerorPlugin from 'frontend-conqueror/plugin'
 
 vite: { plugins: [frontendConquerorPlugin({
   projectRoot: process.cwd(),
@@ -78,16 +103,18 @@ vite: { plugins: [frontendConquerorPlugin({
   gate: { url: 'http://localhost:54322' },  // optional, only needed for Test mode
 })]}
 
-# 3. Add the overlay script tag (Nuxt needs this; vanilla Vite gets it auto-injected)
+// Nuxt also needs:
 app.head.script: process.env.NODE_ENV !== 'production'
   ? [{ src: '/__frontend-conqueror/overlay.js', defer: true }]
   : []
+```
 
-# 4. Run the agent (separate terminal)
-node /path/to/frontend-conqueror/agent/server.js /path/to/your/project
+That's it. Run your normal `npm run dev` — the plugin auto-spawns the agent in the background and shuts it down when Vite exits. No second terminal needed.
 
-# 5. (Optional) Run the gate for Test mode
-GATE_JWT_SECRET=<random-string> node /path/to/frontend-conqueror/gate/server.js
+For Test mode, also run the gate (one process per organization, not per project):
+
+```bash
+GATE_JWT_SECRET=<random-string> node node_modules/frontend-conqueror/gate/server.js
 ```
 
 Open your dev site, press `Shift Shift`, pick a mode.
