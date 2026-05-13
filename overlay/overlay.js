@@ -352,6 +352,57 @@
     .panel .multi-field textarea:focus {
       border-color: var(--mode-color); background: #fff;
     }
+    .panel .picker-intro {
+      font-size: 12px; color: #6b7280;
+      margin-bottom: 10px;
+    }
+    .panel .picker-intro strong {
+      color: #111827; font-weight: 600;
+    }
+    .panel .picker-list {
+      max-height: 280px; overflow-y: auto;
+      border: 1px solid #f0f0f0; border-radius: 6px;
+    }
+    .panel .picker-row {
+      display: block;
+      width: 100%;
+      text-align: start;
+      padding: 10px 12px;
+      background: transparent;
+      border: 0;
+      border-bottom: 1px solid #f0f0f0;
+      cursor: pointer;
+      font: inherit;
+      transition: background-color 0.08s;
+    }
+    .panel .picker-row:last-child { border-bottom: 0; }
+    .panel .picker-row:hover { background: #f9fafb; }
+    .panel .picker-row:focus { outline: none; background: #f3f4f6; }
+    .panel .picker-path {
+      font: 12px/1.3 ui-monospace, Menlo, monospace;
+      color: var(--mode-color);
+      margin-bottom: 3px;
+    }
+    .panel .picker-file {
+      font: 10px/1.3 ui-monospace, Menlo, monospace;
+      color: #9ca3af;
+    }
+    .panel .picker-value {
+      font: 12px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      color: #374151;
+      margin-top: 4px;
+      max-height: 36px; overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .panel .picker-recommended {
+      font: 9px/1 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      color: var(--mode-color);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-inline-start: 6px;
+      font-weight: 600;
+    }
     .panel .panel-sub {
       font-size: 11px; color: #6b7280; margin: -4px 0 8px;
     }
@@ -849,6 +900,30 @@
     return Array.from(byLocale.values());
   }
 
+  // Find ALL entries whose value matches the given text. Returns one per
+  // (path, locale) pair so the picker shows distinct logical destinations
+  // rather than duplicated rows.
+  function findAllByValue(text, locale) {
+    if (!i18nMap || i18nMap.length === 0) return [];
+    const t = (text || '').trim();
+    const matches = i18nMap.filter((e) => e.value && (e.value === text || e.value.trim() === t));
+    // Group by path; one entry per path (locale-filter for relevance but include all locales as a hint).
+    const byPath = new Map();
+    for (const e of matches) {
+      const key = e.path || (e.file + ':' + e.offset);
+      if (!byPath.has(key)) byPath.set(key, []);
+      byPath.get(key).push(e);
+    }
+    // Return one representative entry per path. Prefer the active-locale entry
+    // when available so the picker shows the right value for the user's UI.
+    const out = [];
+    for (const [, entries] of byPath) {
+      const localeMatch = locale ? entries.find((e) => e.locale === locale) : null;
+      out.push(localeMatch || entries[0]);
+    }
+    return out;
+  }
+
   function findByValue(text, locale) {
     if (!i18nMap || i18nMap.length === 0) return null;
     const t = text.trim();
@@ -1119,21 +1194,147 @@
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
+  // Rank candidates by relevance for the user's click. Heuristics:
+  //   1. Entries in the active locale come first.
+  //   2. Entries whose path semantically matches surrounding context (e.g. paths
+  //      starting with 'nav.' when the element is inside a <nav> or NuxtLink).
+  //   3. Shorter paths first (often the more "canonical" key).
+  function rankCandidates(candidates, target, displayedText, locale) {
+    const el = elementForTarget(target);
+    // Detect context hints from ancestors.
+    let inNav = false, inFooter = false, inHeader = false;
+    let n = el;
+    while (n && n.nodeType === 1) {
+      const tag = (n.tagName || '').toLowerCase();
+      if (tag === 'nav') inNav = true;
+      if (tag === 'footer') inFooter = true;
+      if (tag === 'header') inHeader = true;
+      if (n.classList && (n.classList.contains('nav') || n.classList.contains('navbar') || n.classList.contains('navigation'))) inNav = true;
+      n = n.parentElement;
+    }
+    return candidates.slice().sort((a, b) => {
+      // Locale match: prefer active locale.
+      const aLoc = a.locale === locale ? 0 : 1;
+      const bLoc = b.locale === locale ? 0 : 1;
+      if (aLoc !== bLoc) return aLoc - bLoc;
+      // Context match: prefer path starting with semantic prefix.
+      const aPath = (a.path || '').toLowerCase();
+      const bPath = (b.path || '').toLowerCase();
+      const aCtx = (inNav && aPath.startsWith('nav.')) || (inFooter && aPath.startsWith('footer.')) || (inHeader && aPath.startsWith('header.')) ? 0 : 1;
+      const bCtx = (inNav && bPath.startsWith('nav.')) || (inFooter && bPath.startsWith('footer.')) || (inHeader && bPath.startsWith('header.')) ? 0 : 1;
+      if (aCtx !== bCtx) return aCtx - bCtx;
+      // Tiebreaker: shorter path = more canonical.
+      return aPath.length - bPath.length;
+    });
+  }
+
+  // Render a picker UI when an element's text matches multiple sources and we
+  // can't pick the right one statically. User selects a candidate; the editor
+  // (single or multi-locale) opens with that as the active entry.
+  function openCandidatePicker(target, displayedText, candidates, onPick) {
+    editingTarget = target;
+    bubble.style.display = 'none';
+    positionOverlays(target);
+
+    const r = rectForTarget(target) || { top: 0, left: 0, bottom: 0 };
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+    const panelWidth = 480;
+    const top = Math.min(window.innerHeight - 380, Math.max(8, r.bottom + 6));
+    const left = Math.min(window.innerWidth - panelWidth - 8, Math.max(8, r.left));
+    panel.style.top = top + 'px';
+    panel.style.left = left + 'px';
+    panel.style.width = panelWidth + 'px';
+
+    const locale = getActiveLocale();
+    const ranked = rankCandidates(candidates, target, displayedText, locale);
+
+    const intro = document.createElement('div');
+    intro.className = 'picker-intro';
+    intro.innerHTML = `Found <strong>${candidates.length}</strong> places this text comes from. Pick which one you want to edit:`;
+    panel.appendChild(intro);
+
+    const list = document.createElement('div');
+    list.className = 'picker-list';
+    ranked.forEach((entry, idx) => {
+      const row = document.createElement('button');
+      row.className = 'picker-row';
+      const recommended = idx === 0 ? '<span class="picker-recommended">recommended</span>' : '';
+      const pathLabel = entry.path || '(no key)';
+      const fileLabel = entry.file + (entry.line ? ':' + entry.line : '');
+      const localeBadge = entry.locale ? ` <span class="picker-recommended" style="color:#6b7280;">${entry.locale}</span>` : '';
+      row.innerHTML = `
+        <div class="picker-path">${escapeHtml(pathLabel)}${recommended}${localeBadge}</div>
+        <div class="picker-file">${escapeHtml(fileLabel)}</div>
+        <div class="picker-value">${escapeHtml(entry.value || '')}</div>
+      `;
+      row.addEventListener('click', () => {
+        panel.remove();
+        onPick(entry);
+      });
+      list.appendChild(row);
+    });
+    panel.appendChild(list);
+
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.style.marginTop = '10px';
+    const hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent = 'Tip: paths under nav.* / footer.* are ranked first when you click in those areas.';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'cancel';
+    cancelBtn.textContent = 'Cancel';
+    row.appendChild(hint);
+    row.appendChild(cancelBtn);
+    panel.appendChild(row);
+
+    shadow.appendChild(panel);
+
+    function close() {
+      panel.remove();
+      editingTarget = null;
+      currentTarget = null;
+      outline.style.display = 'none';
+    }
+    cancelBtn.addEventListener('click', close);
+    // Esc closes
+    setTimeout(() => {
+      const focusable = list.querySelector('.picker-row');
+      if (focusable) focusable.focus();
+    }, 0);
+    panel.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+  }
+
+  // Open the appropriate editor for a known entry — multi-locale if the entry's
+  // path has parallel translations, single-field otherwise.
+  function openEditorForEntry(target, entry) {
+    if (entry.path && i18nMap) {
+      const all = findAllByPath(entry.path);
+      const distinctLocales = new Set(all.map((e) => e.locale).filter(Boolean));
+      if (all.length > 1 && distinctLocales.size > 1) {
+        return openMultiLocaleEditor(target, entry.path, all);
+      }
+    }
+    // Single-field editor with this entry pre-resolved.
+    return openSingleFieldEditor(target, entry);
+  }
+
   function openEditor(target) {
-    // If the target has a known i18n path with multiple locale entries, open
-    // the multi-locale editor instead of the single-field one.
     const targetElForCheck = elementForTarget(target);
+    const displayedText = getEditableTextFromTarget(target);
+    const locale = getActiveLocale();
+
+    // 1. Direct data-edit-i18n-path → resolve and open editor (multi-locale if applicable)
     let resolvedPath = readAncestorAttr(targetElForCheck, 'data-edit-i18n-path');
     if (!resolvedPath) {
-      // Try the multi-key form (ternary etc.): pick the candidate path whose
-      // value matches the currently displayed text.
+      // 1b. Compound expression (ternary etc.): match the candidate whose value
+      //     matches displayed text.
       const i18nPaths = readAncestorAttr(targetElForCheck, 'data-edit-i18n-paths');
       if (i18nPaths && i18nMap) {
-        const displayed = getEditableTextFromTarget(target);
-        const locale = getActiveLocale();
         for (const path of i18nPaths.split('|').filter(Boolean)) {
           const entry = findByPath(path, locale);
-          if (entry && entry.value && (entry.value === displayed || entry.value.trim() === displayed.trim())) {
+          if (entry && entry.value && (entry.value === displayedText || entry.value.trim() === displayedText.trim())) {
             resolvedPath = path;
             break;
           }
@@ -1148,7 +1349,24 @@
       }
     }
 
-    editingTarget = target;
+    // 2. If element has no path attribute but matches multiple sources by value,
+    //    show the disambiguation picker. (data-edit-loc on a literal template
+    //    text never needs the picker — it's already exact byte-range.)
+    if (!resolvedPath && !readDataEditLoc(targetElForCheck) && displayedText && i18nMap) {
+      const candidates = findAllByValue(displayedText, locale);
+      if (candidates.length > 1) {
+        return openCandidatePicker(target, displayedText, candidates, (chosen) => {
+          openEditorForEntry(target, chosen);
+        });
+      }
+    }
+
+    // 3. Otherwise: fall through to the original single-field editor with
+    //    whatever resolution buildEditMessage settles on (path, value, or grep).
+    return openSingleFieldEditor(target, null);
+  }
+
+  function openSingleFieldEditor(target, presetEntry) {
     // Outline keeps the active mode color via CSS variable — no inline override.
     bubble.style.display = 'none';
     positionOverlays(target);
@@ -1168,15 +1386,30 @@
     // Pre-resolve to see if the full text has a direct edit target. If not,
     // probe the source map for substrings of the rendered text and show them
     // as chips — the user picks which piece to edit.
-    let activeEntry = null;   // when set, overrides buildEditMessage with explicit entry
-    let activeText = originalText;
-    const probe = buildEditMessage(targetEl, originalText, originalText, 0);
+    // When openSingleFieldEditor is called from the candidate picker, presetEntry
+    // is supplied — skip probing and use it directly.
+    let activeEntry = presetEntry || null;
+    let activeText = presetEntry ? presetEntry.value : originalText;
+    const probe = presetEntry
+      ? { type: 'edit-loc' }   // synthetic — picker already resolved
+      : buildEditMessage(targetEl, originalText, originalText, 0);
     const directlyResolved = probe.type === 'edit-loc';
-    const compositions = directlyResolved ? [] : findCompositions(originalText, getActiveLocale());
+    const compositions = (directlyResolved || presetEntry) ? [] : findCompositions(originalText, getActiveLocale());
 
     const ta = document.createElement('textarea');
-    ta.value = originalText;
+    ta.value = presetEntry ? (presetEntry.value || originalText) : originalText;
     ta.spellcheck = false;
+
+    // Show the picked entry's identity at the top so the user knows what they're editing.
+    let presetHeader = null;
+    if (presetEntry) {
+      presetHeader = document.createElement('div');
+      presetHeader.className = 'multi-header';
+      presetHeader.innerHTML = `
+        <div class="multi-title">Edit this source</div>
+        <div class="multi-path">${escapeHtml(presetEntry.path || presetEntry.file)}${presetEntry.locale ? ` · <span style="color:#9ca3af;">${escapeHtml(presetEntry.locale)}</span>` : ''}</div>
+      `;
+    }
 
     let chipsRow = null;
     if (compositions.length > 0) {
@@ -1221,6 +1454,7 @@
     row.appendChild(hint);
     row.appendChild(cancelBtn);
     row.appendChild(saveBtn);
+    if (presetHeader) panel.appendChild(presetHeader);
     if (chipsRow) panel.appendChild(chipsRow);
     panel.appendChild(ta);
     panel.appendChild(row);

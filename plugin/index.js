@@ -301,6 +301,108 @@ function findAllI18nCalls(expr, allowedRoots) {
   return out;
 }
 
+// ----- Scan a .vue file's <script> block for editable strings at top-level data positions. -----
+// Catches patterns that don't go through i18n but render via template interpolation:
+//   const navItems = ['Home', 'About', 'Contact']
+//   const links = [{ label: 'Home', to: '/' }, { label: 'About', to: '/about' }]
+//   const PAGE_TITLE = 'Welcome'
+//
+// Each leaf string literal at an array-element or object-value position is recorded
+// with its byte offset relative to the .vue file. Editing one writes that exact range.
+function scanVueScript(scriptContent, scriptOffset, fileRel, babelParser) {
+  if (!scriptContent || !babelParser) return [];
+  let ast;
+  try {
+    ast = babelParser.parse(scriptContent, {
+      sourceType: 'module',
+      plugins: ['typescript'],
+      allowImportExportEverywhere: true,
+      errorRecovery: true,
+    });
+  } catch { return []; }
+
+  const entries = [];
+  // Record a string-literal node found at a value position.
+  function record(node, pathSegments) {
+    if (!node) return;
+    const offset = scriptOffset + node.start;
+    const length = node.end - node.start;
+    if (!node.value || length < 2) return;     // skip empty strings
+    // Skip strings used as imports, JSX, or type literals (heuristic: very short and matches identifier).
+    entries.push({
+      value: node.value,
+      path: 'script:' + pathSegments.join('.'),
+      locale: null,
+      file: fileRel,
+      offset, length,
+      kind: 'string-literal',
+    });
+  }
+  function recordTemplate(node, pathSegments) {
+    if (!node || !node.quasis) return;
+    node.quasis.forEach((q, i) => {
+      const cooked = q.value && (q.value.cooked == null ? q.value.raw : q.value.cooked);
+      if (!cooked) return;
+      const offset = scriptOffset + q.start;
+      const length = q.end - q.start;
+      if (length === 0) return;
+      entries.push({
+        value: cooked,
+        path: 'script:' + pathSegments.join('.') + '[' + i + ']',
+        locale: null,
+        file: fileRel,
+        offset, length,
+        kind: 'template-quasi',
+        quasiIndex: i,
+      });
+    });
+  }
+  function walkValue(node, pathSegments) {
+    if (!node) return;
+    if (node.type === 'StringLiteral') {
+      record(node, pathSegments);
+    } else if (node.type === 'TemplateLiteral') {
+      recordTemplate(node, pathSegments);
+    } else if (node.type === 'ArrayExpression') {
+      (node.elements || []).forEach((el, i) => walkValue(el, pathSegments.concat(String(i))));
+    } else if (node.type === 'ObjectExpression') {
+      for (const prop of node.properties || []) {
+        if (prop.type !== 'ObjectProperty' && prop.type !== 'Property') continue;
+        let key = null;
+        if (prop.key) {
+          if (prop.key.type === 'Identifier') key = prop.key.name;
+          else if (prop.key.type === 'StringLiteral') key = prop.key.value;
+        }
+        if (key == null) continue;
+        // Skip "to", "href", "src", "icon" — these are rarely user-visible text.
+        if (['to', 'href', 'src', 'name', 'id', 'key', 'type', 'icon', 'class', 'role'].includes(key)) continue;
+        walkValue(prop.value, pathSegments.concat(key));
+      }
+    } else if (node.type === 'CallExpression') {
+      // Recurse into `computed(() => ...)`, `ref(...)`, etc.
+      (node.arguments || []).forEach((a, i) => walkValue(a, pathSegments.concat('arg' + i)));
+    } else if (node.type === 'ArrowFunctionExpression' || node.type === 'FunctionExpression') {
+      if (node.body && node.body.type !== 'BlockStatement') walkValue(node.body, pathSegments);
+    }
+  }
+
+  // Walk top-level variable declarations.
+  for (const node of ast.program.body || []) {
+    if (node.type === 'VariableDeclaration') {
+      for (const d of node.declarations || []) {
+        if (!d.id || d.id.type !== 'Identifier' || !d.init) continue;
+        walkValue(d.init, [d.id.name]);
+      }
+    } else if (node.type === 'ExportNamedDeclaration' && node.declaration && node.declaration.type === 'VariableDeclaration') {
+      for (const d of node.declaration.declarations || []) {
+        if (!d.id || d.id.type !== 'Identifier' || !d.init) continue;
+        walkValue(d.init, [d.id.name]);
+      }
+    }
+  }
+  return entries;
+}
+
 // ----- Transform a .vue source string: emit data-edit-loc / data-edit-i18n-path / data-edit-dyn -----
 function transformVueSource(code, fileRel, deps, options) {
   if (!deps.compilerSfc) return null;
@@ -449,6 +551,10 @@ module.exports = function frontendConquerorPlugin(options = {}) {
   let i18nFile = null;
   let i18nJsonResolved = null;  // { [locale]: absPath } after configResolved
   let deps = { compilerDom: null, compilerSfc: null, babelParser: null };
+  // Per-file cache of editable strings extracted from .vue scripts. Populated
+  // lazily by the transform() hook as Vite loads files. The map endpoint
+  // concatenates these with the i18n source map.
+  const scriptEntriesPerFile = new Map();
 
   function loadDeps() {
     deps.compilerDom = resolveDep('@vue/compiler-dom', projectRoot);
@@ -474,6 +580,10 @@ module.exports = function frontendConquerorPlugin(options = {}) {
           entries.push(...scanI18nJsonFile(content, relPath(projectRoot, absPath), locale));
         } catch {}
       }
+    }
+    // Per-.vue script-block entries — populated by transform() as Vite loads files.
+    for (const fileEntries of scriptEntriesPerFile.values()) {
+      entries.push(...fileEntries);
     }
     return entries;
   }
@@ -615,6 +725,21 @@ module.exports = function frontendConquerorPlugin(options = {}) {
       if (id.includes('?')) return null;
       if (!id.endsWith('.vue')) return null;
       const fileRel = relPath(projectRoot, id);
+
+      // Scan the script block for editable strings (hardcoded arrays, top-level
+      // consts, etc.) so they show up in the map and the picker. Done before the
+      // template transform so script-derived entries are visible when the page
+      // renders.
+      try {
+        const parsed = deps.compilerSfc.parse(code);
+        const scriptBlock = parsed && parsed.descriptor && (parsed.descriptor.scriptSetup || parsed.descriptor.script);
+        if (scriptBlock && deps.babelParser) {
+          const entries = scanVueScript(scriptBlock.content, scriptBlock.loc.start.offset, fileRel, deps.babelParser);
+          if (entries.length > 0) scriptEntriesPerFile.set(id, entries);
+          else scriptEntriesPerFile.delete(id);
+        }
+      } catch {}
+
       try {
         const out = transformVueSource(code, fileRel, deps, opt);
         if (out) return { code: out, map: null };

@@ -10,6 +10,34 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.6.0] — 2026-05-13
+
+Bullet-proofs Edit mode against the most common dynamic-text patterns. **Path identity now works for indirect cases (v-for items, computed text, hardcoded arrays), with a disambiguation picker as the fallback when static analysis can't pick a single source.**
+
+### Added
+- **Disambiguation picker.** When a clicked text matches multiple sources (e.g., a translation value reused across N keys, or text rendered via `{{ item.label }}` in a v-for), the overlay now shows a panel listing every candidate ranked by relevance — clicking one opens the editor (single or multi-locale) with that as the active entry. Replaces silent "Cannot safely edit" rejections.
+- **Candidate ranking heuristic.** Picker entries are ordered by: (1) active-locale match first, (2) semantic context match (paths starting with `nav.` when clicked inside `<nav>`, `footer.` inside `<footer>`, etc.), (3) shorter paths preferred as more canonical. The first row gets a "recommended" badge.
+- **`.vue` script-block scanner.** Plugin now parses every `.vue` file's `<script>` / `<script setup>` block and indexes top-level variable declarations containing strings:
+  - `const navItems = ['Home', 'About']` → each string editable by byte range
+  - `const links = [{ label: 'Home', to: '/' }]` → each `label` editable; skips non-text keys (`to`, `href`, `src`, `icon`, etc.)
+  - `const PAGE_TITLE = 'Welcome'` → editable
+  - Template literals supported with quasi-level byte ranges (like the existing TS i18n scanner)
+- **Per-file script-entry cache** that updates on every `transform()` Vite invocation and merges into the `/__frontend-conqueror/map.json` endpoint.
+
+### Improved
+- **Editor opens with the picker's chosen path baked in.** When you pick a candidate from the picker, the editor shows a header like `Edit this source — nav.contests · ar` so you can see exactly what byte range you're about to write.
+- **`openEditor` is now a router.** Decides between three paths: direct multi-locale editor (when an i18n path has parallel translations), picker (when multiple candidates match by value), or single-field editor (when there's one or zero matches).
+
+### Fixed
+- "Found N matches across N files. Cannot safely edit." rejection on text rendered through indirection patterns. The picker now surfaces those candidates instead.
+- Navbar-style v-for patterns (`navLinks.value = [{ label: t('nav.contests') }]; <a v-for="link in navLinks">{{ link.label }}</a>`) — value lookup finds the i18n entry, picker disambiguates if multiple keys share the same translation.
+
+### Plugin output diagnostic
+- Startup log now reads e.g. `[frontend-conqueror] i18n=app/i18n.ts json=en:i18n/locales/en.json,ar:i18n/locales/ar.json roots=[t,$t,i18n,messages] vue=on ast=on script-scan=on` — the new `script-scan` flag shows the .vue-script extractor is active.
+
+### Compatibility
+- No breaking changes. Plugin options unchanged. Adds entries to the existing map endpoint shape; overlay falls back to single-field editor if it can't find candidates.
+
 ## [0.5.2] — 2026-05-13
 
 ### Added
@@ -126,7 +154,8 @@ See [STACKS.md](./STACKS.md) for the full matrix.
 
 ---
 
-[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Jwan999/frontend-conqueror/compare/v0.4.1...v0.5.0
