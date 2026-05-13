@@ -1320,7 +1320,53 @@
     return openSingleFieldEditor(target, entry);
   }
 
-  function openEditor(target) {
+  // Detects whether a candidate's path semantically matches the DOM context
+  // around the clicked target (e.g. `nav.*` inside `<nav>`). Returns true on
+  // a hit. Used both to rank picker candidates and to decide whether the
+  // top-ranked candidate is a unique strong winner that should be auto-picked.
+  function contextMatches(target, path) {
+    if (!path) return false;
+    const p = path.toLowerCase();
+    const el = elementForTarget(target);
+    let n = el;
+    const tags = new Set();
+    const classes = new Set();
+    while (n && n.nodeType === 1) {
+      tags.add((n.tagName || '').toLowerCase());
+      if (n.classList) n.classList.forEach((c) => classes.add(c.toLowerCase()));
+      n = n.parentElement;
+    }
+    const isNav = tags.has('nav') || classes.has('nav') || classes.has('navbar') || classes.has('navigation');
+    const isFooter = tags.has('footer') || classes.has('footer');
+    const isHeader = tags.has('header');
+    if (isNav && p.startsWith('nav.')) return true;
+    if (isFooter && p.startsWith('footer.')) return true;
+    if (isHeader && p.startsWith('header.')) return true;
+    return false;
+  }
+
+  // From a ranked candidate list, return a single entry if it's a clear winner
+  // (unique strong-context match in the active locale). Otherwise return null,
+  // signalling the caller to show the picker.
+  function pickClearWinner(candidates, target, locale) {
+    if (!candidates || candidates.length === 0) return null;
+    if (candidates.length === 1) return candidates[0];
+
+    const ranked = rankCandidates(candidates, target, null, locale);
+    const top = ranked[0];
+    // Strong winner: in active locale + unique semantic context match.
+    const topContextHit = contextMatches(target, top.path);
+    if (!topContextHit) return null;          // no semantic anchor → ambiguous
+    const otherHits = ranked.slice(1).filter((c) => contextMatches(target, c.path));
+    if (otherHits.length === 0) return top;   // unique → auto-pick
+    return null;                              // multiple context matches → picker
+  }
+
+  async function openEditor(target) {
+    // Always pull a fresh i18n map before deciding which editor to open.
+    // Without this, an edit that changed a value would leave the next click
+    // looking at stale entries (no path match → no multi-locale editor).
+    await fetchI18nMap();
     const targetElForCheck = elementForTarget(target);
     const displayedText = getEditableTextFromTarget(target);
     const locale = getActiveLocale();
@@ -1349,20 +1395,28 @@
       }
     }
 
-    // 2. If element has no path attribute but matches multiple sources by value,
-    //    show the disambiguation picker. (data-edit-loc on a literal template
-    //    text never needs the picker — it's already exact byte-range.)
+    // 2. No path attribute — try value-based resolution.
+    //    (data-edit-loc on a literal template text never needs this — it's
+    //    already exact byte-range.)
     if (!resolvedPath && !readDataEditLoc(targetElForCheck) && displayedText && i18nMap) {
       const candidates = findAllByValue(displayedText, locale);
+      if (candidates.length === 1) {
+        // Single match → route through openEditorForEntry so multi-locale
+        // editor opens if the entry's path has parallel translations.
+        return openEditorForEntry(target, candidates[0]);
+      }
       if (candidates.length > 1) {
+        // Try to auto-pick a unique strong-context winner. Picker shows only
+        // if static analysis really can't decide.
+        const winner = pickClearWinner(candidates, target, locale);
+        if (winner) return openEditorForEntry(target, winner);
         return openCandidatePicker(target, displayedText, candidates, (chosen) => {
           openEditorForEntry(target, chosen);
         });
       }
     }
 
-    // 3. Otherwise: fall through to the original single-field editor with
-    //    whatever resolution buildEditMessage settles on (path, value, or grep).
+    // 3. Otherwise: fall through to the original single-field editor.
     return openSingleFieldEditor(target, null);
   }
 

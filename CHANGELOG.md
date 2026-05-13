@@ -10,6 +10,18 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.6.1] — 2026-05-13
+
+Three focused fixes to make the resolver behave the way a user expects.
+
+### Fixed
+- **`openEditor` now awaits a fresh i18n map** before deciding which editor to open. Previously the map was invalidated after a write but the next click read the stale cached copy synchronously — meaning after editing a value, the next click on the same text could miss the path match and fall through to single-field instead of opening the multi-locale editor.
+- **Single-candidate value-lookup now routes through `openEditorForEntry`**, which runs the multi-locale check. Previously the single-field editor opened directly, missing parallel translations.
+- **Picker auto-picks when there's a clear winner.** When ranking yields exactly one candidate with a strong semantic-context match (e.g., only one path matches `nav.*` and the element is inside `<nav>`), the picker is skipped and the editor opens directly. Picker is now truly a last resort.
+
+### Behavior change
+- For multilingual sites: any edit that resolves to an i18n key with parallel locale entries now opens the multi-locale editor, regardless of whether the entry came from a path attribute, value lookup, or the picker. One uniform path through `openEditorForEntry`.
+
 ## [0.6.0] — 2026-05-13
 
 Bullet-proofs Edit mode against the most common dynamic-text patterns. **Path identity now works for indirect cases (v-for items, computed text, hardcoded arrays), with a disambiguation picker as the fallback when static analysis can't pick a single source.**
@@ -154,7 +166,8 @@ See [STACKS.md](./STACKS.md) for the full matrix.
 
 ---
 
-[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/Jwan999/frontend-conqueror/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.0...v0.5.1
