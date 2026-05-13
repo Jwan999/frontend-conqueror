@@ -10,6 +10,15 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.5.2] — 2026-05-13
+
+### Added
+- **Compound i18n expressions get path identity.** Templates like `{{ cond ? $t('a') : $t('b') }}` (ternary), `{{ x || $t('y') }}` (logical), and `{{ prefix + $t('z') }}` (concat) now emit `data-edit-i18n-paths="a|b|..."`. The overlay picks whichever path's value matches the displayed text — no more falling through to grep. Unblocks the most common "dynamic copy" patterns in production Vue templates.
+- `findAllI18nCalls()` helper in the plugin: scans an expression string for every i18n call (`$t('key')`, `t('key')`, `this.$t('key')`), deduped.
+
+### Fixed
+- Editing text rendered by a ternary expression (`isAuthenticated ? $t('a') : $t('b')`) no longer falls back to v0 grep — which was causing "Found 2 matches across 2 files" errors on projects with duplicate locale directories or repeated string values.
+
 ## [0.5.1] — 2026-05-13
 
 Lands the rest of [#4](https://github.com/Jwan999/frontend-conqueror/issues/4) — **JSON i18n is now Tier 1**. Edit mode works precisely on Nuxt + `@nuxtjs/i18n` JSON bundles, Laravel `lang/*.json`, and any vue-i18n JSON-mode project.
@@ -117,7 +126,8 @@ See [STACKS.md](./STACKS.md) for the full matrix.
 
 ---
 
-[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Jwan999/frontend-conqueror/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Jwan999/frontend-conqueror/compare/v0.4.0...v0.4.1

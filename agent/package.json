@@ -1,6 +1,6 @@
 {
   "name": "frontend-conqueror-agent",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "private": true,
   "description": "frontend-conqueror — Node WebSocket daemon. Applies overlay edits and TODO insertions to source files.",
   "bin": {

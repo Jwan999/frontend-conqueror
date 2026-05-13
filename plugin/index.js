@@ -272,12 +272,33 @@ function scanI18nJsonFile(content, fileRel, locale) {
 }
 
 // Parse an i18n function-call form: `$t('foo.bar')`, `t('x')`, `this.$t('y')`, `i18n.t('z')`.
-// Returns the key path string or null. We don't try to parse expressions inside the parens —
-// only string-literal-argument calls are unambiguous enough to edit.
+// Returns { root, path } for a single direct call, or null. Ignores trailing args
+// like `$t('key', { name })` — we only need the key path.
 function parseI18nCall(expr, allowedRoots) {
-  const re = new RegExp('^\\s*(?:this\\.)?(' + allowedRoots.map(r => r.replace(/\$/g, '\\$')).join('|') + ')(?:\\.t)?\\s*\\(\\s*[\'"]([^\'"]+)[\'"]\\s*\\)\\s*$');
+  const re = new RegExp('^\\s*(?:this\\.)?(' + allowedRoots.map(r => r.replace(/\$/g, '\\$')).join('|') + ')(?:\\.t)?\\s*\\(\\s*[\'"]([^\'"]+)[\'"]\\s*(?:,[\\s\\S]*)?\\)\\s*$');
   const m = String(expr || '').match(re);
   return m ? { root: m[1], path: m[2] } : null;
+}
+
+// Collect ALL i18n keys referenced in a more complex expression like a ternary
+// (`cond ? $t('a') : $t('b')`), logical (`x || $t('y')`), or chained
+// (`prefix + $t('z')`). Each call gets a key, and the overlay disambiguates at
+// edit time by matching the displayed text to a map entry's value.
+//
+// Returns an array of key paths (deduped). Empty array if no i18n calls found.
+function findAllI18nCalls(expr, allowedRoots) {
+  const s = String(expr || '');
+  const rootsPattern = allowedRoots.map(r => r.replace(/\$/g, '\\$')).join('|');
+  // Match each `[this.]?<root>[.t]?('key'...)` occurrence within a longer expression.
+  // Non-anchored, so picks up both arms of a ternary.
+  const re = new RegExp('(?:this\\.)?(?:' + rootsPattern + ')(?:\\.t)?\\s*\\(\\s*[\'"]([^\'"]+)[\'"]', 'g');
+  const out = [];
+  const seen = new Set();
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    if (!seen.has(m[1])) { seen.add(m[1]); out.push(m[1]); }
+  }
+  return out;
 }
 
 // ----- Transform a .vue source string: emit data-edit-loc / data-edit-i18n-path / data-edit-dyn -----
@@ -347,7 +368,14 @@ function transformVueSource(code, fileRel, deps, options) {
         if (chain) {
           transforms.push({ at: insertionPoint(node), str: ` data-edit-i18n-path="${escapeAttr(chain.path)}"` });
         } else {
-          transforms.push({ at: insertionPoint(node), str: ' data-edit-dyn="1"' });
+          // Try to extract all i18n calls from a compound expression (ternary,
+          // logical, concat). Pipe-separated; overlay matches by displayed value.
+          const allKeys = findAllI18nCalls(expr, options.i18nRoots);
+          if (allKeys.length > 0) {
+            transforms.push({ at: insertionPoint(node), str: ` data-edit-i18n-paths="${escapeAttr(allKeys.join('|'))}"` });
+          } else {
+            transforms.push({ at: insertionPoint(node), str: ' data-edit-dyn="1"' });
+          }
         }
       } else if (hasMixedInterpolations) {
         // Wrap each interpolation in <span data-edit-i18n-path="...">{{ … }}</span>
@@ -356,9 +384,15 @@ function transformVueSource(code, fileRel, deps, options) {
         for (const interp of interpChildren) {
           const expr = exprOf(interp);
           const chain = parseMemberChain(expr, options.i18nRoots) || parseI18nCall(expr, options.i18nRoots);
-          const attr = chain
-            ? `data-edit-i18n-path="${escapeAttr(chain.path)}"`
-            : 'data-edit-dyn="1"';
+          let attr;
+          if (chain) {
+            attr = `data-edit-i18n-path="${escapeAttr(chain.path)}"`;
+          } else {
+            const allKeys = findAllI18nCalls(expr, options.i18nRoots);
+            attr = allKeys.length > 0
+              ? `data-edit-i18n-paths="${escapeAttr(allKeys.join('|'))}"`
+              : 'data-edit-dyn="1"';
+          }
           const openAt = templateOffset + interp.loc.start.offset;
           const closeAt = templateOffset + interp.loc.end.offset;
           transforms.push({ at: openAt, str: `<span ${attr}>` });

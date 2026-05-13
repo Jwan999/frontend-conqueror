@@ -917,6 +917,18 @@
       const entry = findByPath(i18nPath, locale);
       if (entry) return entryToMessage(entry, oldText, newText, id);
     }
+    // 2b. Multiple candidate paths (e.g. ternary `cond ? $t(a) : $t(b)`).
+    //     Pick whichever path's value matches the currently displayed text.
+    const i18nPaths = readAncestorAttr(el, 'data-edit-i18n-paths');
+    if (i18nPaths) {
+      const candidates = i18nPaths.split('|').filter(Boolean);
+      for (const path of candidates) {
+        const entry = findByPath(path, locale);
+        if (entry && entry.value && (entry.value === oldText || entry.value.trim() === oldText.trim())) {
+          return entryToMessage(entry, oldText, newText, id);
+        }
+      }
+    }
     // 3. Value-based map lookup, locale-filtered.
     const byVal = findByValue(oldText, locale);
     if (byVal) return entryToMessage(byVal, oldText, newText, id);
@@ -1111,12 +1123,28 @@
     // If the target has a known i18n path with multiple locale entries, open
     // the multi-locale editor instead of the single-field one.
     const targetElForCheck = elementForTarget(target);
-    const i18nPath = readAncestorAttr(targetElForCheck, 'data-edit-i18n-path');
-    if (i18nPath && i18nMap) {
-      const all = findAllByPath(i18nPath);
+    let resolvedPath = readAncestorAttr(targetElForCheck, 'data-edit-i18n-path');
+    if (!resolvedPath) {
+      // Try the multi-key form (ternary etc.): pick the candidate path whose
+      // value matches the currently displayed text.
+      const i18nPaths = readAncestorAttr(targetElForCheck, 'data-edit-i18n-paths');
+      if (i18nPaths && i18nMap) {
+        const displayed = getEditableTextFromTarget(target);
+        const locale = getActiveLocale();
+        for (const path of i18nPaths.split('|').filter(Boolean)) {
+          const entry = findByPath(path, locale);
+          if (entry && entry.value && (entry.value === displayed || entry.value.trim() === displayed.trim())) {
+            resolvedPath = path;
+            break;
+          }
+        }
+      }
+    }
+    if (resolvedPath && i18nMap) {
+      const all = findAllByPath(resolvedPath);
       const distinctLocales = new Set(all.map((e) => e.locale).filter(Boolean));
       if (all.length > 1 && distinctLocales.size > 1) {
-        return openMultiLocaleEditor(target, i18nPath, all);
+        return openMultiLocaleEditor(target, resolvedPath, all);
       }
     }
 
