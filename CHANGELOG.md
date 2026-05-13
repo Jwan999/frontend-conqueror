@@ -10,6 +10,27 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.5.1] — 2026-05-13
+
+Lands the rest of [#4](https://github.com/Jwan999/frontend-conqueror/issues/4) — **JSON i18n is now Tier 1**. Edit mode works precisely on Nuxt + `@nuxtjs/i18n` JSON bundles, Laravel `lang/*.json`, and any vue-i18n JSON-mode project.
+
+### Added
+- **JSON locale-file scanner.** New plugin option `i18nJsonFiles: { en: 'i18n/locales/en.json', ar: 'i18n/locales/ar.json', ... }`. If omitted, the plugin auto-discovers common Nuxt-i18n paths (`i18n/locales/<locale>.json`, then root `locales/<locale>.json`). Each leaf string in the JSON becomes an editable entry with byte-range identity, so edits land in the exact spot — no grep, no ambiguity.
+- **`$t('key.path')` call-form detection** in `.vue` templates. Previously only member-chain access (`$t.foo.bar`) was recognized for path identity. Function-call form is now first-class, which unblocks Nuxt + vue-i18n which always uses `$t('...')`.
+- **Multi-locale editor.** When you click an i18n-keyed text in Edit mode, the panel now shows **one field per locale** side-by-side (English, Arabic, French, …) with each translation pre-filled. Edit any subset, hit Save, and the agent writes each changed locale's JSON file by exact byte range. Arabic / Hebrew / Persian / Urdu fields automatically render RTL.
+- **Agent: `json-string` edit kind.** Validates the on-disk JSON string matches `oldText` (after JSON-unescape), then replaces with `JSON.stringify(newText)` so output stays a valid JSON literal regardless of newlines, quotes, or escapes in the new value.
+
+### Changed
+- Plugin's startup log line now shows JSON locales found: `[frontend-conqueror] i18n=app/i18n.ts json=en:i18n/locales/en.json,ar:i18n/locales/ar.json …`.
+
+### Fixed
+- "Found N matches across N files. Cannot safely edit." rejection on Nuxt + JSON i18n projects (was the v0.5.0 reality, now resolved when keys exist in the plugin's i18n map).
+
+### Compatibility
+- Existing plugin configs without `i18nJsonFiles` automatically benefit from auto-discovery if locale files exist at conventional paths.
+- TS object-literal i18n scanner unchanged.
+- Agent's other edit kinds (`raw`, `string-literal`, `template-quasi`) unchanged.
+
 ## [0.5.0] — 2026-05-13
 
 Major feature release: **one gate can now serve any number of projects**, with a redesigned admin and heartbeat-based auto-discovery. Existing v0.4.x singleton deploys keep working — data migrates on first load.
@@ -96,7 +117,8 @@ See [STACKS.md](./STACKS.md) for the full matrix.
 
 ---
 
-[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Jwan999/frontend-conqueror/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Jwan999/frontend-conqueror/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Jwan999/frontend-conqueror/compare/v0.3.0...v0.4.0

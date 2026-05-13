@@ -190,6 +190,96 @@ function scanI18nAst(content, fileRel, localeNames, babelParser) {
   return entries;
 }
 
+// ----- Scan a JSON locale file (e.g. i18n/locales/en.json) and emit one entry per leaf string. -----
+// Tracks byte offsets manually because JSON.parse loses positions. Mini recursive-descent parser
+// kept small and dep-free — JSON is simple enough that 80 lines covers the whole spec for our use case
+// (we don't care about numbers/booleans/null leaves; only strings are editable values).
+function scanI18nJsonFile(content, fileRel, locale) {
+  const entries = [];
+  let i = 0;
+  function skipWs() { while (i < content.length && /\s/.test(content[i])) i++; }
+  function expect(ch) { skipWs(); if (content[i] !== ch) throw new Error('expected ' + ch + ' at ' + i); i++; }
+  function readString() {
+    skipWs();
+    if (content[i] !== '"') throw new Error('expected " at ' + i);
+    const start = i;
+    i++;
+    let value = '';
+    while (i < content.length && content[i] !== '"') {
+      if (content[i] === '\\') {
+        const esc = content[i + 1];
+        i += 2;
+        if (esc === 'n') value += '\n';
+        else if (esc === 't') value += '\t';
+        else if (esc === 'r') value += '\r';
+        else if (esc === '"') value += '"';
+        else if (esc === '\\') value += '\\';
+        else if (esc === '/') value += '/';
+        else if (esc === 'b') value += '\b';
+        else if (esc === 'f') value += '\f';
+        else if (esc === 'u') {
+          const hex = content.slice(i, i + 4);
+          value += String.fromCharCode(parseInt(hex, 16));
+          i += 4;
+        } else value += esc;
+      } else { value += content[i]; i++; }
+    }
+    if (content[i] !== '"') throw new Error('unterminated string at ' + start);
+    i++;
+    return { value, offset: start, length: i - start };
+  }
+  function readValue(segments) {
+    skipWs();
+    const ch = content[i];
+    if (ch === '"') {
+      const s = readString();
+      const { line, col } = getLineCol(content, s.offset);
+      entries.push({
+        value: s.value, path: segments.join('.'), locale, file: fileRel,
+        offset: s.offset, length: s.length, line, col, kind: 'json-string',
+      });
+    } else if (ch === '{') {
+      i++; skipWs();
+      if (content[i] === '}') { i++; return; }
+      while (true) {
+        skipWs();
+        const key = readString();
+        expect(':');
+        readValue(segments.concat(key.value));
+        skipWs();
+        if (content[i] === ',') { i++; continue; }
+        if (content[i] === '}') { i++; return; }
+        throw new Error('expected , or } at ' + i);
+      }
+    } else if (ch === '[') {
+      i++; skipWs();
+      if (content[i] === ']') { i++; return; }
+      let idx = 0;
+      while (true) {
+        readValue(segments.concat(String(idx++)));
+        skipWs();
+        if (content[i] === ',') { i++; continue; }
+        if (content[i] === ']') { i++; return; }
+        throw new Error('expected , or ] at ' + i);
+      }
+    } else {
+      // number / bool / null — skip silently (not editable)
+      while (i < content.length && /[a-zA-Z0-9_.+\-]/.test(content[i])) i++;
+    }
+  }
+  try { readValue([]); } catch { return []; }
+  return entries;
+}
+
+// Parse an i18n function-call form: `$t('foo.bar')`, `t('x')`, `this.$t('y')`, `i18n.t('z')`.
+// Returns the key path string or null. We don't try to parse expressions inside the parens —
+// only string-literal-argument calls are unambiguous enough to edit.
+function parseI18nCall(expr, allowedRoots) {
+  const re = new RegExp('^\\s*(?:this\\.)?(' + allowedRoots.map(r => r.replace(/\$/g, '\\$')).join('|') + ')(?:\\.t)?\\s*\\(\\s*[\'"]([^\'"]+)[\'"]\\s*\\)\\s*$');
+  const m = String(expr || '').match(re);
+  return m ? { root: m[1], path: m[2] } : null;
+}
+
 // ----- Transform a .vue source string: emit data-edit-loc / data-edit-i18n-path / data-edit-dyn -----
 function transformVueSource(code, fileRel, deps, options) {
   if (!deps.compilerSfc) return null;
@@ -252,7 +342,8 @@ function transformVueSource(code, fileRel, deps, options) {
           str: ` data-edit-loc="${escapeAttr(fileRel)}:${trimmedOffset}:${trimmedLength}"`,
         });
       } else if (isSingleInterpolationOnly) {
-        const chain = parseMemberChain(exprOf(interpChildren[0]), options.i18nRoots);
+        const expr = exprOf(interpChildren[0]);
+        const chain = parseMemberChain(expr, options.i18nRoots) || parseI18nCall(expr, options.i18nRoots);
         if (chain) {
           transforms.push({ at: insertionPoint(node), str: ` data-edit-i18n-path="${escapeAttr(chain.path)}"` });
         } else {
@@ -263,7 +354,8 @@ function transformVueSource(code, fileRel, deps, options) {
         // so each text node has its own resolvable ancestor attribute. The wrapper
         // <span> is an inline element and stays transparent to most CSS.
         for (const interp of interpChildren) {
-          const chain = parseMemberChain(exprOf(interp), options.i18nRoots);
+          const expr = exprOf(interp);
+          const chain = parseMemberChain(expr, options.i18nRoots) || parseI18nCall(expr, options.i18nRoots);
           const attr = chain
             ? `data-edit-i18n-path="${escapeAttr(chain.path)}"`
             : 'data-edit-dyn="1"';
@@ -294,6 +386,13 @@ module.exports = function frontendConquerorPlugin(options = {}) {
   const opt = {
     locales: options.locales || ['en'],
     i18nFile: options.i18nFile || null,
+    // Map of locale → JSON file path, e.g.
+    //   { en: 'i18n/locales/en.json', ar: 'i18n/locales/ar.json' }
+    // Each leaf string in those files becomes an editable entry with byte-range
+    // identity. Required for projects that translate via JSON bundles (Nuxt i18n,
+    // vue-i18n JSON mode, Laravel lang/*.json). If omitted, common Nuxt-i18n paths
+    // are auto-discovered (`i18n/locales/<locale>.json`, `locales/<locale>.json`).
+    i18nJsonFiles: options.i18nJsonFiles || null,
     i18nRoots: options.i18nRoots || ['t', '$t', 'i18n', 'messages'],
     projectRoot: options.projectRoot || null,
     overlayFile: options.overlayFile || path.join(__dirname, '..', 'overlay', 'overlay.js'),
@@ -314,6 +413,7 @@ module.exports = function frontendConquerorPlugin(options = {}) {
 
   let projectRoot;
   let i18nFile = null;
+  let i18nJsonResolved = null;  // { [locale]: absPath } after configResolved
   let deps = { compilerDom: null, compilerSfc: null, babelParser: null };
 
   function loadDeps() {
@@ -323,13 +423,25 @@ module.exports = function frontendConquerorPlugin(options = {}) {
   }
 
   function buildI18nMap() {
-    if (!i18nFile || !fs.existsSync(i18nFile) || !deps.babelParser) return [];
-    try {
-      const content = fs.readFileSync(i18nFile, 'utf8');
-      return scanI18nAst(content, relPath(projectRoot, i18nFile), opt.locales, deps.babelParser);
-    } catch {
-      return [];
+    const entries = [];
+    // TS / JS object-literal scanner
+    if (i18nFile && fs.existsSync(i18nFile) && deps.babelParser) {
+      try {
+        const content = fs.readFileSync(i18nFile, 'utf8');
+        entries.push(...scanI18nAst(content, relPath(projectRoot, i18nFile), opt.locales, deps.babelParser));
+      } catch {}
     }
+    // JSON locale-file scanner
+    if (i18nJsonResolved) {
+      for (const [locale, absPath] of Object.entries(i18nJsonResolved)) {
+        if (!fs.existsSync(absPath)) continue;
+        try {
+          const content = fs.readFileSync(absPath, 'utf8');
+          entries.push(...scanI18nJsonFile(content, relPath(projectRoot, absPath), locale));
+        } catch {}
+      }
+    }
+    return entries;
   }
 
   return {
@@ -356,8 +468,35 @@ module.exports = function frontendConquerorPlugin(options = {}) {
 
       loadDeps();
 
+      // Resolve i18nJsonFiles: either explicit map, or auto-discover common paths.
+      i18nJsonResolved = null;
+      if (opt.i18nJsonFiles && typeof opt.i18nJsonFiles === 'object') {
+        i18nJsonResolved = {};
+        for (const [locale, rel] of Object.entries(opt.i18nJsonFiles)) {
+          if (typeof rel === 'string' && rel) {
+            i18nJsonResolved[locale] = path.resolve(projectRoot, rel);
+          }
+        }
+      } else {
+        // Auto-discover: look for i18n/locales/<locale>.json then locales/<locale>.json.
+        const candidates = [['i18n', 'locales'], ['locales']];
+        for (const parts of candidates) {
+          const dir = path.join(projectRoot, ...parts);
+          if (!fs.existsSync(dir)) continue;
+          const map = {};
+          for (const locale of opt.locales) {
+            const p = path.join(dir, locale + '.json');
+            if (fs.existsSync(p)) map[locale] = p;
+          }
+          if (Object.keys(map).length) { i18nJsonResolved = map; break; }
+        }
+      }
+
+      const jsonLocalesFound = i18nJsonResolved ? Object.keys(i18nJsonResolved).length : 0;
+
       const flags = [
         `i18n=${i18nFile ? relPath(projectRoot, i18nFile) : '(none)'}`,
+        `json=${jsonLocalesFound ? Object.entries(i18nJsonResolved).map(([l, p]) => `${l}:${relPath(projectRoot, p)}`).join(',') : '(none)'}`,
         `roots=[${opt.i18nRoots.join(',')}]`,
         `vue=${deps.compilerDom && deps.compilerSfc ? 'on' : 'off'}`,
         `ast=${deps.babelParser ? 'on' : 'off'}`,

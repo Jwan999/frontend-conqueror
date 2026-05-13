@@ -319,6 +319,39 @@
       color: var(--mode-color); letter-spacing: 0.08em;
       margin: 0 0 8px; text-transform: uppercase;
     }
+    .panel .multi-header {
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    .panel .multi-title {
+      font: 700 11px/1 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      color: var(--mode-color); letter-spacing: 0.08em;
+      text-transform: uppercase; margin-bottom: 4px;
+    }
+    .panel .multi-path {
+      font: 12px/1 ui-monospace, Menlo, monospace;
+      color: #6b7280; word-break: break-all;
+    }
+    .panel .multi-field {
+      margin-bottom: 10px;
+    }
+    .panel .multi-field label {
+      display: block;
+      font: 600 10px/1 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      color: #6b7280; letter-spacing: 0.06em; text-transform: uppercase;
+      margin-bottom: 4px;
+    }
+    .panel .multi-field textarea {
+      width: 100%; min-height: 36px;
+      padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 6px;
+      font: 13px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      color: #111827; background: #fafafa;
+      resize: vertical; outline: none;
+    }
+    .panel .multi-field textarea:focus {
+      border-color: var(--mode-color); background: #fff;
+    }
     .panel .panel-sub {
       font-size: 11px; color: #6b7280; margin: -4px 0 8px;
     }
@@ -802,6 +835,19 @@
     if (any.length === 1) return any[0];
     return null;
   }
+  // Returns ALL entries for an i18n path, one per locale (deduplicated by locale).
+  // Used by the multi-locale editor to show every translation side-by-side.
+  function findAllByPath(path) {
+    if (!i18nMap) return [];
+    const byLocale = new Map();
+    for (const e of i18nMap) {
+      if (e.path !== path) continue;
+      // Prefer non-empty locale, keep first occurrence per locale.
+      const key = e.locale || '';
+      if (!byLocale.has(key)) byLocale.set(key, e);
+    }
+    return Array.from(byLocale.values());
+  }
 
   function findByValue(text, locale) {
     if (!i18nMap || i18nMap.length === 0) return null;
@@ -906,7 +952,174 @@
     return target && target.nodeType === 3 ? target.parentElement : target;
   }
 
+  // Locale display labels — falls back to the locale code if no friendly label.
+  const LOCALE_LABELS = { en: 'English', ar: 'العربية', fr: 'Français', es: 'Español', de: 'Deutsch', it: 'Italiano', tr: 'Türkçe', he: 'עברית', ja: '日本語', zh: '中文' };
+  const RTL_LOCALES = new Set(['ar', 'he', 'fa', 'ur']);
+
+  // Multi-locale editor — shows one textarea per locale that exists for this
+  // i18n path. User can change any subset; on submit, only changed locales
+  // produce edit-loc messages. Designed for `$t('foo.bar')` where translations
+  // live in parallel JSON locale files.
+  async function openMultiLocaleEditor(target, i18nPath, entries) {
+    editingTarget = target;
+    bubble.style.display = 'none';
+    positionOverlays(target);
+
+    const r = rectForTarget(target) || { top: 0, left: 0, bottom: 0 };
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+    const panelWidth = 460;
+    const top = Math.min(window.innerHeight - 360, Math.max(8, r.bottom + 6));
+    const left = Math.min(window.innerWidth - panelWidth - 8, Math.max(8, r.left));
+    panel.style.top = top + 'px';
+    panel.style.left = left + 'px';
+    panel.style.width = panelWidth + 'px';
+
+    // Header with the i18n path so the user knows exactly what they're editing.
+    const header = document.createElement('div');
+    header.className = 'multi-header';
+    header.innerHTML = `
+      <div class="multi-title">Edit translation</div>
+      <div class="multi-path">${escapeHtml(i18nPath)}</div>
+    `;
+    panel.appendChild(header);
+
+    // Sort entries: active locale first, then alphabetical.
+    const activeLocale = getActiveLocale();
+    const sorted = entries.slice().sort((a, b) => {
+      if (a.locale === activeLocale) return -1;
+      if (b.locale === activeLocale) return 1;
+      return (a.locale || '').localeCompare(b.locale || '');
+    });
+
+    const fields = [];  // { entry, textarea, originalValue }
+    for (const entry of sorted) {
+      const wrap = document.createElement('div');
+      wrap.className = 'multi-field';
+
+      const lab = document.createElement('label');
+      const code = entry.locale || '(default)';
+      const friendly = LOCALE_LABELS[entry.locale] || '';
+      lab.textContent = friendly ? `${code} — ${friendly}` : code;
+      wrap.appendChild(lab);
+
+      const ta = document.createElement('textarea');
+      ta.value = entry.value || '';
+      ta.spellcheck = false;
+      ta.rows = Math.min(5, Math.max(1, (entry.value || '').split('\n').length));
+      // Auto-set RTL on Arabic-class locales so editing reads naturally.
+      if (RTL_LOCALES.has((entry.locale || '').toLowerCase())) {
+        ta.dir = 'rtl';
+      } else {
+        ta.dir = 'auto';
+      }
+      wrap.appendChild(ta);
+
+      panel.appendChild(wrap);
+      fields.push({ entry, textarea: ta, originalValue: entry.value || '' });
+    }
+
+    const row = document.createElement('div');
+    row.className = 'row';
+    const hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent = '⌘/Ctrl+Enter to save all · Esc to cancel';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'cancel';
+    cancelBtn.textContent = 'Cancel';
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'save';
+    saveBtn.textContent = 'Save all';
+    row.appendChild(hint);
+    row.appendChild(cancelBtn);
+    row.appendChild(saveBtn);
+    panel.appendChild(row);
+
+    shadow.appendChild(panel);
+
+    // Focus the active-locale field (which we sorted to first).
+    setTimeout(() => { if (fields[0]) { fields[0].textarea.focus(); fields[0].textarea.select(); } }, 0);
+
+    function close() {
+      panel.remove();
+      editingTarget = null;
+      currentTarget = null;
+      outline.style.display = 'none';
+    }
+
+    cancelBtn.addEventListener('click', close);
+    saveBtn.addEventListener('click', submit);
+    for (const f of fields) {
+      f.textarea.addEventListener('keydown', (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); submit(); }
+        else if (e.key === 'Escape') { e.preventDefault(); close(); }
+      });
+    }
+
+    async function submit() {
+      // Collect changed fields.
+      const changed = fields.filter((f) => f.textarea.value !== f.originalValue);
+      if (changed.length === 0) { close(); return; }
+      if (!connected) { toast('Agent not connected', 'error'); return; }
+
+      saveBtn.disabled = true;
+      saveBtn.textContent = `Saving ${changed.length}…`;
+      await fetchI18nMap();   // refresh offsets so writes don't drift
+
+      // Track all in-flight edits — close panel when all settle.
+      let pendingCount = changed.length;
+      const failed = [];
+      let anyAppliedForVisibleLocale = false;
+
+      const finalize = () => {
+        if (pendingCount > 0) return;
+        if (failed.length === 0) {
+          // Reflect in DOM: if active locale was edited, swap the visible text.
+          if (anyAppliedForVisibleLocale) {
+            const activeField = changed.find((f) => f.entry.locale === activeLocale);
+            if (activeField) {
+              applyLocalText(target, activeField.originalValue, activeField.textarea.value);
+            }
+          }
+          toast(`Saved ${changed.length} ${changed.length === 1 ? 'translation' : 'translations'}`);
+          close();
+        } else {
+          saveBtn.disabled = false;
+          saveBtn.textContent = 'Save all';
+          toast(`${failed.length} of ${changed.length} edits failed`, 'error');
+        }
+      };
+
+      for (const f of changed) {
+        const id = ++pendingId;
+        pending.set(id, (err) => {
+          pendingCount--;
+          if (err) failed.push({ locale: f.entry.locale, err });
+          else if (f.entry.locale === activeLocale) anyAppliedForVisibleLocale = true;
+          finalize();
+        });
+        send(entryToMessage(f.entry, f.originalValue, f.textarea.value, id));
+      }
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
   function openEditor(target) {
+    // If the target has a known i18n path with multiple locale entries, open
+    // the multi-locale editor instead of the single-field one.
+    const targetElForCheck = elementForTarget(target);
+    const i18nPath = readAncestorAttr(targetElForCheck, 'data-edit-i18n-path');
+    if (i18nPath && i18nMap) {
+      const all = findAllByPath(i18nPath);
+      const distinctLocales = new Set(all.map((e) => e.locale).filter(Boolean));
+      if (all.length > 1 && distinctLocales.size > 1) {
+        return openMultiLocaleEditor(target, i18nPath, all);
+      }
+    }
+
     editingTarget = target;
     // Outline keeps the active mode color via CSS variable — no inline override.
     bubble.style.display = 'none';

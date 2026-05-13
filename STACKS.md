@@ -26,8 +26,8 @@ This file is kept in lockstep with the open issues. If a row says "tracked in #N
 
 | Stack | Edit | TODO | Test | Tracked in |
 |---|:-:|:-:|:-:|---|
-| Vue + vue-i18n with JSON bundles | ⚠️ | ✅ | ✅ | [#4 — JSON i18n scanner](https://github.com/Jwan999/frontend-conqueror/issues/4) |
-| Vue + Laravel `lang/*.json` | ⚠️ | ✅ | ✅ | [#4](https://github.com/Jwan999/frontend-conqueror/issues/4) |
+| Vue + vue-i18n with JSON bundles | ✅ | ✅ | ✅ | v0.5.1 — path identity via JSON scanner |
+| Vue + Laravel `lang/*.json` | ✅ | ✅ | ✅ | v0.5.1 |
 | Inertia + Vue (Laravel) | ⚠️ | ✅ | ✅ | Templates work; `lang/*.php` blocked on [#6](https://github.com/Jwan999/frontend-conqueror/issues/6) |
 | Vue + i18n imported across files | ⚠️ | ✅ | ✅ | Scanner is single-file; cross-file resolution not yet built |
 
@@ -87,7 +87,7 @@ These stacks bundle their own Vue/React internals or don't expose source-on-disk
 | [#1 — Magic-link email verification](https://github.com/Jwan999/frontend-conqueror/issues/1) | Hardens Tester auth across all stacks | Open |
 | [#2 — TOTP / 2FA on admin](https://github.com/Jwan999/frontend-conqueror/issues/2) | Admin security, all stacks | Open |
 | [#3 — Real-time mode-color sync](https://github.com/Jwan999/frontend-conqueror/issues/3) | UX polish, all stacks | Open |
-| [#4 — JSON i18n scanner](https://github.com/Jwan999/frontend-conqueror/issues/4) | Tier 2 → Tier 1 for JSON-bundle projects | Open |
+| [#4 — JSON i18n scanner](https://github.com/Jwan999/frontend-conqueror/issues/4) | Tier 2 → Tier 1 for JSON-bundle projects | ✅ Closed in v0.5.1 |
 | [#5 — JSX/Svelte/Astro scanners](https://github.com/Jwan999/frontend-conqueror/issues/5) | Tier 3 → Tier 1 for React/Svelte/Astro | Open |
 | [#6 — Blade + PHP-lang scanners](https://github.com/Jwan999/frontend-conqueror/issues/6) | Tier 4 → Tier 1 for Laravel | Open |
 

@@ -377,6 +377,35 @@ function handleEditLoc(ws, msg) {
     }
     const newInner = escapeForStringLiteral(newText, q);
     updated = content.slice(0, offset) + q + newInner + q + content.slice(offset + length);
+  } else if (kind === 'json-string') {
+    // JSON string literal: always double-quoted; escape only what JSON requires.
+    if (content[offset] !== '"' || content[offset + length - 1] !== '"') {
+      ws.send(JSON.stringify({
+        type: 'rejected', id, reason: 'out-of-sync',
+        message: `expected JSON string at ${file}:${offset} — file may have changed.`,
+      }));
+      return;
+    }
+    const innerRaw = content.slice(offset + 1, offset + length - 1);
+    let decoded;
+    try { decoded = JSON.parse('"' + innerRaw + '"'); }
+    catch {
+      ws.send(JSON.stringify({
+        type: 'rejected', id, reason: 'out-of-sync',
+        message: `JSON string at ${file}:${offset} could not be decoded.`,
+      }));
+      return;
+    }
+    if (decoded !== oldText) {
+      ws.send(JSON.stringify({
+        type: 'rejected', id, reason: 'out-of-sync',
+        message: `value at ${file}:${offset} no longer matches "${truncate(oldText, 40)}"`,
+      }));
+      return;
+    }
+    // JSON.stringify produces a properly-escaped string with surrounding quotes.
+    const newJson = JSON.stringify(newText);
+    updated = content.slice(0, offset) + newJson + content.slice(offset + length);
   } else {
     ws.send(JSON.stringify({ type: 'error', id, message: `unknown kind: ${kind}` }));
     return;
