@@ -10,6 +10,39 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.5.0] — 2026-05-13
+
+Major feature release: **one gate can now serve any number of projects**, with a redesigned admin and heartbeat-based auto-discovery. Existing v0.4.x singleton deploys keep working — data migrates on first load.
+
+### Added
+- **Multi-project gate.** A single gate process now hosts N projects with shared Linear API key (overridable per project) and per-project tester allowlists. The Linear destination is per-project.
+- **Plugin option:** `gate: { url, project }`. The `project` key identifies which project on the gate to report to.
+- **Two overlay URL forms** so prod HTML can be project-aware without inline config:
+  - `/<project>/overlay.js` (recommended) — gate bakes project key into the overlay config server-side.
+  - `/overlay.js?project=<key>` — query-string form for callers that can't customize paths.
+- **Heartbeat endpoint** (`POST /api/heartbeat`). Overlay pings on load and every 5 minutes while the page stays open. Auto-creates pending projects so new plugin installs surface in the admin without manual "Add project" clicks.
+- **Per-project activity tracking:** origins seen, page URLs (rolling 100), daily-unique-IP count (IPs hashed daily, never stored raw), heartbeat counts, reports filed.
+- **Rewritten admin UI** — three focused screens (project list, project detail, global settings), a 5-step first-time setup wizard, and a 2-step quick wizard for activating pending projects.
+- **Pending / active / disabled** project statuses. Pending projects appear at the top of the list with a one-click "Configure" CTA.
+
+### Changed
+- **Admin URL is now stable** at `/frontend-conqueror` regardless of `GATE_PROJECT_NAME`. Each project's detail page is at `/frontend-conqueror#/p/<key>`.
+- **Gate routes refactored:**
+  - `POST /api/verify-email` now takes `project` in the body (falls back to the gate's default project if exactly one active project exists).
+  - `POST /api/report-issue` reads `project` from the tester JWT.
+  - New project CRUD: `POST/PUT/GET/DELETE /frontend-conqueror/projects[/:key][/emails|/linear-project]`.
+  - Global Linear endpoints operate on top-level `data.linear` instead of `data.settings.linear`.
+- **JWT shape:** tester tokens now include a `project` claim. Tokens issued by v0.4.x are rejected with `stale-token` — testers re-verify their email once. One-time UX cost on upgrade.
+- Overlay heartbeats fire automatically when `gate.project` is set; no-op otherwise.
+
+### Migration
+- **Old `data.json`** (`settings: { projectName, emails, linear }`) is migrated on first load into the new shape: top-level `linear` (shared key + team) and `projects: { [key]: { ... } }` with the migrated singleton as the first project (status: `active`). The migration is non-destructive and idempotent.
+- **Existing plugin configs** with `gate: { url }` (no `project`) keep working as long as exactly one active project exists on the gate (the gate falls back to it). Set `gate.project` explicitly once you have multiple.
+
+### Compatibility
+- Existing PM2 / Docker / systemd deploys unchanged. Same env vars (`GATE_PORT`, `GATE_HOST`, `GATE_DATA`, `GATE_PUBLIC_URL`, `GATE_JWT_SECRET`, `GATE_ADMIN_PASSWORD`).
+- New optional env var: `GATE_DEFAULT_PROJECT` — picks which project handles ambiguous-project requests when multiple are active.
+
 ## [0.4.1] — 2026-05-13
 
 ### Added
@@ -63,7 +96,8 @@ See [STACKS.md](./STACKS.md) for the full matrix.
 
 ---
 
-[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Jwan999/frontend-conqueror/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Jwan999/frontend-conqueror/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Jwan999/frontend-conqueror/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Jwan999/frontend-conqueror/releases/tag/v0.3.0

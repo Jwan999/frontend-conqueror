@@ -28,9 +28,13 @@ export default defineNuxtConfig({
         // Auto-spawns the agent on this port. Use a unique port per project
         // if you run multiple dev servers simultaneously.
         agentPort: 54321,
-        // Gate URL for Test mode. Use a public URL in prod; localhost in dev.
+        // Gate URL + project key for Test mode.
+        // `project` matches a project registered in the gate's admin panel.
+        // If your gate auto-registers projects from heartbeats, the first
+        // page load surfaces it as 'pending' for the admin to configure.
         gate: {
           url: process.env.NUXT_PUBLIC_GATE_URL || 'http://localhost:54322',
+          project: 'my-app',          // e.g. 'messarat', 'tm', 'tawtheef'
         },
       }),
     ] : [],

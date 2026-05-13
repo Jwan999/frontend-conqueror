@@ -34,35 +34,152 @@ const OVERLAY_FILE = path.join(__dirname, '..', 'overlay', 'overlay.js');
 
 // ---------- Storage ----------
 const DEFAULT_MODE_COLORS = { edit: '#2563eb', test: '#f59e0b', todo: '#059669' };
+// v0.5.0 shape:
+//   { modeColors, adminPasswordHash, linear: {apiKey,teamId,teamName},
+//     projects: { [key]: { key, displayName, status, emails,
+//                          linearProjectId, linearProjectName,
+//                          linearApiKey, linearTeamId,         (per-project overrides; null=use global)
+//                          activity: { firstSeenAt, lastSeenAt, totalHeartbeats,
+//                                      origins: { [origin]: count },
+//                                      pages: [url, ...],            (rolling, max 100)
+//                                      dailyIpHashes: [{ day, hashes: [] }],  (rolling 7 days)
+//                                      reportsCount },
+//                          createdAt } } }
 const DEFAULT_DATA = () => ({
   modeColors: { ...DEFAULT_MODE_COLORS },
-  settings: {
-    projectName: DEFAULT_PROJECT_NAME,
-    emails: [],
-    linear: null, // { apiKey, teamId, availableTeams, projectId, projectName }
-  },
+  linear: null,    // { apiKey, teamId, teamName, availableTeams }
+  projects: {},
 });
+function emptyActivity() {
+  return {
+    firstSeenAt: null,
+    lastSeenAt: null,
+    totalHeartbeats: 0,
+    origins: {},
+    pages: [],
+    dailyIpHashes: [],
+    reportsCount: 0,
+  };
+}
+function emptyProject(key, displayName) {
+  return {
+    key,
+    displayName: displayName || key,
+    status: 'pending',                   // pending | active | disabled
+    emails: [],
+    linearProjectId: '',
+    linearProjectName: '',
+    linearApiKey: null,                  // per-project override
+    linearTeamId: null,
+    activity: emptyActivity(),
+    createdAt: Math.floor(Date.now() / 1000),
+  };
+}
 function loadData() {
   let data;
   try { data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
   catch { data = DEFAULT_DATA(); }
-  // Migrate old multi-project shape if present.
-  if (data.projects && !data.settings) {
-    const keys = Object.keys(data.projects);
-    const first = keys.length ? data.projects[keys[0]] : null;
-    data.settings = {
-      projectName: (first && first.name) || DEFAULT_PROJECT_NAME,
-      emails: (first && first.emails) || [],
-      linear: (first && first.linear) || null,
-    };
-    delete data.projects;
+
+  // ---- v0.5.0 migration from singleton shape ----
+  // Old shape: { modeColors, adminPasswordHash, settings: { projectName, emails, linear } }
+  if (data.settings && !data.projects) {
+    const oldS = data.settings;
+    const key = String(oldS.projectName || DEFAULT_PROJECT_NAME).trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/(^-|-$)/g, '') || 'default';
+    const oldLin = oldS.linear || null;
+    // Promote global Linear key + team if we had one.
+    if (oldLin && oldLin.apiKey) {
+      data.linear = {
+        apiKey: oldLin.apiKey,
+        teamId: oldLin.teamId || '',
+        teamName: oldLin.teamName || '',
+        availableTeams: oldLin.availableTeams || null,
+      };
+    }
+    const proj = emptyProject(key, oldS.projectName);
+    proj.status = 'active';
+    proj.emails = Array.isArray(oldS.emails) ? oldS.emails : [];
+    if (oldLin) {
+      proj.linearProjectId = oldLin.projectId || '';
+      proj.linearProjectName = oldLin.projectName || '';
+    }
+    data.projects = { [key]: proj };
+    delete data.settings;
   }
+
+  // Pre-v0.5.0 alpha (very old multi-project shape; same migration target).
+  if (data.projects && data.projects.length === undefined && Object.values(data.projects).some((p) => p && p.linear && p.linear.apiKey)) {
+    // If any project still has its own .linear object, promote the first one to global.
+    if (!data.linear) {
+      for (const p of Object.values(data.projects)) {
+        if (p && p.linear && p.linear.apiKey) {
+          data.linear = {
+            apiKey: p.linear.apiKey,
+            teamId: p.linear.teamId || '',
+            teamName: p.linear.teamName || '',
+            availableTeams: p.linear.availableTeams || null,
+          };
+          break;
+        }
+      }
+    }
+    for (const [k, p] of Object.entries(data.projects)) {
+      if (!p) continue;
+      if (p.linear) {
+        p.linearProjectId = p.linearProjectId || p.linear.projectId || '';
+        p.linearProjectName = p.linearProjectName || p.linear.projectName || '';
+        delete p.linear;
+      }
+      if (!p.key) p.key = k;
+      if (!p.status) p.status = 'active';
+      if (!p.activity) p.activity = emptyActivity();
+      if (!p.createdAt) p.createdAt = Math.floor(Date.now() / 1000);
+    }
+  }
+
   if (!data.modeColors) data.modeColors = { ...DEFAULT_MODE_COLORS };
-  if (!data.settings) data.settings = DEFAULT_DATA().settings;
+  if (!data.projects) data.projects = {};
+  if (data.linear === undefined) data.linear = null;
   return data;
 }
 function saveData(data) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+}
+
+// Sanitize a string into a project key: lowercase, alphanum + dash.
+function normalizeProjectKey(s) {
+  return String(s || '').trim().toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/(^-|-$)/g, '')
+    .slice(0, 64);
+}
+// Returns the project to use when no project key is given. If exactly one
+// active project exists, that's it. Otherwise null (caller responsible for
+// rejecting). GATE_DEFAULT_PROJECT env var overrides.
+function defaultProject(data) {
+  const envDefault = normalizeProjectKey(process.env.GATE_DEFAULT_PROJECT || '');
+  if (envDefault && data.projects[envDefault]) return data.projects[envDefault];
+  const active = Object.values(data.projects).filter((p) => p.status === 'active');
+  if (active.length === 1) return active[0];
+  return null;
+}
+// Resolve the Linear credentials a project uses: per-project override if set,
+// else falls back to the global gate Linear config.
+function projectLinear(data, proj) {
+  const apiKey = proj.linearApiKey || (data.linear && data.linear.apiKey) || null;
+  const teamId = proj.linearTeamId || (data.linear && data.linear.teamId) || null;
+  return {
+    apiKey,
+    teamId,
+    projectId: proj.linearProjectId || '',
+    projectName: proj.linearProjectName || '',
+  };
+}
+// SHA-256 of an IP + the gate's daily salt. Daily salt rotates each UTC day,
+// so we can compute unique-IP counts without storing raw IPs.
+function dayKey() { return new Date().toISOString().slice(0, 10); }
+function ipHash(ip) {
+  const day = dayKey();
+  return crypto.createHash('sha256').update(JWT_SECRET + ':' + day + ':' + ip).digest('hex').slice(0, 16);
 }
 
 // ---------- Crypto helpers ----------
@@ -252,19 +369,52 @@ async function createLinearIssue(linear, issue) {
   return data.issueCreate.issue;
 }
 
-// Public projection of `settings` for the admin UI. Hides the API key value
-// itself (only signals presence).
-function publicSettings(settings) {
+// Hide API key value; signal presence only.
+function publicLinear(linear) {
+  if (!linear) return null;
   return {
-    projectName: settings.projectName,
-    emails: settings.emails || [],
-    linear: settings.linear ? {
-      hasApiKey: !!settings.linear.apiKey,
-      teamId: settings.linear.teamId || '',
-      availableTeams: settings.linear.availableTeams || null,
-      projectId: settings.linear.projectId || '',
-      projectName: settings.linear.projectName || '',
-    } : null,
+    hasApiKey: !!linear.apiKey,
+    teamId: linear.teamId || '',
+    teamName: linear.teamName || '',
+    availableTeams: linear.availableTeams || null,
+  };
+}
+// Per-project summary for the admin list (no allowlist values leaked here).
+function publicProjectSummary(p) {
+  const a = p.activity || emptyActivity();
+  return {
+    key: p.key,
+    displayName: p.displayName,
+    status: p.status,
+    emailsCount: (p.emails || []).length,
+    linearProjectName: p.linearProjectName || '',
+    hasLinearOverride: !!(p.linearApiKey || p.linearTeamId),
+    activity: {
+      firstSeenAt: a.firstSeenAt,
+      lastSeenAt: a.lastSeenAt,
+      totalHeartbeats: a.totalHeartbeats,
+      originsCount: Object.keys(a.origins || {}).length,
+      pagesCount: (a.pages || []).length,
+      reportsCount: a.reportsCount || 0,
+      uniqueIpsToday: ((a.dailyIpHashes || []).find((d) => d.day === dayKey())?.hashes.length) || 0,
+    },
+    createdAt: p.createdAt,
+  };
+}
+// Full project detail for the admin's project page.
+function publicProjectDetail(p) {
+  return {
+    ...publicProjectSummary(p),
+    emails: p.emails || [],
+    linearProjectId: p.linearProjectId || '',
+    linearApiKey: null, // never sent
+    linearApiKeySet: !!p.linearApiKey,
+    linearTeamId: p.linearTeamId || null,
+    activity: {
+      ...publicProjectSummary(p).activity,
+      origins: p.activity?.origins || {},
+      pages: (p.activity?.pages || []).slice(-50),
+    },
   };
 }
 
@@ -287,12 +437,15 @@ async function handle(req, res) {
     await new Promise((r) => setTimeout(r, 300));
     if (!body || !isValidEmail(body.email)) return send(res, 403, { error: 'not-allowed' });
     const data = loadData();
+    const projKey = normalizeProjectKey(body.project || '');
+    const proj = projKey ? data.projects[projKey] : defaultProject(data);
+    if (!proj || proj.status !== 'active') return send(res, 403, { error: 'not-allowed' });
     const lcEmail = body.email.toLowerCase().trim();
-    const allowed = (data.settings.emails || []).some((e) => e.toLowerCase().trim() === lcEmail);
+    const allowed = (proj.emails || []).some((e) => e.toLowerCase().trim() === lcEmail);
     if (!allowed) return send(res, 403, { error: 'not-allowed' });
     const exp = Math.floor(Date.now() / 1000) + JWT_TTL_SECONDS;
-    const token = signToken({ email: lcEmail, exp });
-    return send(res, 200, { token, expiresAt: exp, project: { name: data.settings.projectName } });
+    const token = signToken({ email: lcEmail, project: proj.key, exp });
+    return send(res, 200, { token, expiresAt: exp, project: { key: proj.key, name: proj.displayName } });
   }
 
   if (method === 'POST' && route === '/api/report-issue') {
@@ -302,16 +455,22 @@ async function handle(req, res) {
     const { token, issue } = body || {};
     const payload = verifyToken(token);
     if (!payload) return send(res, 401, { error: 'not-authorized' });
+    if (!payload.project) return send(res, 401, { error: 'stale-token' });  // pre-v0.5.0 token, re-verify
     const data = loadData();
-    const stillAllowed = (data.settings.emails || []).some((e) => e.toLowerCase().trim() === payload.email);
+    const proj = data.projects[payload.project];
+    if (!proj || proj.status !== 'active') return send(res, 401, { error: 'project-gone' });
+    const stillAllowed = (proj.emails || []).some((e) => e.toLowerCase().trim() === payload.email);
     if (!stillAllowed) return send(res, 401, { error: 'revoked' });
     if (!issue || typeof issue.title !== 'string' || !issue.title.trim()) {
       return send(res, 400, { error: 'missing-title' });
     }
+    const linCreds = projectLinear(data, proj);
+    if (!linCreds.apiKey) return send(res, 503, { error: 'linear-not-configured' });
+    if (!linCreds.projectId) return send(res, 503, { error: 'linear-project-not-set' });
     const title = trunc(issue.title.trim(), 200);
     const meta = issue.meta || {};
     const description = [
-      `**Reported via Test Mode** by \`${payload.email}\``,
+      `**Reported via Test Mode** by \`${payload.email}\` for project \`${proj.displayName}\``,
       '',
       issue.description ? issue.description.trim() : '',
       '',
@@ -323,13 +482,69 @@ async function handle(req, res) {
       meta.userAgent ? `**UA:** ${meta.userAgent}` : '',
     ].filter(Boolean).join('\n');
     try {
-      const created = await createLinearIssue(data.settings.linear, { title, description });
-      console.log(`[gate] issue ${created.identifier || created.id} by ${payload.email}`);
+      const created = await createLinearIssue(linCreds, { title, description });
+      proj.activity = proj.activity || emptyActivity();
+      proj.activity.reportsCount = (proj.activity.reportsCount || 0) + 1;
+      saveData(data);
+      console.log(`[gate] issue ${created.identifier || created.id} for ${proj.key} by ${payload.email}`);
       return send(res, 200, { ok: true, issue: created });
     } catch (e) {
       console.error('[gate] linear error:', e.message);
       return send(res, 502, { error: 'linear-failed', message: e.message });
     }
+  }
+
+  // Heartbeat — overlay pings on load + every 5min. Auto-creates pending
+  // projects when an unknown key arrives so the admin sees them surface.
+  if (method === 'POST' && route === '/api/heartbeat') {
+    if (!rateLimit('heartbeat', getClientIp(req), 60, 60_000)) return send(res, 204, null);
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+    const key = normalizeProjectKey(body && body.project);
+    if (!key) return send(res, 400, { error: 'missing-project' });
+    const data = loadData();
+    let proj = data.projects[key];
+    if (!proj) {
+      proj = emptyProject(key, body.displayName || key);
+      proj.status = 'pending';
+      data.projects[key] = proj;
+      console.log(`[gate] pending project auto-registered: ${key}`);
+    }
+    const a = proj.activity = proj.activity || emptyActivity();
+    const now = Math.floor(Date.now() / 1000);
+    if (!a.firstSeenAt) a.firstSeenAt = now;
+    a.lastSeenAt = now;
+    a.totalHeartbeats = (a.totalHeartbeats || 0) + 1;
+    if (body.origin && typeof body.origin === 'string') {
+      const origin = body.origin.slice(0, 200);
+      a.origins = a.origins || {};
+      a.origins[origin] = (a.origins[origin] || 0) + 1;
+    }
+    if (body.url && typeof body.url === 'string') {
+      a.pages = a.pages || [];
+      const u = body.url.slice(0, 300);
+      if (!a.pages.includes(u)) {
+        a.pages.push(u);
+        if (a.pages.length > 100) a.pages.shift();
+      }
+    }
+    // Daily-unique-IP count via hashed bucket.
+    const today = dayKey();
+    a.dailyIpHashes = a.dailyIpHashes || [];
+    // Trim entries older than 7 days.
+    a.dailyIpHashes = a.dailyIpHashes.filter((d) => {
+      const diff = (Date.parse(today) - Date.parse(d.day)) / 86_400_000;
+      return diff >= 0 && diff < 7;
+    });
+    let today_entry = a.dailyIpHashes.find((d) => d.day === today);
+    if (!today_entry) { today_entry = { day: today, hashes: [] }; a.dailyIpHashes.push(today_entry); }
+    const h = ipHash(getClientIp(req));
+    if (!today_entry.hashes.includes(h)) {
+      today_entry.hashes.push(h);
+      if (today_entry.hashes.length > 10_000) today_entry.hashes.shift();
+    }
+    saveData(data);
+    return send(res, 204, null);
   }
 
   if (method === 'GET' && route === '/api/mode-colors') {
@@ -339,13 +554,24 @@ async function handle(req, res) {
 
   // Production overlay: same overlay.js, but trimmed at runtime via the
   // injected config — only Test mode is enabled, no agent WebSocket, no
-  // i18n-map endpoint expected. This is what host apps include in prod via
-  // <script src="https://<gate>/overlay.js" defer>.
-  if (method === 'GET' && route === '/overlay.js') {
+  // i18n-map endpoint expected.
+  //
+  // Two URL forms are accepted so plugin configs can opt-in to multi-project:
+  //   GET /overlay.js                    — uses default project (or no project)
+  //   GET /overlay.js?project=messarat   — project via query string
+  //   GET /:project/overlay.js           — project via path (recommended)
+  const overlayProjectMatch = route.match(/^\/([a-z0-9][a-z0-9-]{0,63})\/overlay\.js$/);
+  if (method === 'GET' && (route === '/overlay.js' || overlayProjectMatch)) {
     try {
       const body = fs.readFileSync(OVERLAY_FILE, 'utf8');
+      let project = '';
+      if (overlayProjectMatch) {
+        project = overlayProjectMatch[1];
+      } else if (parsed.query && typeof parsed.query.project === 'string') {
+        project = normalizeProjectKey(parsed.query.project);
+      }
       const cfg = {
-        gate: { url: PUBLIC_URL },
+        gate: { url: PUBLIC_URL, project: project || null },
         enabledModes: ['test'],
         mapUrl: null,
         wsUrl: null,
@@ -404,7 +630,100 @@ async function handle(req, res) {
   if (method === 'GET' && route === '/frontend-conqueror/state') {
     if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
     const data = loadData();
-    return send(res, 200, { settings: publicSettings(data.settings), modeColors: data.modeColors });
+    const projects = Object.values(data.projects).map(publicProjectSummary)
+      .sort((a, b) => (a.displayName || '').localeCompare(b.displayName || ''));
+    return send(res, 200, {
+      modeColors: data.modeColors,
+      linear: publicLinear(data.linear),
+      projects,
+      pendingCount: projects.filter((p) => p.status === 'pending').length,
+    });
+  }
+
+  // ----- Admin: project CRUD -----
+
+  if (method === 'POST' && route === '/frontend-conqueror/projects') {
+    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+    const data = loadData();
+    const key = normalizeProjectKey(body.key || body.displayName || '');
+    if (!key) return send(res, 400, { error: 'missing-key' });
+    if (data.projects[key]) return send(res, 409, { error: 'already-exists' });
+    const proj = emptyProject(key, body.displayName || key);
+    proj.status = 'active';
+    if (Array.isArray(body.emails)) {
+      proj.emails = body.emails.filter(isValidEmail).map((e) => e.toLowerCase().trim()).slice(0, 500);
+    }
+    data.projects[key] = proj;
+    saveData(data);
+    return send(res, 200, { project: publicProjectDetail(proj) });
+  }
+
+  const projectMatch = route.match(/^\/frontend-conqueror\/projects\/([a-z0-9][a-z0-9-]{0,63})(?:\/(.+))?$/);
+  if (projectMatch) {
+    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
+    const data = loadData();
+    const key = projectMatch[1];
+    const sub = projectMatch[2] || null;
+    const proj = data.projects[key];
+    if (!proj) return send(res, 404, { error: 'no-such-project' });
+
+    if (method === 'GET' && !sub) {
+      return send(res, 200, { project: publicProjectDetail(proj) });
+    }
+    if (method === 'DELETE' && !sub) {
+      delete data.projects[key];
+      saveData(data);
+      return send(res, 200, { ok: true });
+    }
+    if (method === 'PUT' && !sub) {
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+      if (typeof body.displayName === 'string' && body.displayName.trim()) {
+        proj.displayName = body.displayName.trim().slice(0, 80);
+      }
+      if (typeof body.status === 'string' && ['active', 'pending', 'disabled'].includes(body.status)) {
+        proj.status = body.status;
+      }
+      saveData(data);
+      return send(res, 200, { project: publicProjectDetail(proj) });
+    }
+    if (method === 'PUT' && sub === 'emails') {
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+      if (!Array.isArray(body.emails)) return send(res, 400, { error: 'missing-emails' });
+      proj.emails = body.emails.filter(isValidEmail).map((e) => e.toLowerCase().trim()).slice(0, 500);
+      saveData(data);
+      return send(res, 200, { project: publicProjectDetail(proj) });
+    }
+    if (method === 'PUT' && sub === 'linear-project') {
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+      const lin = projectLinear(data, proj);
+      if (!lin.apiKey) return send(res, 400, { error: 'no-api-key' });
+      if (!lin.teamId) return send(res, 400, { error: 'no-team' });
+      try {
+        let linProj = null;
+        if (typeof body.projectId === 'string' && body.projectId.trim()) {
+          const projects = await fetchLinearProjectsInTeam(lin.apiKey, lin.teamId);
+          linProj = projects.find((p) => p.id === body.projectId.trim());
+          if (!linProj) return send(res, 404, { error: 'project-not-in-team' });
+        } else if (typeof body.newName === 'string' && body.newName.trim()) {
+          linProj = await createLinearProject(lin.apiKey, lin.teamId, body.newName.trim());
+          console.log(`[gate] created Linear project "${linProj.name}" (${linProj.id})`);
+        } else {
+          return send(res, 400, { error: 'missing-project' });
+        }
+        proj.linearProjectId = linProj.id;
+        proj.linearProjectName = linProj.name;
+        saveData(data);
+        return send(res, 200, { project: publicProjectDetail(proj) });
+      } catch (e) {
+        return send(res, 502, { error: 'linear-unreachable', message: e.message });
+      }
+    }
+    return send(res, 404, { error: 'not-found' });
   }
 
   if (method === 'PUT' && route === '/frontend-conqueror/password') {
@@ -442,30 +761,7 @@ async function handle(req, res) {
     return send(res, 200, { modeColors: next });
   }
 
-  // ----- Admin: project meta + emails -----
-
-  if (method === 'PUT' && route === '/frontend-conqueror/project') {
-    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
-    let body;
-    try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
-    const data = loadData();
-    if (typeof body.projectName === 'string' && body.projectName.trim()) {
-      data.settings.projectName = body.projectName.trim().slice(0, 80);
-    }
-    if (Array.isArray(body.emails)) {
-      data.settings.emails = body.emails.filter(isValidEmail).map((e) => e.toLowerCase().trim()).slice(0, 500);
-    }
-    saveData(data);
-    return send(res, 200, { settings: publicSettings(data.settings) });
-  }
-
-  // ----- Admin: Linear -----
-  // The Linear setup is staged:
-  //   1) PUT /linear/api-key { apiKey }      → stores key, auto-resolves teams
-  //   2) PUT /linear/team    { teamId }      → picks a team (only needed if >1)
-  //   3) GET /linear/projects                → list Linear projects in the chosen team
-  //   4) PUT /linear/project { projectId | newName }
-  //                                          → select existing or create new
+  // ----- Admin: global Linear (shared across all projects by default) -----
 
   if (method === 'PUT' && route === '/frontend-conqueror/linear/api-key') {
     if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
@@ -474,18 +770,19 @@ async function handle(req, res) {
     const data = loadData();
     const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
     if (!apiKey) return send(res, 400, { error: 'missing-api-key' });
-    // Reset everything downstream — new key invalidates prior team/project state.
-    data.settings.linear = { apiKey, teamId: '', availableTeams: null, projectId: '', projectName: '' };
+    // Reset team. Per-project Linear destinations stay (they're scoped to teamId).
+    data.linear = { apiKey, teamId: '', teamName: '', availableTeams: null };
     saveData(data);
     try {
       const teams = await fetchLinearTeams(apiKey);
       if (teams.length === 1) {
-        data.settings.linear.teamId = teams[0].id;
+        data.linear.teamId = teams[0].id;
+        data.linear.teamName = teams[0].name;
       } else if (teams.length > 1) {
-        data.settings.linear.availableTeams = teams;
+        data.linear.availableTeams = teams;
       }
       saveData(data);
-      return send(res, 200, { settings: publicSettings(data.settings), resolution: teams.length === 0 ? 'no-teams' : teams.length === 1 ? 'auto-team' : 'pick-team' });
+      return send(res, 200, { linear: publicLinear(data.linear), resolution: teams.length === 0 ? 'no-teams' : teams.length === 1 ? 'auto-team' : 'pick-team' });
     } catch (e) {
       return send(res, 502, { error: 'linear-unreachable', message: e.message });
     }
@@ -496,22 +793,21 @@ async function handle(req, res) {
     let body;
     try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
     const data = loadData();
-    if (!data.settings.linear || !data.settings.linear.apiKey) return send(res, 400, { error: 'no-api-key' });
+    if (!data.linear || !data.linear.apiKey) return send(res, 400, { error: 'no-api-key' });
     const teamId = typeof body.teamId === 'string' ? body.teamId.trim() : '';
     if (!teamId) return send(res, 400, { error: 'missing-team-id' });
-    data.settings.linear.teamId = teamId;
-    data.settings.linear.availableTeams = null;
-    // Switching team invalidates the previously-chosen Linear project.
-    data.settings.linear.projectId = '';
-    data.settings.linear.projectName = '';
+    const team = (data.linear.availableTeams || []).find((t) => t.id === teamId);
+    data.linear.teamId = teamId;
+    data.linear.teamName = team ? team.name : (data.linear.teamName || '');
+    data.linear.availableTeams = null;
     saveData(data);
-    return send(res, 200, { settings: publicSettings(data.settings) });
+    return send(res, 200, { linear: publicLinear(data.linear) });
   }
 
   if (method === 'GET' && route === '/frontend-conqueror/linear/projects') {
     if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
     const data = loadData();
-    const lin = data.settings.linear;
+    const lin = data.linear;
     if (!lin || !lin.apiKey) return send(res, 400, { error: 'no-api-key' });
     if (!lin.teamId) return send(res, 400, { error: 'no-team' });
     try {
@@ -522,42 +818,12 @@ async function handle(req, res) {
     }
   }
 
-  if (method === 'PUT' && route === '/frontend-conqueror/linear/project') {
-    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
-    let body;
-    try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
-    const data = loadData();
-    const lin = data.settings.linear;
-    if (!lin || !lin.apiKey || !lin.teamId) return send(res, 400, { error: 'team-not-set' });
-    try {
-      let project = null;
-      if (typeof body.projectId === 'string' && body.projectId.trim()) {
-        // Select an existing Linear project (resolve its name for display).
-        const projects = await fetchLinearProjectsInTeam(lin.apiKey, lin.teamId);
-        project = projects.find((p) => p.id === body.projectId.trim());
-        if (!project) return send(res, 404, { error: 'project-not-in-team' });
-      } else if (typeof body.newName === 'string' && body.newName.trim()) {
-        // Create a new Linear project under the chosen team.
-        project = await createLinearProject(lin.apiKey, lin.teamId, body.newName.trim());
-        console.log(`[gate] created Linear project "${project.name}" (${project.id})`);
-      } else {
-        return send(res, 400, { error: 'missing-project' });
-      }
-      lin.projectId = project.id;
-      lin.projectName = project.name;
-      saveData(data);
-      return send(res, 200, { settings: publicSettings(data.settings), project });
-    } catch (e) {
-      return send(res, 502, { error: 'linear-unreachable', message: e.message });
-    }
-  }
-
   if (method === 'DELETE' && route === '/frontend-conqueror/linear') {
     if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
     const data = loadData();
-    data.settings.linear = null;
+    data.linear = null;
     saveData(data);
-    return send(res, 200, { settings: publicSettings(data.settings) });
+    return send(res, 200, { linear: null });
   }
 
   // ----- Admin page -----
@@ -577,40 +843,97 @@ const ADMIN_HTML = `<!doctype html>
 <title>frontend-conqueror · gate admin</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-  :root { --c-bg:#0b1220; --c-card:#111827; --c-text:#e5e7eb; --c-muted:#9ca3af; --c-accent:#2563eb; --c-danger:#dc2626; --c-ok:#059669; }
+  :root {
+    --bg:#0b1220; --card:#111827; --card2:#0f1726;
+    --text:#e5e7eb; --muted:#9ca3af; --dim:#6b7280;
+    --accent:#2563eb; --ok:#10b981; --warn:#f59e0b; --danger:#ef4444;
+    --border:#1f2937; --border2:#374151;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: var(--c-bg); color: var(--c-text); min-height: 100vh; }
-  header { padding: 18px 24px; border-bottom: 1px solid #1f2937; display: flex; justify-content: space-between; align-items: center; }
-  header h1 { margin: 0; font-size: 14px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--c-muted); }
-  header button { background: transparent; border: 1px solid #374151; color: var(--c-muted); padding: 4px 10px; border-radius: 6px; cursor: pointer; font: inherit; }
-  main { max-width: 880px; margin: 0 auto; padding: 24px; }
-  .card { background: var(--c-card); border: 1px solid #1f2937; border-radius: 10px; padding: 18px; margin-bottom: 16px; }
-  .card h2 { margin: 0 0 12px; font-size: 13px; color: var(--c-muted); letter-spacing: 0.05em; text-transform: uppercase; }
-  .sub { font-size: 11px; color: var(--c-muted); margin-bottom: 12px; }
-  label { display: block; font-size: 11px; color: var(--c-muted); margin: 8px 0 4px; text-transform: uppercase; letter-spacing: 0.05em; }
-  input, select, textarea { width: 100%; background: #0b1220; border: 1px solid #374151; color: var(--c-text); padding: 8px 10px; border-radius: 6px; font: inherit; outline: none; }
-  input:focus, select:focus, textarea:focus { border-color: var(--c-accent); }
-  button.primary { background: var(--c-accent); color: white; border: 0; padding: 8px 14px; border-radius: 6px; cursor: pointer; font: inherit; font-weight: 600; }
-  button.primary:hover { filter: brightness(1.1); }
-  button.primary:disabled { opacity: 0.6; cursor: default; }
-  button.ghost { background: transparent; border: 1px solid #374151; color: var(--c-muted); padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit; }
-  button.ghost:hover { background: #1f2937; }
-  button.danger { background: transparent; color: var(--c-danger); border: 1px solid #4b1e22; padding: 4px 10px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 12px; }
-  button.danger:hover { background: rgba(220,38,38,0.1); }
+  body { margin:0; font:14px/1.55 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header { padding: 14px 22px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  header .brand { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  header .right { display:flex; gap:10px; align-items:center; font-size: 12px; color: var(--muted); }
+  header button { background: transparent; border: 1px solid var(--border2); color: var(--muted); padding: 5px 11px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 12px; }
+  header button:hover { background: var(--card); color: var(--text); }
+  main { max-width: 820px; margin: 0 auto; padding: 24px 22px 60px; }
+  h2 { margin: 0 0 6px; font-size: 22px; font-weight: 600; color: var(--text); }
+  h2 .sub { display: block; font-size: 12px; font-weight: 400; color: var(--muted); margin-top: 4px; letter-spacing: 0; text-transform: none; }
+  h3 { margin: 0 0 10px; font-size: 13px; color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; font-weight: 600; }
+  .crumbs { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+  .crumbs a { color: var(--muted); }
+  .crumbs a:hover { color: var(--text); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 14px; }
+  .card .body { color: var(--text); }
+  .card .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .sub-muted { color: var(--muted); font-size: 12px; }
   .row { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
-  .row input { flex: 1; }
-  .pill { display: inline-block; background: #1f2937; color: var(--c-muted); padding: 2px 8px; border-radius: 999px; font-size: 11px; margin-inline-end: 6px; }
-  .pill.ok { background: rgba(5,150,105,0.18); color: #6ee7b7; }
-  .pill.warn { background: rgba(245,158,11,0.18); color: #fcd34d; }
-  .empty { color: var(--c-muted); font-style: italic; }
-  .err { color: #fca5a5; margin: 6px 0; font-size: 12px; min-height: 14px; }
-  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-  code { background: #0b1220; padding: 2px 6px; border-radius: 4px; font: 12px/1 ui-monospace, Menlo, monospace; }
+  .row input, .row select { flex: 1; }
+  .row.spaced { justify-content: space-between; }
+  label { display: block; font-size: 11px; color: var(--muted); margin: 10px 0 4px; text-transform: uppercase; letter-spacing: 0.06em; }
+  input, select, textarea { width: 100%; background: var(--card2); border: 1px solid var(--border2); color: var(--text); padding: 9px 11px; border-radius: 6px; font: inherit; outline: none; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: white; border: 0; padding: 9px 16px; border-radius: 6px; cursor: pointer; font: inherit; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.1); }
+  button.primary:disabled { opacity: 0.5; cursor: default; }
+  button.ghost { background: transparent; border: 1px solid var(--border2); color: var(--muted); padding: 8px 14px; border-radius: 6px; cursor: pointer; font: inherit; }
+  button.ghost:hover { background: var(--card); color: var(--text); }
+  button.danger { background: transparent; color: var(--danger); border: 1px solid #4b1e22; padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 12px; }
+  button.danger:hover { background: rgba(239,68,68,0.08); }
+  .pill { display: inline-flex; align-items: center; gap: 4px; background: #1f2937; color: var(--muted); padding: 2px 9px; border-radius: 999px; font-size: 11px; }
+  .pill.pending { background: rgba(245,158,11,0.15); color: #fcd34d; }
+  .pill.active { background: rgba(16,185,129,0.15); color: #6ee7b7; }
+  .pill.disabled { background: rgba(107,114,128,0.15); color: var(--dim); }
+  .pill.dot::before { content: '●'; font-size: 8px; }
+  .empty { color: var(--muted); font-style: italic; padding: 16px 0; text-align: center; }
+  .err { color: #fca5a5; margin: 8px 0; font-size: 12px; min-height: 14px; }
+  .ok-line { color: var(--ok); margin: 8px 0; font-size: 12px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  code { background: var(--card2); padding: 2px 7px; border-radius: 4px; font: 12px/1 ui-monospace, Menlo, monospace; }
+  .project-card { display: block; background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 10px; cursor: pointer; transition: border-color 0.1s; }
+  .project-card:hover { border-color: var(--border2); text-decoration: none; }
+  .project-card .title { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .project-card .name { font-size: 15px; font-weight: 600; color: var(--text); }
+  .project-card .meta { color: var(--muted); font-size: 12px; margin-top: 6px; display: flex; gap: 14px; flex-wrap: wrap; }
+  .project-card.pending { border-style: dashed; }
+  .section-h { display: flex; justify-content: space-between; align-items: center; margin: 18px 0 10px; }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat .v { font-size: 18px; font-weight: 600; color: var(--text); }
+  .stat .l { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .step-dots { display: flex; gap: 6px; margin: 0 0 18px; }
+  .step-dots .d { width: 22px; height: 4px; border-radius: 2px; background: var(--border2); }
+  .step-dots .d.on { background: var(--accent); }
+  .step-dots .d.done { background: var(--ok); }
+  .origin-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .origin-list .o { display: flex; justify-content: space-between; }
+  .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: var(--card); border: 1px solid var(--border2); color: var(--text); padding: 10px 16px; border-radius: 8px; font-size: 13px; z-index: 9; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }
 </style></head>
 <body>
 <div id="root"></div>
+<div id="toast" style="display:none"></div>
 <script>
 const $ = (id) => document.getElementById(id);
+const root = () => $('root');
+const html = (strings, ...values) => strings.map((s, i) => s + (values[i] != null ? values[i] : '')).join('');
+const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+function toast(msg, kind) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'toast' + (kind === 'err' ? ' err' : '');
+  t.style.display = 'block';
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { t.style.display = 'none'; }, 3000);
+}
+function relTime(ts) {
+  if (!ts) return 'never';
+  const diff = Math.floor(Date.now() / 1000) - ts;
+  if (diff < 60) return diff + 's ago';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  return Math.floor(diff / 86400) + 'd ago';
+}
 async function api(method, route, body) {
   const r = await fetch(route, { method, headers: { 'Content-Type': 'application/json' }, body: body && JSON.stringify(body) });
   const text = await r.text();
@@ -619,337 +942,735 @@ async function api(method, route, body) {
   if (!r.ok) { const err = new Error((json && (json.message || json.error)) || r.statusText); err.payload = json; throw err; }
   return json;
 }
+
+// ============================== ROUTING ==============================
+// Simple hash router. Routes:
+//   #/login                       (handled outside the router; only when 401)
+//   #/                            project list
+//   #/settings                    global settings
+//   #/p/:key                      project detail
+//   #/p/:key/configure            project configuration wizard
+//   #/setup                       first-time wizard
+
+let STATE = null;          // last fetched state
+let ROUTE = null;          // current route object
+
+window.addEventListener('hashchange', () => navigate());
+window.addEventListener('load', () => navigate());
+
+function parseHash() {
+  const h = (window.location.hash || '#/').slice(1);
+  const parts = h.split('/').filter(Boolean);
+  if (parts.length === 0) return { name: 'list' };
+  if (parts[0] === 'settings') return { name: 'settings' };
+  if (parts[0] === 'setup') return { name: 'setup' };
+  if (parts[0] === 'p' && parts[1]) {
+    if (parts[2] === 'configure') return { name: 'project-wizard', key: parts[1] };
+    return { name: 'project-detail', key: parts[1] };
+  }
+  return { name: 'list' };
+}
+function go(hash) { window.location.hash = hash; }
+
+async function navigate() {
+  ROUTE = parseHash();
+  try {
+    if (!STATE) STATE = await api('GET', '/frontend-conqueror/state');
+    else STATE = await api('GET', '/frontend-conqueror/state');
+  } catch (e) {
+    if (e.payload && e.payload.error === 'not-authorized') return renderLogin();
+    return renderError(e);
+  }
+  if (ROUTE.name === 'list') {
+    const totalProjects = STATE.projects.length;
+    const hasLinear = STATE.linear && STATE.linear.hasApiKey;
+    if (!hasLinear && totalProjects === 0) return renderSetup();
+    return renderList();
+  }
+  if (ROUTE.name === 'settings') return renderSettings();
+  if (ROUTE.name === 'setup') return renderSetup();
+  if (ROUTE.name === 'project-detail') return renderProjectDetail(ROUTE.key);
+  if (ROUTE.name === 'project-wizard') return renderProjectWizard(ROUTE.key);
+}
+
+function renderError(e) {
+  root().innerHTML = html\`
+    <header><span class="brand">frontend-conqueror · gate</span></header>
+    <main>
+      <div class="card">
+        <h3>Something went wrong</h3>
+        <div class="body">\${esc(e.message)}</div>
+      </div>
+    </main>\`;
+}
+
+// ============================== LOGIN ==============================
 async function renderLogin(err) {
-  // Pull login-state so we can hint the default password the FIRST time only.
   let hint = null;
   try {
     const s = await api('GET', '/frontend-conqueror/login-state');
     if (s.usingDefault) hint = s.defaultPassword;
   } catch {}
-  $('root').innerHTML = \`
-    <header><h1>frontend-conqueror · gate</h1></header>
+  root().innerHTML = html\`
+    <header><span class="brand">frontend-conqueror · gate</span></header>
     <main>
       <div class="card" style="max-width:420px;margin:60px auto;">
-        <h2>admin sign in</h2>
+        <h3>Admin sign in</h3>
         <label for="pw">Password</label>
         <input id="pw" type="password" autofocus>
-        \${err ? '<div class="err">' + err + '</div>' : ''}
-        \${hint ? '<div class="sub" style="margin-top:10px;">First time? Default password: <code>' + hint + '</code> — you\\'ll be asked to change it after sign-in.</div>' : ''}
-        <div class="row" style="justify-content:flex-end;margin-top:12px;">
-          <button class="primary" id="loginBtn">Sign in</button>
+        <div class="err">\${err ? esc(err) : ''}</div>
+        \${hint ? '<div class="sub-muted" style="margin-top:6px;">First time? Default password: <code>' + esc(hint) + '</code> — you\\'ll be asked to change it after sign-in.</div>' : ''}
+        <div class="row" style="justify-content:flex-end;margin-top:14px;">
+          <button class="primary" id="loginBtn">Sign in →</button>
         </div>
       </div>
     </main>\`;
   const submit = async () => {
     try {
       const res = await api('POST', '/frontend-conqueror/login', { password: $('pw').value });
-      if (res.mustChangePassword) renderForcedPasswordChange();
-      else load();
-    }
-    catch (e) { renderLogin(e.message); }
+      if (res.mustChangePassword) return renderForcedPasswordChange();
+      STATE = null;
+      navigate();
+    } catch (e) { renderLogin(e.message); }
   };
   $('loginBtn').addEventListener('click', submit);
   $('pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
 }
 
 function renderForcedPasswordChange() {
-  $('root').innerHTML = \`
-    <header><h1>frontend-conqueror · gate</h1></header>
+  root().innerHTML = html\`
+    <header><span class="brand">frontend-conqueror · gate</span></header>
     <main>
       <div class="card" style="max-width:460px;margin:60px auto;">
-        <h2>set your admin password</h2>
-        <div class="sub">You signed in with the default password. Set a custom one to continue. Minimum 8 characters.</div>
+        <h2>Set your admin password<span class="sub">You signed in with the default. Pick a real one (8+ chars) before we continue.</span></h2>
         <label for="newPw">New password</label>
         <input id="newPw" type="password" autofocus>
         <label for="confirmPw">Confirm new password</label>
         <input id="confirmPw" type="password">
         <div class="err" id="pwErr"></div>
-        <div class="row" style="justify-content:flex-end;margin-top:12px;">
-          <button class="primary" id="saveBtn">Set password</button>
+        <div class="row" style="justify-content:flex-end;margin-top:14px;">
+          <button class="primary" id="saveBtn">Set password →</button>
         </div>
       </div>
     </main>\`;
-  const submit = async () => {
-    const newPw = $('newPw').value;
-    const conf = $('confirmPw').value;
-    $('pwErr').textContent = '';
-    if (newPw.length < 8) { $('pwErr').textContent = 'At least 8 characters.'; return; }
-    if (newPw !== conf) { $('pwErr').textContent = 'Passwords do not match.'; return; }
+  $('saveBtn').addEventListener('click', async () => {
+    const a = $('newPw').value, b = $('confirmPw').value;
+    if (a.length < 8) return ($('pwErr').textContent = 'At least 8 characters.');
+    if (a !== b) return ($('pwErr').textContent = 'Passwords do not match.');
     try {
-      await api('PUT', '/frontend-conqueror/password', { newPassword: newPw });
-      load();
+      await api('PUT', '/frontend-conqueror/password', { newPassword: a });
+      STATE = null;
+      navigate();
     } catch (e) { $('pwErr').textContent = e.message; }
-  };
-  $('saveBtn').addEventListener('click', submit);
-  $('confirmPw').addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+  });
 }
 
-function renderState(state) {
-  const s = state.settings;
-  const mc = state.modeColors || { edit: '#2563eb', test: '#f59e0b', todo: '#059669' };
-  const lin = s.linear;
-  // Stages drive the UI: 1) no key → just show the API-key card.
-  // 2) key but multi-team → pick a team. 3) team set but no Linear project →
-  // pick or create. 4) fully wired → show the project (testers) card.
-  const stage =
-    !lin || !lin.hasApiKey ? 'need-key'
-    : lin.availableTeams && lin.availableTeams.length > 1 ? 'pick-team'
-    : !lin.teamId ? 'need-key'  // edge: key present but no team resolved → re-resolve
-    : !lin.projectId ? 'pick-project'
-    : 'ready';
+// ============================== FIRST-TIME SETUP WIZARD ==============================
+async function renderSetup() {
+  let step = 1;
+  const ctx = {
+    apiKey: '',
+    teamId: null,
+    teamName: null,
+    teams: [],
+    projectKey: '',
+    projectDisplayName: '',
+    linearProjectId: null,
+    linearProjectNewName: '',
+    emails: [],
+  };
+  function nav(html_) {
+    root().innerHTML = html\`
+      <header>
+        <span class="brand">frontend-conqueror · gate · setup</span>
+        <div class="right">
+          <button onclick="logout()">sign out</button>
+        </div>
+      </header>
+      <main>\${html_}</main>\`;
+  }
+  const dots = (n) => '<div class="step-dots">' +
+    [1,2,3,4,5].map(i => '<div class="d ' + (i < n ? 'done' : i === n ? 'on' : '') + '"></div>').join('') +
+    '</div>';
 
-  $('root').innerHTML = \`
+  function renderStep() {
+    if (step === 1) {
+      nav(html\`
+        \${dots(1)}
+        <h2>Let's set up your gate<span class="sub">Step 1 of 5 — Linear API key. This is shared across all your projects (unless you override it per project later).</span></h2>
+        <div class="card">
+          <label for="apiKey">Linear API key</label>
+          <input id="apiKey" type="password" placeholder="lin_api_..." autofocus value="\${esc(ctx.apiKey)}">
+          <div class="sub-muted" style="margin-top:6px;">Get one from <a href="https://linear.app/settings/api" target="_blank" rel="noreferrer">Linear → Settings → API</a>. Personal API keys work fine.</div>
+          <div class="err" id="err"></div>
+          <div class="row" style="justify-content:flex-end;margin-top:14px;">
+            <button class="primary" id="next">Continue →</button>
+          </div>
+        </div>\`);
+      $('next').addEventListener('click', async () => {
+        ctx.apiKey = $('apiKey').value.trim();
+        if (!ctx.apiKey) return ($('err').textContent = 'Paste your Linear API key.');
+        $('next').disabled = true;
+        try {
+          const res = await api('PUT', '/frontend-conqueror/linear/api-key', { apiKey: ctx.apiKey });
+          if (res.resolution === 'no-teams') return ($('err').textContent = 'Linear returned no teams for this key.');
+          if (res.resolution === 'auto-team') {
+            ctx.teamId = res.linear.teamId;
+            ctx.teamName = res.linear.teamName;
+            step = 3;
+          } else {
+            ctx.teams = res.linear.availableTeams || [];
+            step = 2;
+          }
+          renderStep();
+        } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
+      });
+    } else if (step === 2) {
+      nav(html\`
+        \${dots(2)}
+        <h2>Pick your Linear team<span class="sub">Step 2 of 5 — your key has access to multiple teams. Bugs will land in this one.</span></h2>
+        <div class="card">
+          <label for="team">Team</label>
+          <select id="team">\${ctx.teams.map(t => '<option value="' + esc(t.id) + '">' + esc(t.name) + ' (' + esc(t.key) + ')</option>').join('')}</select>
+          <div class="err" id="err"></div>
+          <div class="row" style="justify-content:flex-end;margin-top:14px;">
+            <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
+            <button class="primary" id="next">Continue →</button>
+          </div>
+        </div>\`);
+      $('next').addEventListener('click', async () => {
+        const teamId = $('team').value;
+        try {
+          const res = await api('PUT', '/frontend-conqueror/linear/team', { teamId });
+          ctx.teamId = res.linear.teamId;
+          ctx.teamName = res.linear.teamName;
+          step = 3;
+          renderStep();
+        } catch (e) { $('err').textContent = e.message; }
+      });
+    } else if (step === 3) {
+      nav(html\`
+        \${dots(3)}
+        <h2>Name your first project<span class="sub">Step 3 of 5 — this is what you'll use in your plugin config (\`gate.project = '...'\`). Letters, numbers, dashes.</span></h2>
+        <div class="card">
+          <label for="displayName">Display name</label>
+          <input id="displayName" placeholder="Messarat" autofocus value="\${esc(ctx.projectDisplayName)}">
+          <label for="key">Project key</label>
+          <input id="key" placeholder="messarat" value="\${esc(ctx.projectKey)}">
+          <div class="sub-muted" style="margin-top:4px;">Used in <code>gate.project</code> and the overlay URL.</div>
+          <div class="err" id="err"></div>
+          <div class="row" style="justify-content:flex-end;margin-top:14px;">
+            <button class="ghost" onclick="(()=>{step=2;renderStep();})()">← Back</button>
+            <button class="primary" id="next">Continue →</button>
+          </div>
+        </div>\`);
+      $('displayName').addEventListener('input', () => {
+        if (!$('key').value || $('key').value === ctx.projectKey) {
+          $('key').value = $('displayName').value.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/(^-|-$)/g, '');
+          ctx.projectKey = $('key').value;
+        }
+        ctx.projectDisplayName = $('displayName').value;
+      });
+      $('next').addEventListener('click', async () => {
+        const displayName = $('displayName').value.trim();
+        const key = $('key').value.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/(^-|-$)/g, '');
+        if (!displayName) return ($('err').textContent = 'Display name required.');
+        if (!key) return ($('err').textContent = 'Project key required.');
+        try {
+          await api('POST', '/frontend-conqueror/projects', { key, displayName });
+          ctx.projectKey = key;
+          ctx.projectDisplayName = displayName;
+          step = 4;
+          renderStep();
+        } catch (e) {
+          if (e.payload && e.payload.error === 'already-exists') {
+            ctx.projectKey = key;
+            ctx.projectDisplayName = displayName;
+            step = 4;
+            renderStep();
+          } else $('err').textContent = e.message;
+        }
+      });
+    } else if (step === 4) {
+      nav(html\`
+        \${dots(4)}
+        <h2>Where should bugs land?<span class="sub">Step 4 of 5 — pick or create a Linear project. Bugs from \${esc(ctx.projectDisplayName)} will file there.</span></h2>
+        <div class="card">
+          <div id="projLoad" class="sub-muted">Loading Linear projects…</div>
+        </div>\`);
+      let projects = [];
+      try { projects = (await api('GET', '/frontend-conqueror/linear/projects')).projects || []; } catch (e) { $('projLoad').textContent = e.message; return; }
+      nav(html\`
+        \${dots(4)}
+        <h2>Where should bugs land?<span class="sub">Step 4 of 5 — pick or create a Linear project. Bugs from \${esc(ctx.projectDisplayName)} will file there.</span></h2>
+        <div class="card">
+          <label for="existing">Existing Linear project</label>
+          <select id="existing">
+            <option value="">— pick one —</option>
+            \${projects.map(p => '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>').join('')}
+          </select>
+          <div style="text-align:center;color:var(--muted);margin:14px 0;font-size:12px;">— or —</div>
+          <label for="newName">Create a new Linear project</label>
+          <input id="newName" placeholder="\${esc(ctx.projectDisplayName)} Bugs">
+          <div class="err" id="err"></div>
+          <div class="row" style="justify-content:flex-end;margin-top:14px;">
+            <button class="ghost" onclick="(()=>{step=3;renderStep();})()">← Back</button>
+            <button class="primary" id="next">Continue →</button>
+          </div>
+        </div>\`);
+      $('next').addEventListener('click', async () => {
+        const existingId = $('existing').value;
+        const newName = $('newName').value.trim();
+        if (!existingId && !newName) return ($('err').textContent = 'Pick one or type a name.');
+        $('next').disabled = true;
+        try {
+          const body = existingId ? { projectId: existingId } : { newName };
+          await api('PUT', '/frontend-conqueror/projects/' + ctx.projectKey + '/linear-project', body);
+          step = 5;
+          renderStep();
+        } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
+      });
+    } else if (step === 5) {
+      nav(html\`
+        \${dots(5)}
+        <h2>Add your first testers<span class="sub">Step 5 of 5 — only these emails will be able to file bugs from \${esc(ctx.projectDisplayName)}. You can add more later.</span></h2>
+        <div class="card">
+          <label for="emails">Tester emails (one per line)</label>
+          <textarea id="emails" rows="6" placeholder="alice@example.com&#10;bob@example.com" autofocus></textarea>
+          <div class="err" id="err"></div>
+          <div class="row" style="justify-content:flex-end;margin-top:14px;">
+            <button class="ghost" onclick="(()=>{step=4;renderStep();})()">← Back</button>
+            <button class="primary" id="finish">Finish setup →</button>
+          </div>
+        </div>\`);
+      $('finish').addEventListener('click', async () => {
+        const emails = $('emails').value.split(/[\\n,]/).map(s => s.trim()).filter(Boolean);
+        try {
+          await api('PUT', '/frontend-conqueror/projects/' + ctx.projectKey + '/emails', { emails });
+          STATE = null;
+          toast('Setup complete — your gate is live.');
+          go('#/p/' + ctx.projectKey);
+        } catch (e) { $('err').textContent = e.message; }
+      });
+    }
+  }
+  renderStep();
+}
+
+// ============================== PROJECT LIST ==============================
+function renderList() {
+  const pending = STATE.projects.filter(p => p.status === 'pending');
+  const active = STATE.projects.filter(p => p.status === 'active');
+  const disabled = STATE.projects.filter(p => p.status === 'disabled');
+  root().innerHTML = html\`
     <header>
-      <h1>frontend-conqueror · gate</h1>
-      <button id="logoutBtn">Sign out</button>
+      <span class="brand">frontend-conqueror · gate</span>
+      <div class="right">
+        <a href="#/settings">global settings</a>
+        <button onclick="logout()">sign out</button>
+      </div>
     </header>
     <main>
+      <h2>Projects<span class="sub">\${STATE.projects.length} total · gate at <code>\${esc(location.host)}</code></span></h2>
+
+      \${pending.length > 0 ? html\`
+        <div class="section-h">
+          <h3>Pending (\${pending.length}) — auto-detected, not configured yet</h3>
+        </div>
+        \${pending.map(projectCard).join('')}
+      \` : ''}
+
+      <div class="section-h">
+        <h3>Active</h3>
+        <button class="ghost" onclick="addProject()">+ Add project</button>
+      </div>
+      \${active.length === 0 ? '<div class="empty">No active projects yet.</div>' : active.map(projectCard).join('')}
+
+      \${disabled.length > 0 ? html\`
+        <div class="section-h"><h3>Disabled</h3></div>
+        \${disabled.map(projectCard).join('')}
+      \` : ''}
+    </main>\`;
+}
+function projectCard(p) {
+  const lastSeen = p.activity.lastSeenAt ? relTime(p.activity.lastSeenAt) : 'never';
+  const linearDest = p.linearProjectName || (p.status === 'pending' ? '(needs configuring)' : '(not set)');
+  return html\`
+    <a class="project-card \${p.status}" href="#/p/\${esc(p.key)}">
+      <div class="title">
+        <span class="name">\${esc(p.displayName)} <span class="sub-muted" style="font-weight:normal;font-size:12px;margin-left:6px;">\${esc(p.key)}</span></span>
+        <span class="pill \${p.status} dot">\${p.status}</span>
+      </div>
+      <div class="meta">
+        <span>📬 \${p.emailsCount} \${p.emailsCount === 1 ? 'tester' : 'testers'}</span>
+        <span>🎯 \${esc(linearDest)}</span>
+        <span>⏱ last activity \${lastSeen}</span>
+        \${p.activity.uniqueIpsToday > 0 ? '<span>👤 ' + p.activity.uniqueIpsToday + ' unique today</span>' : ''}
+        \${p.activity.reportsCount > 0 ? '<span>🐞 ' + p.activity.reportsCount + ' reports</span>' : ''}
+      </div>
+    </a>\`;
+}
+window.addProject = async function() {
+  const displayName = prompt('Project display name (e.g. "TM Frontend"):');
+  if (!displayName) return;
+  const key = displayName.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/(^-|-$)/g, '');
+  try {
+    await api('POST', '/frontend-conqueror/projects', { key, displayName });
+    STATE = null;
+    go('#/p/' + key + '/configure');
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.logout = async function() {
+  try { await api('POST', '/frontend-conqueror/logout'); } catch {}
+  STATE = null;
+  renderLogin();
+};
+
+// ============================== PROJECT DETAIL ==============================
+async function renderProjectDetail(key) {
+  let detail;
+  try { detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project; }
+  catch (e) { return renderError(e); }
+
+  const needsConfig = detail.status === 'pending' || !detail.linearProjectId || detail.emailsCount === 0;
+  const overlayTag = '<' + 'script src="' + location.origin + '/' + detail.key + '/overlay.js" defer><' + '/script>';
+  const pluginCfg = "gate: { url: '" + location.origin + "', project: '" + detail.key + "' }";
+
+  root().innerHTML = html\`
+    <header>
+      <span class="brand">frontend-conqueror · gate</span>
+      <div class="right">
+        <a href="#/settings">global settings</a>
+        <button onclick="logout()">sign out</button>
+      </div>
+    </header>
+    <main>
+      <div class="crumbs"><a href="#/">← Projects</a></div>
+      <h2>\${esc(detail.displayName)} <span class="pill \${detail.status} dot" style="vertical-align:middle;margin-left:8px;font-size:11px;">\${detail.status}</span><span class="sub">Key: <code>\${esc(detail.key)}</code> · Created \${esc(new Date(detail.createdAt * 1000).toISOString().slice(0,10))}</span></h2>
+
+      \${needsConfig ? html\`
+        <div class="card" style="border-left:3px solid var(--warn);">
+          <h3>Finish configuring this project</h3>
+          <div class="body sub-muted">This project was auto-detected from a heartbeat or just created. It won't accept bug reports until it has a Linear destination and at least one tester email.</div>
+          <div class="row" style="justify-content:flex-end;margin-top:10px;">
+            <button class="primary" onclick="(()=>go('#/p/' + \${JSON.stringify(detail.key)} + '/configure'))()">Configure now →</button>
+          </div>
+        </div>
+      \` : ''}
+
       <div class="card">
-        <h2>mode colors</h2>
-        <div class="sub">Single source of truth for the badge, viewport frame, hover outline, buttons, and editor focus.</div>
-        <div class="grid3">
-          \${['edit','test','todo'].map((k) => \`
-            <div>
-              <label>\${k.toUpperCase()} mode</label>
-              <div style="display:flex;gap:8px;align-items:center;">
-                <input type="color" id="color_\${k}" value="\${mc[k]}" style="width:48px;height:32px;border:1px solid #374151;border-radius:6px;background:transparent;padding:0;cursor:pointer;">
-                <input id="color_\${k}_hex" value="\${mc[k]}" style="flex:1;font:12px ui-monospace,Menlo,monospace;">
-              </div>
-            </div>\`).join('')}
-        </div>
-        <div class="row" style="justify-content:flex-end;margin-top:12px;">
-          <button class="primary" id="saveColorsBtn">Save colors</button>
-        </div>
+        <h3>Linear destination</h3>
+        \${detail.linearProjectName ? html\`
+          <div class="body">Reports go to: <strong>\${esc(detail.linearProjectName)}</strong></div>
+          <div class="meta">Team: \${esc(STATE.linear ? STATE.linear.teamName : '')}</div>
+          <div class="row" style="margin-top:10px;justify-content:flex-end;">
+            <button class="ghost" onclick="changeLinearProject('\${esc(detail.key)}')">Change</button>
+          </div>
+        \` : html\`
+          <div class="empty">Not set. <a href="#" onclick="changeLinearProject('\${esc(detail.key)}');return false;">Pick a Linear project</a></div>
+        \`}
       </div>
 
       <div class="card">
-        <h2>linear</h2>
-        \${stage === 'need-key' ? \`
-          <div class="sub">Paste a Linear API key (Settings → API → Personal API keys). The gate auto-resolves your team next.</div>
-          <label>API key</label>
-          <input id="apiKey" type="password" placeholder="lin_api_…" autocomplete="off">
-          <div class="err" id="linErr"></div>
-          <div class="row" style="justify-content:flex-end;margin-top:8px;">
-            <button class="primary" id="saveApiKeyBtn">Save API key</button>
+        <h3>Testers (\${detail.emails.length})</h3>
+        <div id="emailList">
+          \${detail.emails.length === 0 ? '<div class="empty">No testers yet.</div>' : detail.emails.map(e => '<div class="row spaced"><code style="background:transparent;">' + esc(e) + '</code><button class="danger" onclick="removeEmail(\\'' + esc(detail.key) + '\\', \\'' + esc(e) + '\\')">remove</button></div>').join('')}
+        </div>
+        <label style="margin-top:14px;">Add tester email</label>
+        <div class="row">
+          <input id="newEmail" type="email" placeholder="alice@example.com">
+          <button class="primary" onclick="addEmail('\${esc(detail.key)}')">Add</button>
+        </div>
+        <div class="err" id="emailErr"></div>
+      </div>
+
+      <div class="card">
+        <h3>How to use this project</h3>
+        <div class="body sub-muted" style="margin-bottom:8px;">In your project's plugin config:</div>
+        <div><code>\${esc(pluginCfg)}</code></div>
+        <div class="body sub-muted" style="margin:10px 0 6px;">Or in production HTML directly:</div>
+        <div><code>\${esc(overlayTag)}</code></div>
+      </div>
+
+      <div class="card">
+        <h3>Activity</h3>
+        <div class="grid3">
+          <div class="stat"><span class="v">\${detail.activity.totalHeartbeats || 0}</span><span class="l">total heartbeats</span></div>
+          <div class="stat"><span class="v">\${detail.activity.uniqueIpsToday}</span><span class="l">unique today</span></div>
+          <div class="stat"><span class="v">\${detail.activity.reportsCount || 0}</span><span class="l">reports filed</span></div>
+        </div>
+        <div style="margin-top:14px;font-size:12px;color:var(--muted);">
+          First seen: \${detail.activity.firstSeenAt ? new Date(detail.activity.firstSeenAt * 1000).toISOString() : 'never'}<br>
+          Last heartbeat: \${detail.activity.lastSeenAt ? relTime(detail.activity.lastSeenAt) : 'never'}
+        </div>
+        \${Object.keys(detail.activity.origins).length > 0 ? html\`
+          <h3 style="margin-top:16px;">Origins seen</h3>
+          <div class="origin-list">
+            \${Object.entries(detail.activity.origins).sort((a,b) => b[1]-a[1]).slice(0,10).map(([o,c]) => '<div class="o"><span>' + esc(o) + '</span><span>' + c + ' hits</span></div>').join('')}
           </div>
         \` : ''}
+        \${detail.activity.pages.length > 0 ? html\`
+          <h3 style="margin-top:16px;">Pages seen (\${detail.activity.pages.length})</h3>
+          <div class="origin-list">
+            \${detail.activity.pages.slice(-10).reverse().map(p => '<div class="o" style="display:block;"><a href="' + esc(p) + '" target="_blank" rel="noreferrer">' + esc(p) + '</a></div>').join('')}
+          </div>
+        \` : ''}
+      </div>
 
-        \${stage === 'pick-team' ? \`
-          <div class="sub">Your token has access to multiple teams. Pick the one issues should land in.</div>
-          <label>Team</label>
-          <select id="teamSel">
-            <option value="">— select —</option>
-            \${lin.availableTeams.map((t) => '<option value="' + t.id + '">' + (t.name || t.key || t.id) + '</option>').join('')}
+      <div class="card">
+        <h3>Danger zone</h3>
+        <div class="row spaced">
+          <div>
+            <div>\${detail.status === 'disabled' ? 'Project disabled. Reports rejected.' : 'Disable to temporarily stop accepting reports.'}</div>
+            <div class="meta">Disabling keeps testers and Linear destination intact.</div>
+          </div>
+          <button class="ghost" onclick="toggleStatus('\${esc(detail.key)}', '\${detail.status === 'disabled' ? 'active' : 'disabled'}')">\${detail.status === 'disabled' ? 'Re-enable' : 'Disable'}</button>
+        </div>
+        <div class="row spaced" style="margin-top:14px;">
+          <div>
+            <div>Delete this project</div>
+            <div class="meta">Removes the allowlist, Linear destination link, and activity stats. Bugs already filed in Linear are not touched.</div>
+          </div>
+          <button class="danger" onclick="deleteProject('\${esc(detail.key)}')">Delete</button>
+        </div>
+      </div>
+    </main>\`;
+}
+window.changeLinearProject = async function(key) {
+  let projects;
+  try { projects = (await api('GET', '/frontend-conqueror/linear/projects')).projects || []; } catch (e) { return toast(e.message, 'err'); }
+  const lines = projects.map((p, i) => (i + 1) + ') ' + p.name).join('\\n');
+  const choice = prompt('Pick a Linear project number, or type a name to create new:\\n\\n' + lines);
+  if (!choice) return;
+  const n = parseInt(choice, 10);
+  let body;
+  if (!isNaN(n) && projects[n - 1]) body = { projectId: projects[n - 1].id };
+  else body = { newName: choice };
+  try {
+    await api('PUT', '/frontend-conqueror/projects/' + key + '/linear-project', body);
+    toast('Linear destination updated.');
+    navigate();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.addEmail = async function(key) {
+  const email = $('newEmail').value.trim();
+  if (!email) return;
+  try {
+    const detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project;
+    const next = [...detail.emails, email];
+    await api('PUT', '/frontend-conqueror/projects/' + key + '/emails', { emails: next });
+    navigate();
+  } catch (e) { $('emailErr').textContent = e.message; }
+};
+window.removeEmail = async function(key, email) {
+  try {
+    const detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project;
+    const next = detail.emails.filter(e => e !== email);
+    await api('PUT', '/frontend-conqueror/projects/' + key + '/emails', { emails: next });
+    navigate();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.toggleStatus = async function(key, newStatus) {
+  try {
+    await api('PUT', '/frontend-conqueror/projects/' + key, { status: newStatus });
+    navigate();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.deleteProject = async function(key) {
+  if (!confirm('Delete project "' + key + '"? This removes the allowlist and Linear destination link. Cannot be undone.')) return;
+  try {
+    await api('DELETE', '/frontend-conqueror/projects/' + key);
+    toast('Project deleted.');
+    go('#/');
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+// ============================== PROJECT CONFIGURE WIZARD (pending → active) ==============================
+async function renderProjectWizard(key) {
+  let detail;
+  try { detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project; }
+  catch (e) { return renderError(e); }
+  const dots2 = (n) => '<div class="step-dots">' +
+    [1,2].map(i => '<div class="d ' + (i < n ? 'done' : i === n ? 'on' : '') + '"></div>').join('') +
+    '</div>';
+  let step = detail.linearProjectId ? 2 : 1;
+
+  function renderStep() {
+    if (step === 1) {
+      root().innerHTML = html\`
+        <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
+        <main>
+          <div class="crumbs"><a href="#/">← Projects</a></div>
+          \${dots2(1)}
+          <h2>Where should bugs land?<span class="sub">Step 1 of 2 — pick or create a Linear project for \${esc(detail.displayName)}.</span></h2>
+          <div class="card"><div id="projLoad" class="sub-muted">Loading…</div></div>
+        </main>\`;
+      (async () => {
+        let projects = [];
+        try { projects = (await api('GET', '/frontend-conqueror/linear/projects')).projects || []; }
+        catch (e) { return ($('projLoad').textContent = e.message); }
+        $('projLoad').outerHTML = html\`
+          <label for="existing">Existing Linear project</label>
+          <select id="existing">
+            <option value="">— pick one —</option>
+            \${projects.map(p => '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>').join('')}
           </select>
-          <div class="err" id="linErr"></div>
-          <div class="row" style="justify-content:space-between;margin-top:8px;">
-            <button class="ghost" id="resetLinearBtn">Reset API key</button>
-            <button class="primary" id="saveTeamBtn">Continue</button>
-          </div>
-        \` : ''}
-
-        \${stage === 'pick-project' ? \`
-          <div class="sub">
-            <span class="pill ok">API key set</span>
-            <span class="pill ok">Team: <code>\${lin.teamId}</code></span>
-          </div>
-          <label>Pick an existing Linear project</label>
-          <select id="projectSel"><option value="">— loading… —</option></select>
-          <div style="margin-top:10px;border-top:1px solid #1f2937;padding-top:10px;">
-            <label>…or create a new one</label>
-            <div class="row">
-              <input id="newProjName" placeholder="\${s.projectName} feedback">
-              <button class="primary" id="createProjBtn">Create</button>
+          <div style="text-align:center;color:var(--muted);margin:14px 0;font-size:12px;">— or —</div>
+          <label for="newName">Create a new Linear project</label>
+          <input id="newName" placeholder="\${esc(detail.displayName)} Bugs">
+          <div class="err" id="err"></div>
+          <div class="row" style="justify-content:flex-end;margin-top:14px;">
+            <button class="primary" id="next">Continue →</button>
+          </div>\`;
+        $('next').addEventListener('click', async () => {
+          const existingId = $('existing').value;
+          const newName = $('newName').value.trim();
+          if (!existingId && !newName) return ($('err').textContent = 'Pick one or type a name.');
+          $('next').disabled = true;
+          try {
+            const body = existingId ? { projectId: existingId } : { newName };
+            await api('PUT', '/frontend-conqueror/projects/' + detail.key + '/linear-project', body);
+            step = 2;
+            renderStep();
+          } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
+        });
+      })();
+    } else if (step === 2) {
+      root().innerHTML = html\`
+        <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
+        <main>
+          <div class="crumbs"><a href="#/">← Projects</a></div>
+          \${dots2(2)}
+          <h2>Add your testers<span class="sub">Step 2 of 2 — only these emails will be able to file bugs from \${esc(detail.displayName)}.</span></h2>
+          <div class="card">
+            <label for="emails">Tester emails (one per line)</label>
+            <textarea id="emails" rows="6" placeholder="alice@example.com&#10;bob@example.com" autofocus>\${esc((detail.emails || []).join('\\n'))}</textarea>
+            <div class="err" id="err"></div>
+            <div class="row" style="justify-content:flex-end;margin-top:14px;">
+              <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
+              <button class="primary" id="finish">Activate project →</button>
             </div>
           </div>
-          <div class="err" id="linErr"></div>
-          <div class="row" style="justify-content:space-between;margin-top:8px;">
-            <button class="ghost" id="resetLinearBtn">Reset Linear setup</button>
-            <button class="primary" id="saveProjectBtn" disabled>Use selected</button>
-          </div>
-        \` : ''}
+        </main>\`;
+      $('finish').addEventListener('click', async () => {
+        const emails = $('emails').value.split(/[\\n,]/).map(s => s.trim()).filter(Boolean);
+        try {
+          await api('PUT', '/frontend-conqueror/projects/' + detail.key + '/emails', { emails });
+          await api('PUT', '/frontend-conqueror/projects/' + detail.key, { status: 'active' });
+          toast(detail.displayName + ' is live.');
+          go('#/p/' + detail.key);
+        } catch (e) { $('err').textContent = e.message; }
+      });
+    }
+  }
+  renderStep();
+}
 
-        \${stage === 'ready' ? \`
-          <div class="sub">
-            <span class="pill ok">API key set</span>
-            <span class="pill ok">Linear project: <strong>\${lin.projectName}</strong></span>
+// ============================== GLOBAL SETTINGS ==============================
+async function renderSettings() {
+  const s = STATE;
+  root().innerHTML = html\`
+    <header>
+      <span class="brand">frontend-conqueror · gate</span>
+      <div class="right">
+        <button onclick="logout()">sign out</button>
+      </div>
+    </header>
+    <main>
+      <div class="crumbs"><a href="#/">← Projects</a></div>
+      <h2>Global settings<span class="sub">Affects all projects on this gate.</span></h2>
+
+      <div class="card">
+        <h3>Linear API key</h3>
+        \${s.linear && s.linear.hasApiKey ? html\`
+          <div class="body">Connected to <strong>\${esc(s.linear.teamName || s.linear.teamId || 'a team')}</strong></div>
+          <div class="meta">All projects use this key unless they override it.</div>
+          <div class="row" style="justify-content:flex-end;margin-top:10px;">
+            <button class="ghost" onclick="replaceApiKey()">Replace</button>
+            <button class="danger" onclick="removeApiKey()">Disconnect</button>
           </div>
-          <div class="row" style="justify-content:flex-end;margin-top:8px;">
-            <button class="ghost" id="resetLinearBtn">Disconnect Linear</button>
+        \` : html\`
+          <div class="empty">No Linear API key set.</div>
+          <div class="row" style="justify-content:flex-end;">
+            <button class="primary" onclick="replaceApiKey()">Connect Linear</button>
           </div>
-        \` : ''}
+        \`}
       </div>
 
       <div class="card">
-        <h2>account</h2>
-        <div class="sub">Change the admin password used to sign into this gate.</div>
-        <label>Current password</label>
-        <input id="curPw" type="password" autocomplete="current-password">
-        <label>New password (min 8 characters)</label>
-        <input id="newPw2" type="password" autocomplete="new-password">
-        <label>Confirm new password</label>
-        <input id="confirmPw2" type="password" autocomplete="new-password">
-        <div class="err" id="pwErr2"></div>
-        <div class="row" style="justify-content:flex-end;margin-top:8px;">
-          <button class="primary" id="changePwBtn">Change password</button>
+        <h3>Mode colors</h3>
+        <div class="sub-muted" style="margin-bottom:8px;">Border + palette colors for each mode in the overlay.</div>
+        <div class="grid3">
+          \${['edit','test','todo'].map(k => html\`
+            <div>
+              <label>\${k}</label>
+              <input type="color" id="color-\${k}" value="\${esc(s.modeColors[k] || '#888888')}" style="height:38px;cursor:pointer;">
+            </div>
+          \`).join('')}
+        </div>
+        <div class="row" style="justify-content:flex-end;margin-top:10px;">
+          <button class="primary" onclick="saveColors()">Save colors</button>
         </div>
       </div>
 
-      \${stage === 'ready' ? \`
       <div class="card">
-        <h2>\${s.projectName}</h2>
-        <div class="sub">Reports filed from this gate land in Linear → <strong>\${lin.projectName}</strong>.</div>
-        <label>Project display name</label>
-        <input id="projName" value="\${s.projectName}">
-        <div class="row" style="justify-content:flex-end;margin-top:8px;">
-          <button class="primary" id="saveProjNameBtn">Save name</button>
+        <h3>Admin password</h3>
+        <label for="currentPw">Current password</label>
+        <input id="currentPw" type="password">
+        <label for="newAdminPw">New password (8+ characters)</label>
+        <input id="newAdminPw" type="password">
+        <div class="err" id="pwErr"></div>
+        <div class="row" style="justify-content:flex-end;margin-top:10px;">
+          <button class="primary" onclick="changePassword()">Change password</button>
         </div>
-
-        <div style="margin-top:16px;border-top:1px solid #1f2937;padding-top:14px;">
-          <label>Allowed tester emails</label>
-          <div id="emails"></div>
-          <div class="row">
-            <input id="newEmail" placeholder="tester@example.com">
-            <button class="primary" id="addEmailBtn">Add</button>
-          </div>
-        </div>
-      </div>\` : ''}
+      </div>
     </main>\`;
-
-  $('logoutBtn').addEventListener('click', async () => { await api('POST', '/frontend-conqueror/logout'); load(); });
-
-  // ----- Mode colors -----
-  for (const k of ['edit', 'test', 'todo']) {
-    const pick = $('color_' + k);
-    const hex = $('color_' + k + '_hex');
-    pick.addEventListener('input', () => { hex.value = pick.value; });
-    hex.addEventListener('input', () => { if (/^#[0-9a-fA-F]{6}$/.test(hex.value.trim())) pick.value = hex.value.trim(); });
-  }
-  $('saveColorsBtn').addEventListener('click', async () => {
-    const payload = {
-      edit: $('color_edit_hex').value.trim() || $('color_edit').value,
-      test: $('color_test_hex').value.trim() || $('color_test').value,
-      todo: $('color_todo_hex').value.trim() || $('color_todo').value,
-    };
-    try { await api('PUT', '/frontend-conqueror/mode-colors', payload); load(); }
-    catch (e) { alert(e.message); }
-  });
-
-  // ----- Account (change password) -----
-  $('changePwBtn').addEventListener('click', async () => {
-    const cur = $('curPw').value;
-    const nw  = $('newPw2').value;
-    const cf  = $('confirmPw2').value;
-    $('pwErr2').textContent = '';
-    if (nw.length < 8) { $('pwErr2').textContent = 'At least 8 characters.'; return; }
-    if (nw !== cf) { $('pwErr2').textContent = 'Passwords do not match.'; return; }
-    try {
-      await api('PUT', '/frontend-conqueror/password', { currentPassword: cur, newPassword: nw });
-      $('curPw').value = $('newPw2').value = $('confirmPw2').value = '';
-      $('pwErr2').textContent = 'Password updated.';
-      $('pwErr2').style.color = '#6ee7b7';
-    } catch (e) { $('pwErr2').style.color = ''; $('pwErr2').textContent = e.message; }
-  });
-
-  // ----- Stage handlers -----
-  if (stage === 'need-key') {
-    const submit = async () => {
-      const apiKey = $('apiKey').value.trim();
-      if (!apiKey) { $('linErr').textContent = 'Enter the API key.'; return; }
-      $('saveApiKeyBtn').disabled = true;
-      try { await api('PUT', '/frontend-conqueror/linear/api-key', { apiKey }); load(); }
-      catch (e) { $('linErr').textContent = e.message; $('saveApiKeyBtn').disabled = false; }
-    };
-    $('saveApiKeyBtn').addEventListener('click', submit);
-    $('apiKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
-  }
-
-  if (stage === 'pick-team') {
-    $('saveTeamBtn').addEventListener('click', async () => {
-      const teamId = $('teamSel').value;
-      if (!teamId) { $('linErr').textContent = 'Pick a team.'; return; }
-      try { await api('PUT', '/frontend-conqueror/linear/team', { teamId }); load(); }
-      catch (e) { $('linErr').textContent = e.message; }
-    });
-    $('resetLinearBtn').addEventListener('click', resetLinear);
-  }
-
-  if (stage === 'pick-project') {
-    // Load list lazily after the card renders.
-    (async () => {
-      try {
-        const r = await api('GET', '/frontend-conqueror/linear/projects');
-        const sel = $('projectSel');
-        sel.innerHTML = '<option value="">— select —</option>' +
-          r.projects.map((p) => '<option value="' + p.id + '">' + p.name + '</option>').join('');
-        sel.addEventListener('change', () => { $('saveProjectBtn').disabled = !sel.value; });
-      } catch (e) {
-        $('linErr').textContent = e.message;
-      }
-    })();
-    $('saveProjectBtn').addEventListener('click', async () => {
-      const projectId = $('projectSel').value;
-      try { await api('PUT', '/frontend-conqueror/linear/project', { projectId }); load(); }
-      catch (e) { $('linErr').textContent = e.message; }
-    });
-    $('createProjBtn').addEventListener('click', async () => {
-      const newName = $('newProjName').value.trim();
-      if (!newName) { $('linErr').textContent = 'Enter a project name.'; return; }
-      try { await api('PUT', '/frontend-conqueror/linear/project', { newName }); load(); }
-      catch (e) { $('linErr').textContent = e.message; }
-    });
-    $('resetLinearBtn').addEventListener('click', resetLinear);
-  }
-
-  if (stage === 'ready') {
-    $('resetLinearBtn').addEventListener('click', resetLinear);
-    $('saveProjNameBtn').addEventListener('click', async () => {
-      const projectName = $('projName').value.trim();
-      try { await api('PUT', '/frontend-conqueror/project', { projectName }); load(); }
-      catch (e) { alert(e.message); }
-    });
-    // Emails
-    const root = $('emails');
-    if (!s.emails.length) root.innerHTML = '<div class="empty">No testers yet.</div>';
-    else {
-      for (const email of s.emails) {
-        const row = document.createElement('div');
-        row.className = 'row';
-        row.innerHTML = '<div style="flex:1;">' + email + '</div><button class="danger">Remove</button>';
-        row.querySelector('button').addEventListener('click', async () => {
-          const remaining = s.emails.filter((e) => e !== email);
-          try { await api('PUT', '/frontend-conqueror/project', { emails: remaining }); load(); }
-          catch (e) { alert(e.message); }
-        });
-        root.appendChild(row);
+}
+window.replaceApiKey = async function() {
+  const apiKey = prompt('Paste Linear API key:');
+  if (!apiKey) return;
+  try {
+    const res = await api('PUT', '/frontend-conqueror/linear/api-key', { apiKey });
+    STATE = null;
+    if (res.resolution === 'pick-team') {
+      const team = prompt('Multiple teams found. Pick one (number):\\n\\n' + res.linear.availableTeams.map((t,i)=>(i+1)+') '+t.name).join('\\n'));
+      const idx = parseInt(team,10) - 1;
+      if (res.linear.availableTeams[idx]) {
+        await api('PUT', '/frontend-conqueror/linear/team', { teamId: res.linear.availableTeams[idx].id });
       }
     }
-    $('addEmailBtn').addEventListener('click', async () => {
-      const newEmail = $('newEmail').value.trim();
-      if (!newEmail) return;
-      const next = Array.from(new Set([...s.emails, newEmail]));
-      try { await api('PUT', '/frontend-conqueror/project', { emails: next }); load(); }
-      catch (e) { alert(e.message); }
-    });
-  }
-}
-async function resetLinear() {
-  if (!confirm('Disconnect Linear? You\\'ll need to re-enter the API key.')) return;
-  try { await api('DELETE', '/frontend-conqueror/linear'); load(); }
-  catch (e) { alert(e.message); }
-}
-async function load() {
+    toast('Linear connected.');
+    navigate();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.removeApiKey = async function() {
+  if (!confirm('Disconnect Linear? All projects will stop accepting reports until a new key is set (or per-project override is configured).')) return;
   try {
-    const state = await api('GET', '/frontend-conqueror/state');
-    renderState(state);
-  } catch (e) {
-    renderLogin();
-  }
-}
-load();
+    await api('DELETE', '/frontend-conqueror/linear');
+    STATE = null;
+    toast('Linear disconnected.');
+    navigate();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.saveColors = async function() {
+  const body = { edit: $('color-edit').value, test: $('color-test').value, todo: $('color-todo').value };
+  try {
+    await api('PUT', '/frontend-conqueror/mode-colors', body);
+    toast('Colors saved.');
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.changePassword = async function() {
+  const currentPassword = $('currentPw').value;
+  const newPassword = $('newAdminPw').value;
+  if (newPassword.length < 8) return ($('pwErr').textContent = 'At least 8 characters.');
+  try {
+    await api('PUT', '/frontend-conqueror/password', { currentPassword, newPassword });
+    $('currentPw').value = ''; $('newAdminPw').value = '';
+    toast('Password changed.');
+  } catch (e) { $('pwErr').textContent = e.message; }
+};
 </script>
 </body></html>`;
-
 http.createServer(handle).listen(PORT, HOST, () => {
   // Surface a clear "what's the default password right now" line so the
   // developer doesn't have to dig — useful in dev. Once data.adminPasswordHash

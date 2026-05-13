@@ -2,27 +2,35 @@
 
 Step-by-step guide to put **frontend-conqueror Test mode** into production for a single project. By the end of this, your team types `Shift Shift` on the prod site, picks Test mode, and a Linear issue lands in your project.
 
-**Key principle:** the gate is *project-specific*. One project = one gate = one Linear destination = one tester allowlist. If you have a frontend SPA and a backend admin for the same product, they share **one** gate (one Linear project, one allowlist).
+**Key principle (v0.5.0+):** one gate serves **N projects**. Each project has its own Linear destination and its own tester allowlist; the Linear API key is shared across them by default (overridable per project).
 
-If you have multiple distinct products, deploy multiple gates. They're cheap (Node + a JSON file).
+This means you usually deploy **one gate per company / domain group**, not per project. Drop the plugin into any number of sites under that domain, give each a `project` key, and they all surface in the same admin panel.
 
 ```
-┌─ your prod site(s) ──────────────────┐
-│  - public frontend                    │
-│  - internal admin                     │
-│  - any other surface                  │
-│       │                               │
-│       │  overlay.js loaded from gate  │
-│       ▼                               │
-│  ┌─ your gate (one per project) ──┐   │
-│  │  - Linear API key              │   │
-│  │  - tester email allowlist      │   │
-│  │  - admin UI at /<project-name> │   │
-│  └────────┬───────────────────────┘   │
-│           ▼                            │
-│       Linear API                      │
-└───────────────────────────────────────┘
+┌─ your sites (any stack) ──────────────────────────────────┐
+│  messarat.com               → project: 'messarat'          │
+│  back.messarat.com/admin    → project: 'messarat'          │
+│  tm.example.com             → project: 'tm'                │
+│  tawtheef.example.com       → project: 'tawtheef'          │
+│       │                                                    │
+│       │  overlay.js loaded from gate, project key baked in │
+│       ▼                                                    │
+│  ┌─ your gate (one per domain group) ──────────────────┐   │
+│  │  - global Linear API key (shared default)           │   │
+│  │  - per-project Linear destination + allowlist       │   │
+│  │  - heartbeat-based auto-discovery (pending projects)│   │
+│  │  - admin UI at /frontend-conqueror                  │   │
+│  └────────┬─────────────────────────────────────────────┘   │
+│           ▼                                                │
+│       Linear API (issues land in each project's Linear)   │
+└────────────────────────────────────────────────────────────┘
 ```
+
+### Project keys
+
+Each surface that hosts the overlay has a `project` key. Two surfaces with the *same* key (e.g. `messarat.com` and `back.messarat.com` both set to `'messarat'`) report into the same Linear project and share an allowlist. Two surfaces with *different* keys (e.g. `'messarat-frontend'` and `'messarat-admin'`) are tracked separately.
+
+If a heartbeat arrives from an **unknown** project key, the gate auto-creates it as `pending` and surfaces it to the admin with one-click "Configure". This makes "install on a new project" smooth: drop in the plugin, set the key, open the site once, then configure in the admin.
 
 ---
 
@@ -65,7 +73,10 @@ export default defineNuxtConfig({
   vite: { plugins: isDev ? [frontendConquerorPlugin({
     projectRoot: process.cwd(),
     locales: ['en', 'ar'],
-    gate: { url: process.env.NUXT_PUBLIC_GATE_URL || 'http://localhost:54322' },
+    gate: {
+      url: process.env.NUXT_PUBLIC_GATE_URL || 'http://localhost:54322',
+      project: 'my-app',          // project key in the gate's admin
+    },
   })] : [] },
 });
 ```
@@ -93,13 +104,16 @@ The Blade view that hosts your Vue app needs both the dev and prod overlay tags,
 @php
     $fcDevUrl  = file_exists(public_path('hot')) ? trim(file_get_contents(public_path('hot'))) : null;
     $fcGateUrl = env('FRONTEND_CONQUEROR_GATE_URL');
+    $fcProject = env('FRONTEND_CONQUEROR_PROJECT', 'my-app');
 @endphp
 @if(app()->environment('local') && $fcDevUrl)
     <script src="{{ $fcDevUrl }}/__frontend-conqueror/overlay.js" defer></script>
 @elseif(!app()->environment('local') && $fcGateUrl)
-    <script src="{{ $fcGateUrl }}/overlay.js" defer></script>
+    <script src="{{ $fcGateUrl }}/{{ $fcProject }}/overlay.js" defer></script>
 @endif
 ```
+
+The `/<project>/overlay.js` path form is recommended (v0.5.0+). The gate bakes the project key into the overlay config server-side, so the page doesn't need to know about it.
 
 ### Other stacks
 
@@ -185,15 +199,21 @@ See [examples/nginx.example.conf](./examples/nginx.example.conf).
 
 ## Step 5 — First-time admin setup
 
-Visit `https://gate.YOUR-DOMAIN.com/<GATE_PROJECT_NAME>` (e.g. `https://gate.my-domain.com/my-app`).
+Visit `https://gate.YOUR-DOMAIN.com/frontend-conqueror`.
 
 1. Log in with the default password — **shown on the login page until you change it**.
 2. You'll be force-prompted to change it. New password ≥ 8 chars.
-3. Paste your Linear API key. The gate auto-fetches your team.
-4. Pick the Linear project where issues should land. Or create a new one inline.
-5. Add your testers' email addresses to the allowlist.
+3. **Setup wizard (5 steps):**
+   1. Paste your Linear API key.
+   2. Pick your team (auto-skipped if you have only one).
+   3. Name your first project — display name + key (e.g. "Messarat" / `messarat`). The key is what you put in `gate.project` in plugin configs.
+   4. Pick or create a Linear project for it. Bugs from this project land there.
+   5. Add at least one tester email.
+4. Done — you're on the project's detail page.
 
-That's the entire admin flow. Bookmark `https://gate.YOUR-DOMAIN.com/<project-name>` — that's the only URL you need.
+After setup, adding more projects is a 2-step wizard (Linear destination + testers), and **auto-detected pending projects** (from heartbeats) show up at the top of the project list with a one-click "Configure" button.
+
+Bookmark `https://gate.YOUR-DOMAIN.com/frontend-conqueror` — that's the only URL the admin uses.
 
 ---
 

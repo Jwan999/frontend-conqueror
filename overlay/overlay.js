@@ -19,15 +19,16 @@
   );
   const WS_URL = CFG.wsUrl;
   const MAP_URL = CFG.mapUrl;
-  const GATE = CFG.gate; // { url } | null — required for Test mode
+  const GATE = CFG.gate; // { url, project? } | null — required for Test mode
   const ENABLED = new Set(Array.isArray(CFG.enabledModes) ? CFG.enabledModes : ['edit', 'todo', 'test']);
   const HOST_ID = '__frontend-conqueror-host';
 
   // ---------- Gate session helpers (Test mode) ----------
-  // The gate is a singleton per project (one gate = one project), so the JWT
-  // is namespaced by gate URL alone — no projectKey to send or to track.
+  // Tokens are namespaced by (gate URL, project) since one gate can serve
+  // multiple projects and each project has its own allowlist.
+  function gateProject() { return (GATE && GATE.project) || ''; }
   function gateStorageKey() {
-    return GATE ? `__fc_jwt:${GATE.url}` : null;
+    return GATE ? `__fc_jwt:${GATE.url}:${gateProject()}` : null;
   }
   function getStoredGateToken() {
     if (!GATE) return null;
@@ -52,7 +53,7 @@
     const r = await fetch(`${GATE.url}/api/verify-email`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ email, project: gateProject() || undefined }),
     });
     if (!r.ok) return { ok: false, status: r.status };
     const data = await r.json();
@@ -68,6 +69,26 @@
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch {}
     return { ok: r.ok, status: r.status, data };
+  }
+
+  // ---------- Heartbeat ----------
+  // Lets the gate auto-discover this project and surface activity to the admin.
+  // Fired on load and every 5 minutes while the page stays open.
+  // No-op (and fail-silent) when no gate or no project key configured.
+  function gateHeartbeat() {
+    if (!GATE || !GATE.url || !gateProject()) return;
+    try {
+      fetch(`${GATE.url}/api/heartbeat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project: gateProject(),
+          origin: location.origin,
+          url: location.href.slice(0, 300),
+        }),
+        keepalive: true,
+      }).catch(() => {});
+    } catch {}
   }
 
   // Multi-mode state. Mutually exclusive: only one mode is active at a time.
@@ -102,6 +123,10 @@
       .then((r) => r.ok ? r.json() : null)
       .then((j) => { if (j) applyModeColorsFromGate(j.modeColors); })
       .catch(() => {});
+    // Heartbeat: announce ourselves on load, then every 5 minutes while the
+    // page stays open. Lets the gate's admin see this project + page activity.
+    gateHeartbeat();
+    setInterval(gateHeartbeat, 5 * 60 * 1000);
   }
   let activeMode = null;  // null | 'edit' | 'test' | 'todo'
   // Convenience: anywhere we previously checked `editMode`, we now check `activeMode === 'edit'`.

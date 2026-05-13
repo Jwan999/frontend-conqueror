@@ -68,7 +68,7 @@ Pin to a tagged version so you get reproducible installs:
 
 ```bash
 # Latest stable
-npm install --save-dev github:Jwan999/frontend-conqueror#v0.4.0
+npm install --save-dev github:Jwan999/frontend-conqueror#v0.5.0
 
 # Or track main if you want every commit (not recommended for shared projects)
 npm install --save-dev github:Jwan999/frontend-conqueror

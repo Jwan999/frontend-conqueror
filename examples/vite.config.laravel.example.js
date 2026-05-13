@@ -30,6 +30,7 @@ export default defineConfig({
         agentPort: 54321,
         gate: {
           url: process.env.FRONTEND_CONQUEROR_GATE_URL || 'http://localhost:54322',
+          project: 'my-app',          // project key in the gate's admin
         },
       }),
     ] : []),

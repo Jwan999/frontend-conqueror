@@ -304,10 +304,12 @@ module.exports = function frontendConquerorPlugin(options = {}) {
     // old behavior (useful if you want to run the agent under a debugger).
     autoStartAgent: options.autoStartAgent !== false,
     agentPath: options.agentPath || path.join(__dirname, '..', 'agent', 'server.js'),
-    // Test mode wiring: where the gate service lives + which key identifies
-    // this project in the gate's allowlist database. Both required to activate
-    // Test mode; without them the overlay shows a "configure gate" toast.
-    gate: options.gate || null,  // { url: string, projectKey: string }
+    // Test mode wiring. Pass `{ url, project }`:
+    //   url:     base URL of the gate service (dev: http://localhost:54322)
+    //   project: project key registered in the gate (v0.5.0+; omit for
+    //            single-project gates falling back to the default project).
+    // Without `gate`, Test mode shows a "configure gate" toast.
+    gate: options.gate || null,
   };
 
   let projectRoot;
