@@ -822,6 +822,17 @@
   // ---------- Source-map (data-edit-loc + i18n) ----------
   let i18nMap = null;
   let i18nMapPromise = null;
+  // Cross-reference table: { file: [i18n keys] }. Populated alongside the map.
+  // Used by the picker to boost candidates referenced by ancestor components.
+  let i18nReferences = null;
+
+  function fetchRefs() {
+    if (!ENABLED.has('edit') || !CFG.refsUrl) { i18nReferences = i18nReferences || {}; return Promise.resolve(i18nReferences); }
+    return fetch(CFG.refsUrl, { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : {}))
+      .then((m) => { i18nReferences = m && typeof m === 'object' ? m : {}; return i18nReferences; })
+      .catch(() => { if (!i18nReferences) i18nReferences = {}; return i18nReferences; });
+  }
 
   function fetchI18nMap() {
     // Only Edit mode needs the i18n source map. Skip the fetch entirely in
@@ -842,7 +853,7 @@
   // map around so lookups don't suddenly return null between an edit and its
   // refetch. submit() always awaits the latest before sending, so stale offsets
   // can't reach the agent.
-  function invalidateI18nMap() { i18nMapPromise = null; fetchI18nMap(); }
+  function invalidateI18nMap() { i18nMapPromise = null; fetchI18nMap(); fetchRefs(); }
 
   function getActiveLocale() {
     if (typeof window.__activeLocale === 'string') return window.__activeLocale.toLowerCase();
@@ -875,6 +886,21 @@
     const file = loc.slice(0, idx1);
     if (!Number.isFinite(offset) || !Number.isFinite(length)) return null;
     return { file, offset, length };
+  }
+  // Reads data-edit-script-loc="<file>:<offset>:<length>:<kind>" emitted by
+  // the plugin when an interpolation traces to a literal JS string in the
+  // component's script. Resolves to a synthetic entry the editor can use.
+  function readDataEditScriptLoc(el) {
+    const v = readAncestorAttr(el, 'data-edit-script-loc');
+    if (!v) return null;
+    const parts = v.split(':');
+    if (parts.length < 4) return null;
+    const kind = parts[parts.length - 1] || 'string-literal';
+    const length = Number(parts[parts.length - 2]);
+    const offset = Number(parts[parts.length - 3]);
+    const file = parts.slice(0, parts.length - 3).join(':');
+    if (!Number.isFinite(offset) || !Number.isFinite(length)) return null;
+    return { file, offset, length, kind, path: 'script:' + file + ':' + offset, locale: null };
   }
 
   function findByPath(path, locale) {
@@ -1217,6 +1243,12 @@
       const aLoc = a.locale === locale ? 0 : 1;
       const bLoc = b.locale === locale ? 0 : 1;
       if (aLoc !== bLoc) return aLoc - bLoc;
+      // STRONGEST signal: candidate's key is literally referenced by an
+      // ancestor component's script. This catches the cross-component case
+      // (`{{ link.label }}` in a child where the parent does `t('nav.x')`).
+      const aRef = ancestorReferences(a, target) ? 0 : 1;
+      const bRef = ancestorReferences(b, target) ? 0 : 1;
+      if (aRef !== bRef) return aRef - bRef;
       // Context match: prefer path starting with semantic prefix.
       const aPath = (a.path || '').toLowerCase();
       const bPath = (b.path || '').toLowerCase();
@@ -1345,6 +1377,37 @@
     return false;
   }
 
+  // Returns the set of .vue source files in the clicked element's ancestor
+  // chain (from data-edit-source attributes). Used to check whether a
+  // candidate's i18n key is referenced by any ancestor component.
+  function ancestorSourceFiles(target) {
+    const files = new Set();
+    let n = elementForTarget(target);
+    while (n && n.nodeType === 1) {
+      const src = n.getAttribute && n.getAttribute('data-edit-source');
+      if (src) {
+        const i = src.lastIndexOf(':');
+        if (i > 0) files.add(src.slice(0, i));
+      }
+      n = n.parentElement;
+    }
+    return files;
+  }
+  // Is this candidate's i18n key referenced by any of the ancestor components?
+  // True = the parent file's script literally contains `$t('key')` — strong
+  // signal that this is the right candidate even when the rendering child
+  // component doesn't know about it.
+  function ancestorReferences(candidate, target) {
+    if (!candidate.path || !i18nReferences) return false;
+    const ancestors = ancestorSourceFiles(target);
+    if (ancestors.size === 0) return false;
+    for (const file of ancestors) {
+      const keys = i18nReferences[file];
+      if (keys && keys.indexOf(candidate.path) >= 0) return true;
+    }
+    return false;
+  }
+
   // From a ranked candidate list, return a single entry if it's a clear winner
   // (unique strong-context match in the active locale). Otherwise return null,
   // signalling the caller to show the picker.
@@ -1354,12 +1417,24 @@
 
     const ranked = rankCandidates(candidates, target, null, locale);
     const top = ranked[0];
-    // Strong winner: in active locale + unique semantic context match.
+
+    // Strongest signal: unique ancestor-reference match. Catches cross-component
+    // cases where the parent's script literally has `$t('key')` for one of the
+    // candidates and no other.
+    const topRef = ancestorReferences(top, target);
+    if (topRef) {
+      const otherRefs = ranked.slice(1).filter((c) => ancestorReferences(c, target));
+      if (otherRefs.length === 0) return top;
+    }
+
+    // Next: unique semantic-context match (nav.* inside <nav> etc.).
     const topContextHit = contextMatches(target, top.path);
-    if (!topContextHit) return null;          // no semantic anchor → ambiguous
-    const otherHits = ranked.slice(1).filter((c) => contextMatches(target, c.path));
-    if (otherHits.length === 0) return top;   // unique → auto-pick
-    return null;                              // multiple context matches → picker
+    if (topContextHit) {
+      const otherHits = ranked.slice(1).filter((c) => contextMatches(target, c.path));
+      if (otherHits.length === 0) return top;
+    }
+
+    return null;                              // ambiguous → picker
   }
 
   async function openEditor(target) {
@@ -1392,6 +1467,17 @@
       const distinctLocales = new Set(all.map((e) => e.locale).filter(Boolean));
       if (all.length > 1 && distinctLocales.size > 1) {
         return openMultiLocaleEditor(target, resolvedPath, all);
+      }
+    }
+
+    // 1c. data-edit-script-loc — literal string in a .vue script that the
+    //     plugin's resolver traced to. Edit the byte range directly.
+    if (!resolvedPath) {
+      const scriptLoc = readDataEditScriptLoc(targetElForCheck);
+      if (scriptLoc) {
+        // Synthesize an entry with .value so the editor pre-fills correctly.
+        const synth = { ...scriptLoc, value: displayedText };
+        return openEditorForEntry(target, synth);
       }
     }
 
@@ -1934,6 +2020,7 @@
     shadow.appendChild(indicator);
     updateIndicator();
     fetchI18nMap();
+    fetchRefs();
     document.addEventListener('mousemove', onMouseMove, true);
     document.addEventListener('mousedown', onDocMouseDown, true);
     document.addEventListener('click', onDocClick, true);

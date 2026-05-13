@@ -1,6 +1,6 @@
 {
   "name": "frontend-conqueror-gate",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "private": true,
   "description": "frontend-conqueror — standalone HTTP gate that holds the email allowlist + Linear API keys for Test mode in production.",
   "bin": {

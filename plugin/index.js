@@ -18,6 +18,7 @@ const { spawn } = require('child_process');
 
 const OVERLAY_URL = '/__frontend-conqueror/overlay.js';
 const MAP_URL = '/__frontend-conqueror/map.json';
+const REFS_URL = '/__frontend-conqueror/refs.json';
 
 function relPath(root, p) {
   return path.relative(root, p).replace(/\\/g, '/');
@@ -403,6 +404,323 @@ function scanVueScript(scriptContent, scriptOffset, fileRel, babelParser) {
   return entries;
 }
 
+// ============================================================================
+// SYMBOL TABLE — for each .vue script block, resolve top-level declarations
+// to their value shape. The template resolver uses this to trace expressions
+// like {{ link.label }} back to a concrete i18n key or script literal range.
+// ============================================================================
+
+// Matches a CallExpression node against known i18n call forms:
+//   $t('key'), t('key'), this.$t('key'), i18n.t('key'), messages.t('key')
+// Returns the key string or null.
+function matchI18nCallNode(node, allowedRoots) {
+  if (!node || node.type !== 'CallExpression') return null;
+  let callee = node.callee;
+  let funcName = null;
+  if (callee.type === 'Identifier') funcName = callee.name;
+  else if (callee.type === 'MemberExpression') {
+    if (callee.property && callee.property.type === 'Identifier') {
+      funcName = callee.property.name;
+    }
+  }
+  if (!funcName || !allowedRoots.includes(funcName)) return null;
+  const arg = node.arguments && node.arguments[0];
+  if (!arg || arg.type !== 'StringLiteral') return null;
+  return arg.value;
+}
+
+// Returns a ResolvedValue describing what an AST expression node evaluates to,
+// to the extent we can determine statically. Recurses into `computed(() => x)`,
+// `ref(x)`, arrow-function expression bodies, ternaries.
+function resolveScriptExpression(node, scriptOffset, allowedRoots, i18nCallsUsed) {
+  if (!node) return { kind: 'unknown' };
+  if (node.type === 'StringLiteral') {
+    return {
+      kind: 'string-literal',
+      value: node.value,
+      offset: scriptOffset + node.start,
+      length: node.end - node.start,
+    };
+  }
+  if (node.type === 'TemplateLiteral') {
+    return {
+      kind: 'template-literal',
+      quasis: (node.quasis || []).map((q, i) => ({
+        value: q.value && (q.value.cooked == null ? q.value.raw : q.value.cooked),
+        offset: scriptOffset + q.start,
+        length: q.end - q.start,
+        quasiIndex: i,
+      })),
+    };
+  }
+  if (node.type === 'CallExpression') {
+    const key = matchI18nCallNode(node, allowedRoots);
+    if (key) {
+      i18nCallsUsed.push(key);
+      return { kind: 'i18n-call', key };
+    }
+    // Recognize Vue reactivity wrappers and unwrap them.
+    const calleeName = node.callee && node.callee.type === 'Identifier' && node.callee.name;
+    if ((calleeName === 'computed' || calleeName === 'ref' || calleeName === 'reactive' || calleeName === 'shallowRef' || calleeName === 'shallowReactive') && node.arguments[0]) {
+      return resolveScriptExpression(node.arguments[0], scriptOffset, allowedRoots, i18nCallsUsed);
+    }
+    return { kind: 'unknown' };
+  }
+  if (node.type === 'ArrowFunctionExpression' || node.type === 'FunctionExpression') {
+    if (node.body && node.body.type !== 'BlockStatement') {
+      return resolveScriptExpression(node.body, scriptOffset, allowedRoots, i18nCallsUsed);
+    }
+    // Block-body: try to find a single `return` statement and resolve its argument.
+    if (node.body && node.body.type === 'BlockStatement') {
+      const returns = (node.body.body || []).filter((s) => s.type === 'ReturnStatement');
+      if (returns.length === 1 && returns[0].argument) {
+        return resolveScriptExpression(returns[0].argument, scriptOffset, allowedRoots, i18nCallsUsed);
+      }
+    }
+    return { kind: 'unknown' };
+  }
+  if (node.type === 'ArrayExpression') {
+    return {
+      kind: 'array',
+      items: (node.elements || []).map((el) => resolveScriptExpression(el, scriptOffset, allowedRoots, i18nCallsUsed)),
+    };
+  }
+  if (node.type === 'ObjectExpression') {
+    const props = new Map();
+    for (const p of node.properties || []) {
+      if ((p.type !== 'ObjectProperty' && p.type !== 'Property') || !p.key) continue;
+      let key = null;
+      if (p.key.type === 'Identifier') key = p.key.name;
+      else if (p.key.type === 'StringLiteral') key = p.key.value;
+      if (key == null) continue;
+      props.set(key, resolveScriptExpression(p.value, scriptOffset, allowedRoots, i18nCallsUsed));
+    }
+    return { kind: 'object', props };
+  }
+  if (node.type === 'ConditionalExpression') {
+    return {
+      kind: 'conditional',
+      branches: [
+        resolveScriptExpression(node.consequent, scriptOffset, allowedRoots, i18nCallsUsed),
+        resolveScriptExpression(node.alternate, scriptOffset, allowedRoots, i18nCallsUsed),
+      ],
+    };
+  }
+  if (node.type === 'LogicalExpression') {
+    // x || y, x && y — collect both sides' resolution.
+    return {
+      kind: 'conditional',
+      branches: [
+        resolveScriptExpression(node.left, scriptOffset, allowedRoots, i18nCallsUsed),
+        resolveScriptExpression(node.right, scriptOffset, allowedRoots, i18nCallsUsed),
+      ],
+    };
+  }
+  return { kind: 'unknown' };
+}
+
+// Parse a .vue script block and return its symbol table.
+function buildSymbolTable(scriptContent, scriptOffset, babelParser, allowedRoots) {
+  const empty = { locals: new Map(), i18nCallsUsed: [] };
+  if (!scriptContent || !babelParser) return empty;
+  let ast;
+  try {
+    ast = babelParser.parse(scriptContent, {
+      sourceType: 'module',
+      plugins: ['typescript'],
+      allowImportExportEverywhere: true,
+      errorRecovery: true,
+    });
+  } catch { return empty; }
+
+  const locals = new Map();
+  const i18nCallsUsed = [];
+
+  function visitDeclarations(declarations) {
+    for (const d of declarations || []) {
+      if (!d.id || d.id.type !== 'Identifier' || !d.init) continue;
+      locals.set(d.id.name, resolveScriptExpression(d.init, scriptOffset, allowedRoots, i18nCallsUsed));
+    }
+  }
+
+  for (const stmt of ast.program.body || []) {
+    if (stmt.type === 'VariableDeclaration') {
+      visitDeclarations(stmt.declarations);
+    } else if (stmt.type === 'ExportNamedDeclaration' && stmt.declaration && stmt.declaration.type === 'VariableDeclaration') {
+      visitDeclarations(stmt.declaration.declarations);
+    } else if (stmt.type === 'ExpressionStatement' && stmt.expression && stmt.expression.type === 'CallExpression') {
+      // Side-effect i18n calls (e.g. `useI18nKey('foo')`) still get recorded as referenced.
+      const key = matchI18nCallNode(stmt.expression, allowedRoots);
+      if (key) i18nCallsUsed.push(key);
+    }
+  }
+  return { locals, i18nCallsUsed: Array.from(new Set(i18nCallsUsed)) };
+}
+
+// ============================================================================
+// TEMPLATE EXPRESSION RESOLVER — given a `{{ expr }}` interpolation string and
+// the .vue's symbol table, trace expr to a list of i18n key paths and/or
+// script-literal byte ranges. Falls back to {dyn: true} when unresolvable.
+// ============================================================================
+function resolveTemplateExpr(exprStr, symbolTable, allowedRoots, babelParser, scopeStack) {
+  const result = { paths: [], scriptLocs: [], dyn: false };
+  if (!exprStr || !babelParser) { result.dyn = true; return result; }
+  scopeStack = scopeStack || [];
+  let exprAst;
+  try {
+    const parsed = babelParser.parse('(' + exprStr + ')', {
+      sourceType: 'module',
+      plugins: ['typescript'],
+      errorRecovery: true,
+    });
+    exprAst = parsed.program.body[0] && parsed.program.body[0].expression;
+  } catch { result.dyn = true; return result; }
+  if (!exprAst) { result.dyn = true; return result; }
+
+  // Lookup an identifier in scope stack (innermost first), then locals.
+  function lookupIdent(name) {
+    for (let i = scopeStack.length - 1; i >= 0; i--) {
+      if (scopeStack[i].variable === name) return scopeStack[i].source;
+    }
+    return symbolTable.locals.get(name) || null;
+  }
+
+  // Drill into a member chain to find the root identifier + property path.
+  // Supports Identifier (literal property), StringLiteral (`obj['key']`), and
+  // NumericLiteral (`arr[3]`).
+  function resolveMember(node) {
+    const segs = [];
+    let cur = node;
+    while (cur.type === 'MemberExpression') {
+      let name = null;
+      if (cur.property.type === 'Identifier' && !cur.computed) name = cur.property.name;
+      else if (cur.property.type === 'StringLiteral') name = cur.property.value;
+      else if (cur.property.type === 'NumericLiteral') name = String(cur.property.value);
+      else return null;          // computed expression we can't resolve statically
+      segs.unshift(name);
+      cur = cur.object;
+    }
+    if (cur.type !== 'Identifier') return null;
+    return { root: cur.name, props: segs };
+  }
+  // Apply prop chain to a resolved value. When the value is an array, expand
+  // into every item (so `link.label` in a v-for over an array yields a path
+  // per item).
+  function followProps(val, props) {
+    let current = [val];
+    for (const p of props) {
+      const next = [];
+      for (const v of current) {
+        if (!v) continue;
+        if (v.kind === 'object' && v.props.has(p)) next.push(v.props.get(p));
+        else if (v.kind === 'array') {
+          if (/^\d+$/.test(p) && v.items[Number(p)]) next.push(v.items[Number(p)]);
+          else {
+            // Generic property access on an array → broadcast across items.
+            for (const item of v.items) {
+              if (item && item.kind === 'object' && item.props.has(p)) next.push(item.props.get(p));
+            }
+          }
+        }
+      }
+      current = next;
+      if (current.length === 0) return [];
+    }
+    return current;
+  }
+  function extract(resolved) {
+    if (!resolved) return;
+    if (Array.isArray(resolved)) { for (const r of resolved) extract(r); return; }
+    if (resolved.kind === 'i18n-call') result.paths.push(resolved.key);
+    else if (resolved.kind === 'string-literal') result.scriptLocs.push({ offset: resolved.offset, length: resolved.length, kind: 'string-literal' });
+    else if (resolved.kind === 'template-literal') {
+      for (const q of resolved.quasis) {
+        if (q.length > 0) result.scriptLocs.push({ offset: q.offset, length: q.length, kind: 'template-quasi' });
+      }
+    } else if (resolved.kind === 'conditional') {
+      for (const b of resolved.branches) extract(b);
+    } else if (resolved.kind === 'array') {
+      // Bare `{{ items }}` doesn't render usable text. Member access handles items.
+    }
+  }
+
+  function walk(node) {
+    if (!node) return;
+    if (node.type === 'CallExpression') {
+      const key = matchI18nCallNode(node, allowedRoots);
+      if (key) { result.paths.push(key); return; }
+      for (const a of node.arguments || []) walk(a);
+      return;
+    }
+    if (node.type === 'Identifier') {
+      const val = lookupIdent(node.name);
+      if (val) extract(val);
+      return;
+    }
+    if (node.type === 'MemberExpression') {
+      const m = resolveMember(node);
+      if (!m) return;
+      const val = lookupIdent(m.root);
+      if (!val) return;
+      const reached = followProps(val, m.props);
+      extract(reached);
+      return;
+    }
+    if (node.type === 'ConditionalExpression') {
+      walk(node.consequent); walk(node.alternate); return;
+    }
+    if (node.type === 'LogicalExpression') {
+      walk(node.left); walk(node.right); return;
+    }
+    if (node.type === 'BinaryExpression' && node.operator === '+') {
+      walk(node.left); walk(node.right); return;
+    }
+    if (node.type === 'TemplateLiteral') {
+      for (const e of node.expressions || []) walk(e);
+      return;
+    }
+  }
+  walk(exprAst);
+  result.paths = Array.from(new Set(result.paths));
+  if (result.paths.length === 0 && result.scriptLocs.length === 0) result.dyn = true;
+  return result;
+}
+
+// Build the most precise attribute we can for an interpolation expression.
+// Order of preference (highest signal first):
+//   1. New resolver finds i18n key(s)            → data-edit-i18n-path / data-edit-i18n-paths
+//   2. New resolver finds script literal byte range → data-edit-script-loc
+//   3. Legacy parseMemberChain (`t.foo.bar`)     → data-edit-i18n-path
+//   4. Legacy parseI18nCall (`$t('foo')`)        → data-edit-i18n-path
+//   5. Legacy findAllI18nCalls (compound expr)   → data-edit-i18n-paths
+// Returns null when nothing resolves; caller emits `data-edit-dyn="1"`.
+function resolveInterpolationAttr(expr, symbolTable, options, deps, fileRel, scopeStack) {
+  // 1+2: new resolver (uses symbol table + active v-for scope to trace expr)
+  const r = resolveTemplateExpr(expr, symbolTable, options.i18nRoots, deps.babelParser, scopeStack);
+  if (r.paths.length === 1) {
+    return `data-edit-i18n-path="${escapeAttr(r.paths[0])}"`;
+  }
+  if (r.paths.length > 1) {
+    return `data-edit-i18n-paths="${escapeAttr(r.paths.join('|'))}"`;
+  }
+  if (r.scriptLocs.length === 1) {
+    const s = r.scriptLocs[0];
+    return `data-edit-script-loc="${escapeAttr(fileRel)}:${s.offset}:${s.length}:${s.kind || 'string-literal'}"`;
+  }
+  if (r.scriptLocs.length > 1) {
+    // Emit pipe-separated script locations the overlay can match by value.
+    const enc = r.scriptLocs.map((s) => `${s.offset}:${s.length}:${s.kind || 'string-literal'}`).join('|');
+    return `data-edit-script-locs="${escapeAttr(fileRel + '|' + enc)}"`;
+  }
+
+  // 3+4+5: legacy fallbacks (unchanged behavior for compat)
+  const chain = parseMemberChain(expr, options.i18nRoots) || parseI18nCall(expr, options.i18nRoots);
+  if (chain) return `data-edit-i18n-path="${escapeAttr(chain.path)}"`;
+  const allKeys = findAllI18nCalls(expr, options.i18nRoots);
+  if (allKeys.length > 0) return `data-edit-i18n-paths="${escapeAttr(allKeys.join('|'))}"`;
+  return null;
+}
+
 // ----- Transform a .vue source string: emit data-edit-loc / data-edit-i18n-path / data-edit-dyn -----
 function transformVueSource(code, fileRel, deps, options) {
   if (!deps.compilerSfc) return null;
@@ -412,6 +730,13 @@ function transformVueSource(code, fileRel, deps, options) {
   if (!tpl) return null;
   const templateInner = tpl.content;
   const templateOffset = tpl.loc.start.offset;
+
+  // Build the symbol table from this .vue's script block. Empty table is fine —
+  // resolver will then return dyn and we fall back to the existing detectors.
+  const scriptBlock = parsed.descriptor.scriptSetup || parsed.descriptor.script;
+  const symbolTable = scriptBlock && deps.babelParser
+    ? buildSymbolTable(scriptBlock.content, scriptBlock.loc.start.offset, deps.babelParser, options.i18nRoots)
+    : { locals: new Map(), i18nCallsUsed: [] };
 
   let ast;
   try { ast = deps.compilerDom.parse(templateInner); }
@@ -429,6 +754,51 @@ function transformVueSource(code, fileRel, deps, options) {
     return interp && interp.content && interp.content.content;
   }
 
+  // Scope stack for v-for / v-slot bindings. Pushed when entering a node with
+  // such a directive, popped when leaving. Resolvers in this scope can map a
+  // loop variable like `link` to the array it iterates over.
+  const scopeStack = [];
+
+  // Parse a v-for expression like "link in navLinks" or "(item, idx) in items"
+  // and push a scope frame for the loop variable. Returns whether we pushed
+  // anything (caller pops on exit).
+  function pushVForScope(node) {
+    if (!node.props) return false;
+    let pushed = false;
+    for (const dir of node.props) {
+      if (dir.type !== 7 || dir.name !== 'for') continue;
+      // The for directive's value is the raw expression e.g. "(link, i) in navLinks".
+      const exprStr = dir.exp && dir.exp.content;
+      if (!exprStr) continue;
+      const m = exprStr.match(/^\s*(?:\(([^)]+)\)|(\S+))\s+(?:in|of)\s+(.+?)\s*$/);
+      if (!m) continue;
+      const loopHead = m[1] || m[2];
+      const sourceExpr = m[3].trim();
+      // The loop variable is the first identifier in `loopHead` (skip ws / parens / commas).
+      const loopVar = loopHead.split(',')[0].trim().replace(/[()]/g, '');
+      if (!loopVar) continue;
+      // Resolve the source expression statically (against the current symbol table + outer scopes).
+      const srcResolved = resolveTemplateExpr(sourceExpr, symbolTable, options.i18nRoots, deps.babelParser, scopeStack);
+      // We don't need the resolver's paths/scriptLocs here — we need the underlying ResolvedValue.
+      // Cheat path: re-look up directly if sourceExpr is a single identifier we know.
+      let sourceVal = null;
+      if (/^[A-Za-z_$][\w$]*$/.test(sourceExpr)) {
+        sourceVal = lookupIdentInScopes(sourceExpr, scopeStack, symbolTable.locals);
+      }
+      if (sourceVal) {
+        scopeStack.push({ variable: loopVar, source: sourceVal });
+        pushed = true;
+      }
+    }
+    return pushed;
+  }
+  function lookupIdentInScopes(name, scopes, locals) {
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      if (scopes[i].variable === name) return scopes[i].source;
+    }
+    return locals.get(name) || null;
+  }
+
   function walk(node) {
     if (!node) return;
     if (node.type === 1) {
@@ -441,6 +811,10 @@ function transformVueSource(code, fileRel, deps, options) {
         at: insertionPoint(node),
         str: ` data-edit-source="${escapeAttr(fileRel)}:${elementSourceOffset}"`,
       });
+
+      // v-for / v-slot bindings introduce new scope variables. Push for the
+      // duration of this subtree.
+      const pushedFrame = pushVForScope(node);
 
       const children = node.children || [];
       const interpChildren = children.filter((c) => c.type === 5);
@@ -466,35 +840,18 @@ function transformVueSource(code, fileRel, deps, options) {
         });
       } else if (isSingleInterpolationOnly) {
         const expr = exprOf(interpChildren[0]);
-        const chain = parseMemberChain(expr, options.i18nRoots) || parseI18nCall(expr, options.i18nRoots);
-        if (chain) {
-          transforms.push({ at: insertionPoint(node), str: ` data-edit-i18n-path="${escapeAttr(chain.path)}"` });
+        const attr = resolveInterpolationAttr(expr, symbolTable, options, deps, fileRel, scopeStack);
+        if (attr) {
+          transforms.push({ at: insertionPoint(node), str: ' ' + attr });
         } else {
-          // Try to extract all i18n calls from a compound expression (ternary,
-          // logical, concat). Pipe-separated; overlay matches by displayed value.
-          const allKeys = findAllI18nCalls(expr, options.i18nRoots);
-          if (allKeys.length > 0) {
-            transforms.push({ at: insertionPoint(node), str: ` data-edit-i18n-paths="${escapeAttr(allKeys.join('|'))}"` });
-          } else {
-            transforms.push({ at: insertionPoint(node), str: ' data-edit-dyn="1"' });
-          }
+          transforms.push({ at: insertionPoint(node), str: ' data-edit-dyn="1"' });
         }
       } else if (hasMixedInterpolations) {
         // Wrap each interpolation in <span data-edit-i18n-path="...">{{ … }}</span>
-        // so each text node has its own resolvable ancestor attribute. The wrapper
-        // <span> is an inline element and stays transparent to most CSS.
+        // so each text node has its own resolvable ancestor attribute.
         for (const interp of interpChildren) {
           const expr = exprOf(interp);
-          const chain = parseMemberChain(expr, options.i18nRoots) || parseI18nCall(expr, options.i18nRoots);
-          let attr;
-          if (chain) {
-            attr = `data-edit-i18n-path="${escapeAttr(chain.path)}"`;
-          } else {
-            const allKeys = findAllI18nCalls(expr, options.i18nRoots);
-            attr = allKeys.length > 0
-              ? `data-edit-i18n-paths="${escapeAttr(allKeys.join('|'))}"`
-              : 'data-edit-dyn="1"';
-          }
+          const attr = resolveInterpolationAttr(expr, symbolTable, options, deps, fileRel, scopeStack) || 'data-edit-dyn="1"';
           const openAt = templateOffset + interp.loc.start.offset;
           const closeAt = templateOffset + interp.loc.end.offset;
           transforms.push({ at: openAt, str: `<span ${attr}>` });
@@ -502,6 +859,7 @@ function transformVueSource(code, fileRel, deps, options) {
         }
       }
       for (const c of children) walk(c);
+      if (pushedFrame) scopeStack.pop();
     } else if (node.children) {
       for (const c of node.children) walk(c);
     }
@@ -555,6 +913,11 @@ module.exports = function frontendConquerorPlugin(options = {}) {
   // lazily by the transform() hook as Vite loads files. The map endpoint
   // concatenates these with the i18n source map.
   const scriptEntriesPerFile = new Map();
+  // file (relPath) → Set<i18n key> referenced by that file's script. Used by
+  // the overlay's picker to rank candidates referenced by ancestor components
+  // (the cross-component case where a child renders a prop and we want to
+  // match it to the parent's i18n call).
+  const i18nReferencesPerFile = new Map();
 
   function loadDeps() {
     deps.compilerDom = resolveDep('@vue/compiler-dom', projectRoot);
@@ -677,6 +1040,15 @@ module.exports = function frontendConquerorPlugin(options = {}) {
         res.setHeader('Cache-Control', 'no-store');
         res.end(JSON.stringify(m));
       });
+      // Cross-reference table: { file: [i18n keys] } — used by the overlay's
+      // picker to boost candidates referenced by ancestor components.
+      server.middlewares.use(REFS_URL, (_req, res) => {
+        const refs = {};
+        for (const [file, keys] of i18nReferencesPerFile) refs[file] = keys;
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(JSON.stringify(refs));
+      });
       server.middlewares.use(OVERLAY_URL, (_req, res) => {
         try {
           const body = fs.readFileSync(opt.overlayFile, 'utf8');
@@ -686,6 +1058,7 @@ module.exports = function frontendConquerorPlugin(options = {}) {
           // duplicate assignment is harmless.
           const cfg = {
             mapUrl: MAP_URL,
+            refsUrl: REFS_URL,
             wsUrl: `ws://localhost:${opt.agentPort}`,
             locales: opt.locales,
             gate: opt.gate || null,
@@ -708,6 +1081,7 @@ module.exports = function frontendConquerorPlugin(options = {}) {
         if (!opt.autoInject) return html;
         const cfg = {
           mapUrl: MAP_URL,
+          refsUrl: REFS_URL,
           wsUrl: `ws://localhost:${opt.agentPort}`,
           locales: opt.locales,
           gate: opt.gate || null,
@@ -726,10 +1100,8 @@ module.exports = function frontendConquerorPlugin(options = {}) {
       if (!id.endsWith('.vue')) return null;
       const fileRel = relPath(projectRoot, id);
 
-      // Scan the script block for editable strings (hardcoded arrays, top-level
-      // consts, etc.) so they show up in the map and the picker. Done before the
-      // template transform so script-derived entries are visible when the page
-      // renders.
+      // Scan the script block for editable strings AND collect i18n references
+      // for cross-component picker ranking.
       try {
         const parsed = deps.compilerSfc.parse(code);
         const scriptBlock = parsed && parsed.descriptor && (parsed.descriptor.scriptSetup || parsed.descriptor.script);
@@ -737,6 +1109,11 @@ module.exports = function frontendConquerorPlugin(options = {}) {
           const entries = scanVueScript(scriptBlock.content, scriptBlock.loc.start.offset, fileRel, deps.babelParser);
           if (entries.length > 0) scriptEntriesPerFile.set(id, entries);
           else scriptEntriesPerFile.delete(id);
+          // Build the symbol table once more here purely to harvest i18nCallsUsed.
+          // (transformVueSource builds it independently for its own use — cheap.)
+          const sym = buildSymbolTable(scriptBlock.content, scriptBlock.loc.start.offset, deps.babelParser, opt.i18nRoots);
+          if (sym.i18nCallsUsed.length > 0) i18nReferencesPerFile.set(fileRel, sym.i18nCallsUsed);
+          else i18nReferencesPerFile.delete(fileRel);
         }
       } catch {}
 

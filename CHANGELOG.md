@@ -10,6 +10,38 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.7.0] — 2026-05-13
+
+**The big bullet-proofing release.** Edit mode now traces template expressions through the component's script back to their actual source — i18n calls, hardcoded literals, v-for iterations, computed properties — without needing the user to know about i18n keys. Picker stays as last resort.
+
+### Added
+- **Per-`.vue` symbol table.** Each `.vue` file's `<script>` is parsed once and every top-level declaration is resolved to its value shape: `i18n-call` (with key), `string-literal` (with byte offset), `array` (with item shapes), `object` (with property map), `conditional` (with branches). Walks through `computed(() => ...)`, `ref(...)`, arrow-function expression bodies, single-return block bodies.
+- **Template expression resolver.** For each `{{ expr }}` interpolation, parses the expression with Babel and traces it: Identifier → lookup, MemberExpression → chain into property tree (supports numeric indices `arr[3]`), CallExpression → i18n call detection, ConditionalExpression / LogicalExpression / BinaryExpression+ → recurse all branches.
+- **v-for binding tracking.** Template walker maintains a scope stack: entering a node with `v-for="link in links"` pushes `{ variable: 'link', source: resolved(links) }`. When the resolver hits `link.label`, it broadcasts the property access across every array item, yielding all candidate i18n keys. Multi-locale editor opens with the right one auto-picked by displayed value.
+- **`data-edit-script-loc` attribute** emitted when an interpolation traces to a literal JS string in the script (`const TITLE = 'Welcome'; <h1>{{ TITLE }}</h1>`). Overlay reads it, opens editor with the script byte range — no grep, no value lookup.
+- **Cross-reference table** (`/__frontend-conqueror/refs.json`). Each `.vue` file records which i18n keys its script references. Overlay fetches this alongside the map and uses it for ancestor-aware ranking.
+- **Ancestor-aware picker ranking.** When ranking picker candidates, the overlay walks DOM ancestors collecting `data-edit-source` files. Candidates whose key is referenced by any ancestor file get the strongest boost — solves the cross-component v-for case (parent passes prop to child that renders it) without full data-flow analysis. If the boosted candidate is unique, the picker is skipped entirely.
+
+### Changed
+- `resolveInterpolationAttr()` is now the single entry point for interpolation attribute emission. Tries the new resolver first; falls back to the legacy `parseMemberChain` / `parseI18nCall` / `findAllI18nCalls` chain when the resolver can't decide. No behavior regression for cases that worked before.
+- `rankCandidates()` and `pickClearWinner()` now factor in ancestor-reference signal before semantic-context signal.
+
+### Behavior matrix (what each pattern resolves to now)
+
+| Template pattern | Plugin emits | Resolution path |
+|---|---|---|
+| `<h1>Hello</h1>` | `data-edit-loc` | Direct byte range |
+| `<h1>{{ $t('foo') }}</h1>` | `data-edit-i18n-path="foo"` | Path identity |
+| `<h1>{{ cond ? $t('a') : $t('b') }}</h1>` | `data-edit-i18n-paths="a\|b"` | Value match |
+| `<h1>{{ pageTitle }}</h1>` (computed = $t('foo')) | `data-edit-i18n-path="foo"` | **NEW: traced via symbol table** |
+| `<li v-for="x in arr">{{ x.label }}` (arr = `[{label: $t('a')}, ...]`) | `data-edit-i18n-paths="a\|b\|..."` | **NEW: v-for scope tracking** |
+| `<h1>{{ items[0] }}</h1>` (items = `['Hello']`) | `data-edit-script-loc="<file>:<off>:<len>:string-literal"` | **NEW: script byte range** |
+| `<a>{{ link.label }}` in child where parent passes prop | (resolver dyn) | **NEW: picker boosts by ancestor-references** |
+
+### Compatibility
+- **No breaking changes.** All existing modes work identically. Plugin options unchanged. Agent kinds unchanged. Adds new emit (`data-edit-script-loc`) and new endpoint (`/refs.json`) — old overlay versions ignore both gracefully.
+- Resolver is additive: when it can't decide (`dyn: true`), the existing detectors take over unchanged.
+
 ## [0.6.1] — 2026-05-13
 
 Three focused fixes to make the resolver behave the way a user expects.
@@ -166,7 +198,8 @@ See [STACKS.md](./STACKS.md) for the full matrix.
 
 ---
 
-[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/Jwan999/frontend-conqueror/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/Jwan999/frontend-conqueror/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/Jwan999/frontend-conqueror/compare/v0.5.1...v0.5.2
