@@ -1151,7 +1151,7 @@ async function renderSetup() {
     } else if (step === 3) {
       nav(html\`
         \${dots(3)}
-        <h2>Name your first project<span class="sub">Step 3 of 5 — this is what you'll use in your plugin config (\`gate.project = '...'\`). Letters, numbers, dashes.</span></h2>
+        <h2>Name your first project<span class="sub">Step 3 of 5 — this is what you'll use in your plugin config (<code>gate.project = '...'</code>). Letters, numbers, dashes.</span></h2>
         <div class="card">
           <label for="displayName">Display name</label>
           <input id="displayName" placeholder="Messarat" autofocus value="\${esc(ctx.projectDisplayName)}">
@@ -1198,38 +1198,41 @@ async function renderSetup() {
         <div class="card">
           <div id="projLoad" class="sub-muted">Loading Linear projects…</div>
         </div>\`);
-      let projects = [];
-      try { projects = (await api('GET', '/frontend-conqueror/linear/projects')).projects || []; } catch (e) { $('projLoad').textContent = e.message; return; }
-      nav(html\`
-        \${dots(4)}
-        <h2>Where should bugs land?<span class="sub">Step 4 of 5 — pick or create a Linear project. Bugs from \${esc(ctx.projectDisplayName)} will file there.</span></h2>
-        <div class="card">
-          <label for="existing">Existing Linear project</label>
-          <select id="existing">
-            <option value="">— pick one —</option>
-            \${projects.map(p => '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>').join('')}
-          </select>
-          <div style="text-align:center;color:var(--muted);margin:14px 0;font-size:12px;">— or —</div>
-          <label for="newName">Create a new Linear project</label>
-          <input id="newName" placeholder="\${esc(ctx.projectDisplayName)} Bugs">
-          <div class="err" id="err"></div>
-          <div class="row" style="justify-content:flex-end;margin-top:14px;">
-            <button class="ghost" onclick="(()=>{step=3;renderStep();})()">← Back</button>
-            <button class="primary" id="next">Continue →</button>
-          </div>
-        </div>\`);
-      $('next').addEventListener('click', async () => {
-        const existingId = $('existing').value;
-        const newName = $('newName').value.trim();
-        if (!existingId && !newName) return ($('err').textContent = 'Pick one or type a name.');
-        $('next').disabled = true;
-        try {
-          const body = existingId ? { projectId: existingId } : { newName };
-          await api('PUT', '/frontend-conqueror/projects/' + ctx.projectKey + '/linear-project', body);
-          step = 5;
-          renderStep();
-        } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
-      });
+      (async () => {
+        let projects = [];
+        try { projects = (await api('GET', '/frontend-conqueror/linear/projects')).projects || []; }
+        catch (e) { $('projLoad').textContent = e.message; return; }
+        nav(html\`
+          \${dots(4)}
+          <h2>Where should bugs land?<span class="sub">Step 4 of 5 — pick or create a Linear project. Bugs from \${esc(ctx.projectDisplayName)} will file there.</span></h2>
+          <div class="card">
+            <label for="existing">Existing Linear project</label>
+            <select id="existing">
+              <option value="">— pick one —</option>
+              \${projects.map(p => '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>').join('')}
+            </select>
+            <div style="text-align:center;color:var(--muted);margin:14px 0;font-size:12px;">— or —</div>
+            <label for="newName">Create a new Linear project</label>
+            <input id="newName" placeholder="\${esc(ctx.projectDisplayName)} Bugs">
+            <div class="err" id="err"></div>
+            <div class="row" style="justify-content:flex-end;margin-top:14px;">
+              <button class="ghost" onclick="(()=>{step=3;renderStep();})()">← Back</button>
+              <button class="primary" id="next">Continue →</button>
+            </div>
+          </div>\`);
+        $('next').addEventListener('click', async () => {
+          const existingId = $('existing').value;
+          const newName = $('newName').value.trim();
+          if (!existingId && !newName) return ($('err').textContent = 'Pick one or type a name.');
+          $('next').disabled = true;
+          try {
+            const body = existingId ? { projectId: existingId } : { newName };
+            await api('PUT', '/frontend-conqueror/projects/' + ctx.projectKey + '/linear-project', body);
+            step = 5;
+            renderStep();
+          } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
+        });
+      })();
     } else if (step === 5) {
       nav(html\`
         \${dots(5)}
