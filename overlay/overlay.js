@@ -144,13 +144,25 @@
   // ---------- Shadow DOM ----------
   const host = document.createElement('div');
   host.id = HOST_ID;
-  host.style.cssText = 'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;';
+  // Lock the overlay UI to LTR + English — the host site might be RTL
+  // (Arabic / Hebrew / Persian / Urdu), but the plugin's chrome stays in a
+  // fixed orientation so all developers see the same layout regardless of
+  // which site they're inspecting. Per-locale RTL still applies inside the
+  // multi-locale editor's individual translation textareas.
+  host.dir = 'ltr';
+  host.lang = 'en';
+  host.style.cssText = 'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;direction:ltr;text-align:left;';
   const shadow = host.attachShadow({ mode: 'closed' });
 
   const style = document.createElement('style');
   style.textContent = `
     :host, * { box-sizing: border-box; }
     :host {
+      /* Lock direction at the shadow root — without this, RTL inheritance
+         from the host page mirrors the entire overlay UI. */
+      direction: ltr;
+      text-align: left;
+      unicode-bidi: isolate;
       /* Single source of truth for the active mode color. Future modes will
          only need to swap --mode-color on the host. */
       --mode-color: #2563eb;

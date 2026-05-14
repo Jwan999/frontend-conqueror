@@ -10,6 +10,11 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.7.2] — 2026-05-14
+
+### Fixed
+- **Overlay UI no longer mirrors on RTL host pages.** When the plugin ran on Arabic / Hebrew / Persian / Urdu sites (anywhere `<html dir="rtl">`), the chrome (palette, panels, buttons, hint text) inherited the host page's direction and rendered mirrored — labels on the wrong side, buttons reversed, "?" appearing at the start of placeholder text instead of end. The shadow root now explicitly locks `direction: ltr; text-align: left; unicode-bidi: isolate;` and the host element gets `dir="ltr" lang="en"`. Per-locale RTL still applies inside the multi-locale editor's individual translation textareas (where it should — Arabic translations should render RTL).
+
 ## [0.7.1] — 2026-05-14
 
 Hotfix for two JS-syntax errors in the gate's admin UI that produced a blank page on first visit.
@@ -209,7 +214,8 @@ See [STACKS.md](./STACKS.md) for the full matrix.
 
 ---
 
-[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/Jwan999/frontend-conqueror/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/Jwan999/frontend-conqueror/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/Jwan999/frontend-conqueror/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/Jwan999/frontend-conqueror/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/Jwan999/frontend-conqueror/compare/v0.6.0...v0.6.1
