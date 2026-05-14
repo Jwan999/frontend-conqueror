@@ -66,7 +66,7 @@ function emptyProject(key, displayName) {
     key,
     displayName: displayName || key,
     status: 'pending',                   // pending | active | disabled
-    emails: [],
+    users: {},                           // { [email]: { passwordHash, createdAt, lastLoginAt, lockedUntil } }
     linearProjectId: '',
     linearProjectName: '',
     linearApiKey: null,                  // per-project override
@@ -74,6 +74,9 @@ function emptyProject(key, displayName) {
     activity: emptyActivity(),
     createdAt: Math.floor(Date.now() / 1000),
   };
+}
+function emptyUser() {
+  return { passwordHash: null, createdAt: Math.floor(Date.now() / 1000), lastLoginAt: null, lockedUntil: null };
 }
 function loadData() {
   let data;
@@ -97,7 +100,14 @@ function loadData() {
     }
     const proj = emptyProject(key, oldS.projectName);
     proj.status = 'active';
-    proj.emails = Array.isArray(oldS.emails) ? oldS.emails : [];
+    // v0.8.0: emails[] → users{}. Migrated entries have no password — admin must
+    // set one before they can log in.
+    if (Array.isArray(oldS.emails)) {
+      for (const e of oldS.emails) {
+        const lc = String(e).toLowerCase().trim();
+        if (lc) proj.users[lc] = emptyUser();
+      }
+    }
     if (oldLin) {
       proj.linearProjectId = oldLin.projectId || '';
       proj.linearProjectName = oldLin.projectName || '';
@@ -139,6 +149,20 @@ function loadData() {
   if (!data.modeColors) data.modeColors = { ...DEFAULT_MODE_COLORS };
   if (!data.projects) data.projects = {};
   if (data.linear === undefined) data.linear = null;
+
+  // v0.8.0 migration: convert per-project emails[] to users{} (with no
+  // password — admin must set one). Idempotent — leaves existing users{} alone.
+  for (const proj of Object.values(data.projects)) {
+    if (!proj) continue;
+    if (!proj.users) proj.users = {};
+    if (Array.isArray(proj.emails)) {
+      for (const e of proj.emails) {
+        const lc = String(e).toLowerCase().trim();
+        if (lc && !proj.users[lc]) proj.users[lc] = emptyUser();
+      }
+      delete proj.emails;
+    }
+  }
   return data;
 }
 function saveData(data) {
@@ -382,11 +406,15 @@ function publicLinear(linear) {
 // Per-project summary for the admin list (no allowlist values leaked here).
 function publicProjectSummary(p) {
   const a = p.activity || emptyActivity();
+  const users = p.users || {};
+  const userCount = Object.keys(users).length;
+  const usersWithoutPassword = Object.values(users).filter((u) => !u.passwordHash).length;
   return {
     key: p.key,
     displayName: p.displayName,
     status: p.status,
-    emailsCount: (p.emails || []).length,
+    usersCount: userCount,
+    usersNeedingPassword: usersWithoutPassword,
     linearProjectName: p.linearProjectName || '',
     hasLinearOverride: !!(p.linearApiKey || p.linearTeamId),
     activity: {
@@ -401,11 +429,20 @@ function publicProjectSummary(p) {
     createdAt: p.createdAt,
   };
 }
-// Full project detail for the admin's project page.
+// Full project detail for the admin's project page. Users surfaced as a list of
+// safe records — never the password hash itself, only whether one is set.
 function publicProjectDetail(p) {
+  const users = Object.entries(p.users || {}).map(([email, u]) => ({
+    email,
+    hasPassword: !!u.passwordHash,
+    createdAt: u.createdAt || null,
+    lastLoginAt: u.lastLoginAt || null,
+    locked: !!(u.lockedUntil && u.lockedUntil > Math.floor(Date.now() / 1000)),
+    lockedUntil: u.lockedUntil || null,
+  })).sort((a, b) => a.email.localeCompare(b.email));
   return {
     ...publicProjectSummary(p),
-    emails: p.emails || [],
+    users,
     linearProjectId: p.linearProjectId || '',
     linearApiKey: null, // never sent
     linearApiKeySet: !!p.linearApiKey,
@@ -428,24 +465,56 @@ async function handle(req, res) {
 
   // ----- Public (overlay) -----
 
-  if (method === 'POST' && route === '/api/verify-email') {
-    // Email enumeration / brute-force defense. Tight bucket because a valid
-    // request only fires when a real tester first clicks Test mode.
-    if (!rateLimit('verify-email', getClientIp(req), 10, 60_000)) return send(res, 429, { error: 'rate-limited' });
+  // v0.8.0: tester login by email + password. Replaces /api/verify-email
+  // (which is kept around as a 410 alias for old overlay versions).
+  if (method === 'POST' && route === '/api/login') {
+    // Per-IP rate limit (broad). Per-email lockout below catches focused stuffing.
+    if (!rateLimit('login-tester', getClientIp(req), 20, 60_000)) return send(res, 429, { error: 'rate-limited' });
     let body;
     try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+    // Constant-ish-time delay so attackers can't distinguish missing user
+    // from wrong password from missing project.
     await new Promise((r) => setTimeout(r, 300));
-    if (!body || !isValidEmail(body.email)) return send(res, 403, { error: 'not-allowed' });
+    if (!body || !isValidEmail(body.email) || typeof body.password !== 'string') {
+      return send(res, 401, { error: 'invalid-credentials' });
+    }
     const data = loadData();
     const projKey = normalizeProjectKey(body.project || '');
     const proj = projKey ? data.projects[projKey] : defaultProject(data);
-    if (!proj || proj.status !== 'active') return send(res, 403, { error: 'not-allowed' });
+    if (!proj || proj.status !== 'active') return send(res, 401, { error: 'invalid-credentials' });
     const lcEmail = body.email.toLowerCase().trim();
-    const allowed = (proj.emails || []).some((e) => e.toLowerCase().trim() === lcEmail);
-    if (!allowed) return send(res, 403, { error: 'not-allowed' });
-    const exp = Math.floor(Date.now() / 1000) + JWT_TTL_SECONDS;
+    const user = (proj.users || {})[lcEmail];
+    if (!user) return send(res, 401, { error: 'invalid-credentials' });
+    const now = Math.floor(Date.now() / 1000);
+    // Lockout check.
+    if (user.lockedUntil && user.lockedUntil > now) {
+      return send(res, 401, { error: 'invalid-credentials' });
+    }
+    // No password set → admin must configure one. Generic error to avoid
+    // distinguishing "no password" from "wrong password" to anonymous callers.
+    if (!user.passwordHash) return send(res, 401, { error: 'invalid-credentials' });
+    const ok = await verifyHash(body.password, user.passwordHash);
+    if (!ok) {
+      user.failedAttempts = (user.failedAttempts || 0) + 1;
+      if (user.failedAttempts >= 5) {
+        user.lockedUntil = now + 15 * 60;     // 15-minute lockout
+        user.failedAttempts = 0;
+        console.log(`[gate] tester ${lcEmail} (${proj.key}) locked out for 15min after 5 failed attempts`);
+      }
+      saveData(data);
+      return send(res, 401, { error: 'invalid-credentials' });
+    }
+    user.failedAttempts = 0;
+    user.lockedUntil = null;
+    user.lastLoginAt = now;
+    saveData(data);
+    const exp = now + JWT_TTL_SECONDS;
     const token = signToken({ email: lcEmail, project: proj.key, exp });
     return send(res, 200, { token, expiresAt: exp, project: { key: proj.key, name: proj.displayName } });
+  }
+  // Deprecated alias for v0.7.x overlays. Tells them the auth model changed.
+  if (method === 'POST' && route === '/api/verify-email') {
+    return send(res, 410, { error: 'method-removed', message: 'Email-only auth has been replaced with email + password. Update your overlay.' });
   }
 
   if (method === 'POST' && route === '/api/report-issue') {
@@ -459,8 +528,8 @@ async function handle(req, res) {
     const data = loadData();
     const proj = data.projects[payload.project];
     if (!proj || proj.status !== 'active') return send(res, 401, { error: 'project-gone' });
-    const stillAllowed = (proj.emails || []).some((e) => e.toLowerCase().trim() === payload.email);
-    if (!stillAllowed) return send(res, 401, { error: 'revoked' });
+    const user = (proj.users || {})[payload.email];
+    if (!user) return send(res, 401, { error: 'revoked' });
     if (!issue || typeof issue.title !== 'string' || !issue.title.trim()) {
       return send(res, 400, { error: 'missing-title' });
     }
@@ -652,9 +721,6 @@ async function handle(req, res) {
     if (data.projects[key]) return send(res, 409, { error: 'already-exists' });
     const proj = emptyProject(key, body.displayName || key);
     proj.status = 'active';
-    if (Array.isArray(body.emails)) {
-      proj.emails = body.emails.filter(isValidEmail).map((e) => e.toLowerCase().trim()).slice(0, 500);
-    }
     data.projects[key] = proj;
     saveData(data);
     return send(res, 200, { project: publicProjectDetail(proj) });
@@ -689,13 +755,41 @@ async function handle(req, res) {
       saveData(data);
       return send(res, 200, { project: publicProjectDetail(proj) });
     }
-    if (method === 'PUT' && sub === 'emails') {
+    // User CRUD (v0.8.0+).
+    // PUT /projects/:key/users — { email, password } — adds or updates a user.
+    //   Empty/missing password = unset (user can't login).
+    // DELETE /projects/:key/users/:email — removes a user.
+    if (method === 'PUT' && sub === 'users') {
       let body;
       try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
-      if (!Array.isArray(body.emails)) return send(res, 400, { error: 'missing-emails' });
-      proj.emails = body.emails.filter(isValidEmail).map((e) => e.toLowerCase().trim()).slice(0, 500);
+      if (!isValidEmail(body.email)) return send(res, 400, { error: 'invalid-email' });
+      const lcEmail = body.email.toLowerCase().trim();
+      proj.users = proj.users || {};
+      const existed = !!proj.users[lcEmail];
+      if (!existed) proj.users[lcEmail] = emptyUser();
+      const user = proj.users[lcEmail];
+      if (typeof body.password === 'string' && body.password.length > 0) {
+        if (body.password.length < 8) return send(res, 400, { error: 'password-too-short', message: 'Min 8 characters.' });
+        user.passwordHash = await hashPassword(body.password);
+        user.lockedUntil = null;
+        user.failedAttempts = 0;
+      }
       saveData(data);
       return send(res, 200, { project: publicProjectDetail(proj) });
+    }
+    const userMatch = sub && sub.match(/^users\/(.+)$/);
+    if (userMatch) {
+      const lcEmail = decodeURIComponent(userMatch[1]).toLowerCase().trim();
+      if (method === 'DELETE') {
+        if (proj.users && proj.users[lcEmail]) delete proj.users[lcEmail];
+        saveData(data);
+        return send(res, 200, { project: publicProjectDetail(proj) });
+      }
+    }
+    // Legacy: PUT /projects/:key/emails kept as a no-op redirect for old admin
+    // scripts (returns 410 Gone with a hint).
+    if (method === 'PUT' && sub === 'emails') {
+      return send(res, 410, { error: 'method-removed', message: 'Use PUT /projects/:key/users { email, password } instead.' });
     }
     if (method === 'PUT' && sub === 'linear-project') {
       let body;
@@ -1077,7 +1171,6 @@ async function renderSetup() {
     projectDisplayName: '',
     linearProjectId: null,
     linearProjectNewName: '',
-    emails: [],
   };
   function nav(html_) {
     root().innerHTML = html\`
@@ -1238,8 +1331,11 @@ async function renderSetup() {
         \${dots(5)}
         <h2>Add your first testers<span class="sub">Step 5 of 5 — only these emails will be able to file bugs from \${esc(ctx.projectDisplayName)}. You can add more later.</span></h2>
         <div class="card">
-          <label for="emails">Tester emails (one per line)</label>
-          <textarea id="emails" rows="6" placeholder="alice@example.com&#10;bob@example.com" autofocus></textarea>
+          <label for="firstEmail">First tester email</label>
+          <input id="firstEmail" type="email" placeholder="alice@example.com" autofocus>
+          <label for="firstPassword">Password (min 8 characters) — share this with the tester</label>
+          <input id="firstPassword" type="text" placeholder="password">
+          <div class="sub-muted" style="margin-top:6px;">You can add more testers from the project page after setup.</div>
           <div class="err" id="err"></div>
           <div class="row" style="justify-content:flex-end;margin-top:14px;">
             <button class="ghost" onclick="(()=>{step=4;renderStep();})()">← Back</button>
@@ -1247,9 +1343,12 @@ async function renderSetup() {
           </div>
         </div>\`);
       $('finish').addEventListener('click', async () => {
-        const emails = $('emails').value.split(/[\\n,]/).map(s => s.trim()).filter(Boolean);
+        const email = $('firstEmail').value.trim();
+        const password = $('firstPassword').value;
+        if (!email) return ($('err').textContent = 'Email required.');
+        if (!password || password.length < 8) return ($('err').textContent = 'Password must be at least 8 characters.');
         try {
-          await api('PUT', '/frontend-conqueror/projects/' + ctx.projectKey + '/emails', { emails });
+          await api('PUT', '/frontend-conqueror/projects/' + ctx.projectKey + '/users', { email, password });
           STATE = null;
           toast('Setup complete — your gate is live.');
           go('#/p/' + ctx.projectKey);
@@ -1305,7 +1404,7 @@ function projectCard(p) {
         <span class="pill \${p.status} dot">\${p.status}</span>
       </div>
       <div class="meta">
-        <span>📬 \${p.emailsCount} \${p.emailsCount === 1 ? 'tester' : 'testers'}</span>
+        <span>📬 \${p.usersCount} \${p.usersCount === 1 ? 'tester' : 'testers'}\${p.usersNeedingPassword > 0 ? ' (' + p.usersNeedingPassword + ' need password)' : ''}</span>
         <span>🎯 \${esc(linearDest)}</span>
         <span>⏱ last activity \${lastSeen}</span>
         \${p.activity.uniqueIpsToday > 0 ? '<span>👤 ' + p.activity.uniqueIpsToday + ' unique today</span>' : ''}
@@ -1335,7 +1434,7 @@ async function renderProjectDetail(key) {
   try { detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project; }
   catch (e) { return renderError(e); }
 
-  const needsConfig = detail.status === 'pending' || !detail.linearProjectId || detail.emailsCount === 0;
+  const needsConfig = detail.status === 'pending' || !detail.linearProjectId || detail.usersCount === 0;
   const overlayTag = '<' + 'script src="' + location.origin + '/' + detail.key + '/overlay.js" defer><' + '/script>';
   const pluginCfg = "gate: { url: '" + location.origin + "', project: '" + detail.key + "' }";
 
@@ -1375,16 +1474,36 @@ async function renderProjectDetail(key) {
       </div>
 
       <div class="card">
-        <h3>Testers (\${detail.emails.length})</h3>
-        <div id="emailList">
-          \${detail.emails.length === 0 ? '<div class="empty">No testers yet.</div>' : detail.emails.map(e => '<div class="row spaced"><code style="background:transparent;">' + esc(e) + '</code><button class="danger" onclick="removeEmail(\\'' + esc(detail.key) + '\\', \\'' + esc(e) + '\\')">remove</button></div>').join('')}
+        <h3>Testers (\${detail.users.length})</h3>
+        <div class="sub-muted" style="margin-bottom:10px;">Each tester logs in with their email + the password you set here.</div>
+        <div id="userList">
+          \${detail.users.length === 0
+            ? '<div class="empty">No testers yet.</div>'
+            : detail.users.map(u => {
+                const status = !u.hasPassword
+                  ? '<span class="pill warn dot" style="background:rgba(245,158,11,.15);color:#fcd34d;">needs password</span>'
+                  : u.locked ? '<span class="pill warn dot">locked (5 failed attempts)</span>'
+                  : '<span class="pill active dot">active</span>';
+                const lastLogin = u.lastLoginAt
+                  ? '<span class="sub-muted" style="font-size:11px;">last login: ' + new Date(u.lastLoginAt * 1000).toISOString().slice(0,10) + '</span>'
+                  : '<span class="sub-muted" style="font-size:11px;">never logged in</span>';
+                return '<div class="row spaced" style="padding:8px 0;border-bottom:1px solid #f0f0f0;">'
+                  + '<div><code style="background:transparent;font-size:12px;">' + esc(u.email) + '</code><br>' + status + ' &nbsp; ' + lastLogin + '</div>'
+                  + '<div style="display:flex;gap:6px;">'
+                    + '<button class="ghost" style="padding:4px 10px;font-size:11px;" onclick="setUserPassword(\\'' + esc(detail.key) + '\\', \\'' + esc(u.email) + '\\')">set password</button>'
+                    + '<button class="danger" onclick="removeUser(\\'' + esc(detail.key) + '\\', \\'' + esc(u.email) + '\\')">remove</button>'
+                  + '</div></div>';
+              }).join('')
+          }
         </div>
-        <label style="margin-top:14px;">Add tester email</label>
+        <label style="margin-top:14px;">Add tester</label>
         <div class="row">
           <input id="newEmail" type="email" placeholder="alice@example.com">
-          <button class="primary" onclick="addEmail('\${esc(detail.key)}')">Add</button>
+          <input id="newPassword" type="text" placeholder="password (min 8 chars)" style="max-width:200px;">
+          <button class="primary" onclick="addUser('\${esc(detail.key)}')">Add</button>
         </div>
-        <div class="err" id="emailErr"></div>
+        <div class="err" id="userErr"></div>
+        \${detail.usersNeedingPassword > 0 ? '<div class="ok-line" style="color:#fcd34d;margin-top:8px;">⚠ ' + detail.usersNeedingPassword + ' tester(s) migrated from email-only mode and need a password set before they can log in.</div>' : ''}
       </div>
 
       <div class="card">
@@ -1455,21 +1574,33 @@ window.changeLinearProject = async function(key) {
     navigate();
   } catch (e) { toast(e.message, 'err'); }
 };
-window.addEmail = async function(key) {
+window.addUser = async function(key) {
   const email = $('newEmail').value.trim();
-  if (!email) return;
+  const password = $('newPassword').value;
+  if (!email) return ($('userErr').textContent = 'Email required.');
+  if (!password || password.length < 8) return ($('userErr').textContent = 'Password must be at least 8 characters.');
   try {
-    const detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project;
-    const next = [...detail.emails, email];
-    await api('PUT', '/frontend-conqueror/projects/' + key + '/emails', { emails: next });
+    await api('PUT', '/frontend-conqueror/projects/' + key + '/users', { email, password });
+    $('newEmail').value = ''; $('newPassword').value = '';
+    toast('Tester added — share email + password with them.');
     navigate();
-  } catch (e) { $('emailErr').textContent = e.message; }
+  } catch (e) { $('userErr').textContent = e.message; }
 };
-window.removeEmail = async function(key, email) {
+window.setUserPassword = async function(key, email) {
+  const password = prompt('New password for ' + email + ' (min 8 chars):');
+  if (!password) return;
+  if (password.length < 8) return toast('Password must be at least 8 characters.', 'err');
   try {
-    const detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project;
-    const next = detail.emails.filter(e => e !== email);
-    await api('PUT', '/frontend-conqueror/projects/' + key + '/emails', { emails: next });
+    await api('PUT', '/frontend-conqueror/projects/' + key + '/users', { email, password });
+    toast('Password updated.');
+    navigate();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.removeUser = async function(key, email) {
+  if (!confirm('Remove tester ' + email + '? They will no longer be able to log in.')) return;
+  try {
+    await api('DELETE', '/frontend-conqueror/projects/' + key + '/users/' + encodeURIComponent(email));
+    toast('Tester removed.');
     navigate();
   } catch (e) { toast(e.message, 'err'); }
 };
@@ -1544,10 +1675,12 @@ async function renderProjectWizard(key) {
         <main>
           <div class="crumbs"><a href="#/">← Projects</a></div>
           \${dots2(2)}
-          <h2>Add your testers<span class="sub">Step 2 of 2 — only these emails will be able to file bugs from \${esc(detail.displayName)}.</span></h2>
+          <h2>Add your first tester<span class="sub">Step 2 of 2 — set an email + password. You can add more testers from the project page after.</span></h2>
           <div class="card">
-            <label for="emails">Tester emails (one per line)</label>
-            <textarea id="emails" rows="6" placeholder="alice@example.com&#10;bob@example.com" autofocus>\${esc((detail.emails || []).join('\\n'))}</textarea>
+            <label for="firstEmail">Email</label>
+            <input id="firstEmail" type="email" placeholder="alice@example.com" autofocus>
+            <label for="firstPassword">Password (min 8 chars)</label>
+            <input id="firstPassword" type="text" placeholder="password">
             <div class="err" id="err"></div>
             <div class="row" style="justify-content:flex-end;margin-top:14px;">
               <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
@@ -1556,9 +1689,12 @@ async function renderProjectWizard(key) {
           </div>
         </main>\`;
       $('finish').addEventListener('click', async () => {
-        const emails = $('emails').value.split(/[\\n,]/).map(s => s.trim()).filter(Boolean);
+        const email = $('firstEmail').value.trim();
+        const password = $('firstPassword').value;
+        if (!email) return ($('err').textContent = 'Email required.');
+        if (!password || password.length < 8) return ($('err').textContent = 'Password must be at least 8 characters.');
         try {
-          await api('PUT', '/frontend-conqueror/projects/' + detail.key + '/emails', { emails });
+          await api('PUT', '/frontend-conqueror/projects/' + detail.key + '/users', { email, password });
           await api('PUT', '/frontend-conqueror/projects/' + detail.key, { status: 'active' });
           toast(detail.displayName + ' is live.');
           go('#/p/' + detail.key);

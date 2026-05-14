@@ -10,6 +10,32 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.8.0] — 2026-05-14
+
+**Test-mode auth: email → email + password.** The email-only allowlist was theatre — anyone who knew an allowlisted address could file issues. v0.8.0 replaces it with per-tester passwords set by the gate admin.
+
+### Added
+- **Per-tester credentials.** The gate now stores `users: { [email]: { passwordHash, lastLoginAt, lockedUntil, ... } }` per project. Passwords are scrypt-hashed (Node built-in, no deps). Min length 8.
+- **`POST /api/login`** — overlay endpoint. Returns the same JWT shape as before (`token`, `expiresAt`) on success, identical `invalid-credentials` response for every failure mode (unknown user, wrong password, locked, no password set, project disabled) so callers can't enumerate.
+- **Per-email lockout.** 5 wrong passwords for the same email triggers a 15-minute lock. Correct password is rejected during lockout. Lock clears on password reset.
+- **Admin user CRUD.** `PUT /frontend-conqueror/projects/:key/users { email, password }` adds or sets a password; `DELETE /frontend-conqueror/projects/:key/users/:email` removes. Per-IP rate limits on `/api/login` (20/min) and existing limits on `/api/report-issue` apply unchanged.
+- **Setup wizard step 5** now collects email **and** password for the first tester so a freshly configured project is immediately usable.
+
+### Changed
+- **Admin Testers card rebuilt.** Shows each tester's status (active / needs-password / locked), last login, and per-row "set password" + "remove" controls. Add-tester row takes email + password together.
+- **Overlay sign-in panel rebuilt.** Two fields (email + password) instead of one. Surfaces 429 rate-limit and network-unreachable distinctly; collapses every other failure into "Sign-in failed. Check with your admin if this persists."
+- **`POST /api/verify-email`** now returns `410 Gone` with a hint pointing at `/api/login`. Old overlay versions get a clear error rather than a silent break.
+- Project shape: `emails: []` → `users: {}`. The admin list summary surfaces `usersCount` + `usersNeedingPassword`; the project detail returns a `users[]` array (with `hasPassword`, `locked`, `lastLoginAt`) — password hashes are never sent to the client.
+
+### Migration (automatic, in-place)
+- On first load, every project's `emails: ["x@y.com", ...]` is converted to `users: { "x@y.com": { passwordHash: null, ... } }` and the legacy `emails` field is deleted. **No tester can log in until the admin sets a password** — the project page shows a "⚠ N tester(s) migrated from email-only mode and need a password set before they can log in." line.
+- The legacy `PUT /projects/:key/emails` admin endpoint returns `410 Gone` with a pointer to the new shape.
+
+### Compatibility
+- **Breaking for the overlay.** v0.7.x overlays talking to a v0.8.0 gate will get a 410 on sign-in and fail clearly. Update the overlay (or use the gate-served `/<project>/overlay.js`, which is always in lock-step with the gate).
+- v0.8.0 overlays talking to a v0.7.x gate will fail on `/api/login` with 404. Upgrade the gate.
+- Existing JWTs issued by the v0.7.x gate continue to be honoured by the v0.8.0 gate **only if the email still maps to a user record** (which the migration guarantees) — but reports filed with those tokens still work transparently until they expire.
+
 ## [0.7.2] — 2026-05-14
 
 ### Fixed

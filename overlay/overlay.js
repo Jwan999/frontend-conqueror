@@ -49,14 +49,24 @@
     if (!GATE) return;
     try { sessionStorage.removeItem(gateStorageKey()); } catch {}
   }
-  async function gateVerifyEmail(email) {
-    const r = await fetch(`${GATE.url}/api/verify-email`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, project: gateProject() || undefined }),
-    });
-    if (!r.ok) return { ok: false, status: r.status };
-    const data = await r.json();
+  // v0.8.0: email + password login. Gate intentionally collapses every failure
+  // (no such user, wrong password, lockout, missing password, disabled project)
+  // into a single `invalid-credentials` error so callers can't enumerate.
+  // 429 surfaces separately as rate-limit feedback.
+  async function gateLogin(email, password) {
+    let r;
+    try {
+      r = await fetch(`${GATE.url}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, project: gateProject() || undefined }),
+      });
+    } catch (e) {
+      return { ok: false, status: 0, error: 'network' };
+    }
+    let data = null;
+    try { data = await r.json(); } catch {}
+    if (!r.ok) return { ok: false, status: r.status, error: (data && data.error) || 'invalid-credentials' };
     return { ok: true, ...data };
   }
   async function gateReportIssue(token, issue) {
@@ -1794,9 +1804,10 @@
   }
 
   // ---------- Test mode (gate-backed) ----------
-  // Renders an issue-report form on click; gates first use with an email prompt
-  // that calls the gate's /api/verify-email. JWT is cached in sessionStorage.
-  function openEmailPrompt(then) {
+  // Renders an issue-report form on click; gates first use with an email +
+  // password prompt that calls the gate's /api/login. JWT cached in
+  // sessionStorage. Credentials are set per-tester by the gate admin.
+  function openLoginPrompt(then) {
     const backdrop = document.createElement('div');
     backdrop.className = 'palette-backdrop';
     const panel = document.createElement('div');
@@ -1810,22 +1821,32 @@
 
     const sub = document.createElement('div');
     sub.className = 'panel-sub';
-    sub.textContent = 'Enter your team email. We verify against the project allowlist.';
+    sub.textContent = 'Use the email + password your admin set for you.';
 
-    const input = document.createElement('input');
-    input.type = 'email';
-    input.placeholder = 'you@team.com';
-    input.spellcheck = false;
-    input.style.cssText = 'width:100%;border:1px solid #d1d5db;border-radius:6px;padding:8px;font:inherit;outline:none;';
-    input.addEventListener('focus', () => {
-      input.style.borderColor = 'var(--mode-color)';
-      input.style.boxShadow = '0 0 0 3px var(--mode-color-glow)';
-    });
-    input.addEventListener('blur', () => { input.style.borderColor = '#d1d5db'; input.style.boxShadow = ''; });
+    const inputStyle = 'width:100%;border:1px solid #d1d5db;border-radius:6px;padding:8px;font:inherit;outline:none;margin-bottom:6px;';
+    const emailInput = document.createElement('input');
+    emailInput.type = 'email';
+    emailInput.placeholder = 'you@team.com';
+    emailInput.autocomplete = 'username';
+    emailInput.spellcheck = false;
+    emailInput.style.cssText = inputStyle;
+    const pwInput = document.createElement('input');
+    pwInput.type = 'password';
+    pwInput.placeholder = 'password';
+    pwInput.autocomplete = 'current-password';
+    pwInput.spellcheck = false;
+    pwInput.style.cssText = inputStyle;
+    for (const el of [emailInput, pwInput]) {
+      el.addEventListener('focus', () => {
+        el.style.borderColor = 'var(--mode-color)';
+        el.style.boxShadow = '0 0 0 3px var(--mode-color-glow)';
+      });
+      el.addEventListener('blur', () => { el.style.borderColor = '#d1d5db'; el.style.boxShadow = ''; });
+    }
 
     const err = document.createElement('div');
     err.className = 'err';
-    err.style.cssText = 'font-size:11px;color:#dc2626;margin-top:6px;min-height:14px;';
+    err.style.cssText = 'font-size:11px;color:#dc2626;margin-top:2px;min-height:14px;';
 
     const row = document.createElement('div');
     row.className = 'row';
@@ -1837,51 +1858,54 @@
     cancelBtn.textContent = 'Cancel';
     const okBtn = document.createElement('button');
     okBtn.className = 'save';
-    okBtn.textContent = 'Continue';
+    okBtn.textContent = 'Sign in';
     row.appendChild(hint); row.appendChild(cancelBtn); row.appendChild(okBtn);
 
     panel.appendChild(title);
     panel.appendChild(sub);
-    panel.appendChild(input);
+    panel.appendChild(emailInput);
+    panel.appendChild(pwInput);
     panel.appendChild(err);
     panel.appendChild(row);
     backdrop.appendChild(panel);
     shadow.appendChild(backdrop);
-    setTimeout(() => input.focus(), 0);
+    setTimeout(() => emailInput.focus(), 0);
 
     function close(result) {
       backdrop.remove();
       if (then) then(result);
     }
     async function submit() {
-      const email = input.value.trim();
+      const email = emailInput.value.trim();
+      const password = pwInput.value;
       err.textContent = '';
-      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { err.textContent = 'Enter a valid email.'; return; }
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { err.textContent = 'Enter a valid email.'; emailInput.focus(); return; }
+      if (!password) { err.textContent = 'Enter your password.'; pwInput.focus(); return; }
       okBtn.disabled = true;
-      okBtn.textContent = 'Verifying…';
-      try {
-        const v = await gateVerifyEmail(email);
-        if (!v.ok) {
-          // Identical message for 403 and 404 so an outsider can't enumerate.
-          err.textContent = 'Sign-in failed.';
-          okBtn.disabled = false;
-          okBtn.textContent = 'Continue';
-          return;
-        }
-        storeGateToken(v.token, v.expiresAt, email);
-        close({ ok: true, email });
-      } catch (e) {
-        err.textContent = 'Could not reach the gate.';
+      okBtn.textContent = 'Signing in…';
+      const v = await gateLogin(email, password);
+      if (!v.ok) {
+        if (v.status === 429) err.textContent = 'Too many attempts. Wait a minute and try again.';
+        else if (v.status === 0) err.textContent = 'Could not reach the gate.';
+        // 401 covers wrong password, unknown user, locked-out, no-password-set,
+        // and disabled project — gate returns the same error for all of these.
+        else err.textContent = 'Sign-in failed. Check with your admin if this persists.';
         okBtn.disabled = false;
-        okBtn.textContent = 'Continue';
+        okBtn.textContent = 'Sign in';
+        pwInput.select();
+        return;
       }
+      storeGateToken(v.token, v.expiresAt, email);
+      close({ ok: true, email });
     }
     cancelBtn.addEventListener('click', () => close({ ok: false }));
     okBtn.addEventListener('click', submit);
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); submit(); }
-      else if (e.key === 'Escape') { e.preventDefault(); close({ ok: false }); }
-    });
+    for (const el of [emailInput, pwInput]) {
+      el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); submit(); }
+        else if (e.key === 'Escape') { e.preventDefault(); close({ ok: false }); }
+      });
+    }
     backdrop.addEventListener('click', () => close({ ok: false }));
   }
 
@@ -1893,7 +1917,7 @@
     }
     const session = getStoredGateToken();
     if (!session) {
-      openEmailPrompt((result) => {
+      openLoginPrompt((result) => {
         if (result && result.ok) openTestPanel(target);
         else setMode(null);
       });
@@ -1981,7 +2005,7 @@
           clearGateToken();
           toast('Session expired or revoked. Sign in again.', 'error');
           close();
-          openEmailPrompt(() => {});
+          openLoginPrompt(() => {});
           return;
         }
         toast((r2.data && r2.data.error) || 'Submission failed', 'error');

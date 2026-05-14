@@ -18,9 +18,11 @@ What "solid-proof for other developers" actually means here. If you fork this an
 - [x] Minimum 8-character new passwords. Confirm-password mismatch caught in the UI.
 - [x] Login is rate-limited per-IP (5/min). Verified by sending 7 wrong attempts in a row and getting the expected `401 401 429 429 429 429 429`.
 - [x] All admin endpoints are cookie-gated. Cookie is `HttpOnly; SameSite=Lax`. Add `Secure` once you serve the admin over HTTPS.
-- [x] Tester emails are verified against the allowlist on **every** report (instant revocation; not waiting for JWT expiry).
-- [x] Unknown email + malformed verify-email + missing project all return the same `403 not-allowed` after the same ~300ms delay. Email enumeration is impractical.
-- [x] Tester verify-email and report-issue are independently rate-limited (10/min and 20/min per IP).
+- [x] Testers sign in with **email + scrypt-hashed password** set by the gate admin. Passwords are never sent back to the client. Min 8 characters.
+- [x] Tester user record is checked against the project's `users` dict on **every** report (instant revocation by deleting the user; not waiting for JWT expiry).
+- [x] Unknown email, wrong password, locked-out account, missing-password (post-migration), and disabled project all return the same `invalid-credentials` error after the same ~300ms delay. Enumeration is impractical.
+- [x] 5 wrong passwords for the same email triggers a 15-minute lockout. Correct password is rejected during the lockout window. Lockout clears on admin password reset.
+- [x] Tester login (20/min per IP) and report-issue (20/min per IP) are independently rate-limited.
 
 ## Production safety
 
@@ -46,7 +48,7 @@ What "solid-proof for other developers" actually means here. If you fork this an
 ## What I'd want to know before installing this in my own org
 
 - [ ] If the gate is breached, what can the attacker do? *Answer:* file Linear issues to your configured project. Read your tester emails. Read your Linear API key. **Cannot** read or modify your application source — that's behind the agent, which never accepts remote connections.
-- [ ] If a tester's account is compromised, what's the blast radius? *Answer:* file false bug reports to Linear. Cannot edit source, cannot read Linear data (the gate is write-only against Linear from this surface), cannot escalate to admin.
+- [ ] If a tester's account is compromised (their email + password leak), what's the blast radius? *Answer:* file false bug reports to Linear. Cannot edit source, cannot read Linear data (the gate is write-only against Linear from this surface), cannot escalate to admin. Rotate the tester's password from the admin Testers card — that revokes nothing, but the next time they sign in with the old password the JWT-issuance flow will reject them; existing live tokens stay valid until expiry. To kill existing sessions for one tester, delete them and re-add. To kill **all** sessions, rotate `GATE_JWT_SECRET`.
 - [ ] If the plugin itself is malicious, what could it do? *Answer:* the plugin runs in your dev build. It has full access to your source tree at build time. **Read the source before installing.** It's ~400 lines.
 - [ ] What if I want to remove this entirely? *Answer:* remove the plugin from `vite.config.js`, remove the script tag from `app.head.script`, delete `gate/data.json`. No state lives in your application source — every artifact is in `gate/data.json`.
 

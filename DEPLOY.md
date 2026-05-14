@@ -208,7 +208,7 @@ Visit `https://gate.YOUR-DOMAIN.com/frontend-conqueror`.
    2. Pick your team (auto-skipped if you have only one).
    3. Name your first project — display name + key (e.g. "Messarat" / `messarat`). The key is what you put in `gate.project` in plugin configs.
    4. Pick or create a Linear project for it. Bugs from this project land there.
-   5. Add at least one tester email.
+   5. Add at least one tester — email **and** the password they'll use to sign in.
 4. Done — you're on the project's detail page.
 
 After setup, adding more projects is a 2-step wizard (Linear destination + testers), and **auto-detected pending projects** (from heartbeats) show up at the top of the project list with a one-click "Configure" button.
@@ -224,10 +224,10 @@ Tell your tester:
 1. Visit the prod site (`https://my-domain.com`).
 2. Press **Shift Shift**.
 3. Pick **Test** in the palette.
-4. Enter their email (the one you allowlisted).
+4. Sign in with the email **and password** you set for them in the gate admin.
 5. Hover the component that's broken → click → fill in the report → submit.
 
-The issue lands in Linear within ~1 second, with the page URL, component hint, and reporter email attached. The tester sees a green confirmation.
+The issue lands in Linear within ~1 second, with the page URL, component hint, and reporter email attached. The tester sees a green confirmation. After 5 wrong passwords for the same email the gate locks that email out for 15 minutes — reset the password in the admin to clear it.
 
 ---
 
@@ -246,7 +246,7 @@ PM2's `messarat-gate` entry will pick up the new gate code on the next `pm2 relo
 
 ### Persisting `data.json`
 
-The gate writes admin password hash, JWT-rotated state, allowlist, and Linear key to `GATE_DATA`. Make sure that path is **outside your deployment directory** so deploys don't wipe it. `/var/data/<project>-gate.json` is a safe default.
+The gate writes admin password hash, JWT-rotated state, per-tester credentials (scrypt-hashed), and Linear key to `GATE_DATA`. Make sure that path is **outside your deployment directory** so deploys don't wipe it. `/var/data/<project>-gate.json` is a safe default.
 
 Back it up like any database. If you lose it, run setup again from Step 5.
 
@@ -278,16 +278,17 @@ It fits anywhere your app already runs.
 - If 404: `NUXT_PUBLIC_GATE_URL` / `FRONTEND_CONQUEROR_GATE_URL` is unset or wrong.
 - If CORS error: gate isn't reachable from the page's origin. Check reverse proxy.
 
-**Tester gets `403 not-allowed`.**
-- Email isn't in the allowlist, or has a typo. Admin → check allowlist.
-- The 300ms delay is intentional — prevents email enumeration.
+**Tester sees "Sign-in failed".**
+- Email + password don't match a tester record. Admin → check the Testers card; the gate intentionally returns the same error for unknown email, wrong password, lockout, and "no password set yet" (post-migration), so the tester can't tell which one it is.
+- The 300ms delay is intentional — prevents enumeration.
+- If they're locked out (5 wrong attempts), reset their password from the admin Testers card — that clears the lock.
 
 **Issues file but don't appear in Linear.**
 - Linear API key is missing or revoked. Admin → re-paste it.
 - Linear project was deleted. Admin → pick a different project.
 
 **Admin can't log in.**
-- Default password was changed but new one was lost. SSH the server, delete `GATE_DATA`, restart. You'll be back to default password (and an empty allowlist — re-add testers).
+- Default password was changed but new one was lost. SSH the server, delete `GATE_DATA`, restart. You'll be back to default password (and an empty tester list — re-add testers with their passwords).
 
 **Multiple projects, each needs Test mode.**
 - One gate per project. Spin up additional PM2 entries on different ports (54322, 54323, …) with different `GATE_PUBLIC_URL`, `GATE_PROJECT_NAME`, `GATE_DATA`. Reverse-proxy each at a different hostname.
