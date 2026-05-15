@@ -10,6 +10,14 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.9.2] — 2026-05-15
+
+Two UI fixes on top of v0.9.1's data fixes.
+
+### Fixed
+- **Edit button in the bubble panel did nothing — and the panel disappeared instead.** The outside-click dismiss handler listens on `document` for `mousedown`. The bubble panel lives inside a closed shadow root, so the event gets retargeted to the shadow host before reaching the document listener — `panel.contains(e.target)` returned false even for clicks *inside* the panel, so the handler thought you'd clicked outside and dismissed before the Edit button's click could fire. Fix: use `e.composedPath()` (which walks through the shadow boundary) for the inside-panel check.
+- **Bubble dots floated above the new-issue report form.** `.fc-bubble-host` had `z-index: 2147483645`, beating every `.panel` (none of which set an explicit z-index). Fix: drop the z-index from `.fc-bubble-host` entirely. The bubble host now stacks at the default within the shadow root, so any panel opened later (test-report form, edit popup, login prompt) paints on top via normal document order. Bubbles still float above page content because the shadow host itself is already pinned at the top of the page's stacking order.
+
 ## [0.9.1] — 2026-05-15
 
 Hotfix for v0.9.0's bubble feature. Two prod issues surfaced the day after release:

@@ -489,12 +489,16 @@
       to { transform: translateY(0); opacity: 1; }
     }
     /* v0.9.0: report-bubble feature. Persistent dot anchored to each element
-       with one or more open Linear issues. Click → list panel. */
+       with one or more open Linear issues. Click → list panel.
+       Intentionally NO z-index on .fc-bubble-host — keep it at the default so
+       any panel opened later (test-report .panel, login prompt, edit popup)
+       paints on top via normal document stacking order. The shadow root host
+       is already z-index 2147483647 on the page, so even default-z children
+       float above page content. */
     .fc-bubble-host {
       position: absolute; top: 0; left: 0;
       width: 0; height: 0;
       pointer-events: none;
-      z-index: 2147483645;
     }
     .fc-bubble {
       position: absolute;
@@ -2038,11 +2042,19 @@
 
     // Dismiss on outside click. Defer to next tick so the click that opened
     // it doesn't immediately close it.
+    //
+    // The panel lives inside a closed shadow root, so events that originate
+    // on its descendants get retargeted at the document boundary: `e.target`
+    // becomes the shadow host, and `panel.contains(e.target)` is false even
+    // for clicks inside the panel. composedPath() walks the real DOM through
+    // the shadow and lets us check membership correctly — without this the
+    // Edit button gets pre-empted by the dismiss handler.
     setTimeout(() => {
       fcBubblePanelDismiss = (e) => {
         if (!fcOpenedBubblePanel) return;
-        if (fcOpenedBubblePanel.contains(e.target)) return;
-        if (e.target === dot) return;
+        const path = (typeof e.composedPath === 'function') ? e.composedPath() : [];
+        if (path.includes(fcOpenedBubblePanel)) return;
+        if (path.includes(dot)) return;
         fcCloseBubblePanel();
       };
       document.addEventListener('mousedown', fcBubblePanelDismiss, true);
