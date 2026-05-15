@@ -10,6 +10,14 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.9.6] — 2026-05-15
+
+### Changed
+- **Single-mode setups now toggle directly with Shift-Shift instead of opening the picker.** Production overlays ship with `enabledModes: ['test']` — only one mode is available, so the picker step is wasted clicks. With one mode enabled, Shift-Shift turns Test mode on; another Shift-Shift turns it off. Dev/local setups (which usually have all three modes — edit + todo + test) keep the picker palette on the way in, since there's a real choice to make.
+
+### Fixed
+- **Double-shift to exit didn't actually exit across reloads.** `setMode(null)` set `activeMode = null` and then hit the early `return` before the new `fcSaveMode(null)` call could clear sessionStorage. The user toggled off, refreshed, and the mode came back from stored state. Move the persistence write to before the early return so every state change — including "off" — is persisted.
+
 ## [0.9.5] — 2026-05-15
 
 ### Added

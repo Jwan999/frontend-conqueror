@@ -2587,6 +2587,12 @@
       if (activeMode === 'test') fcRemoveBubbles();
     }
     activeMode = modeKey;
+    // Persist the state change BEFORE any early return below — otherwise
+    // setMode(null) (the "exit mode" path) sets activeMode but never reaches
+    // fcSaveMode, so sessionStorage still holds the prior mode and the next
+    // page load restores it. Subtle but breaks the "double-shift to exit"
+    // contract: user toggles off, refreshes, mode comes back.
+    fcSaveMode(modeKey);
     if (!modeKey) return;
     applyModeColor(modeKey);
     shadow.appendChild(frame);
@@ -2600,7 +2606,6 @@
     window.addEventListener('scroll', onScrollOrResize, true);
     window.addEventListener('resize', onScrollOrResize, true);
     if (modeKey === 'test') fcRefreshBubbles();
-    fcSaveMode(modeKey);
   }
   // v0.9.5: persist the active mode across page navigation + reload so testers
   // don't lose Test mode every time they click an internal link. Tab-scoped
@@ -2716,10 +2721,11 @@
   }, true);
 
   // ---------- Activation: Shift-Shift mode palette + legacy ⌘+Shift+E ----------
-  // v0.9.5: when a mode is already active, shift-shift now toggles it OFF.
-  // When no mode is active, it opens the picker. This matches the mental
-  // model "double-shift is the on/off switch" and lets users exit without
-  // hunting for Esc on a page that may have its own keyboard handlers.
+  // v0.9.5: shift-shift toggles the active mode OFF when one is on.
+  // v0.9.6: when only ONE mode is enabled (prod overlays default to ['test'])
+  // there's nothing to pick — skip the palette and toggle that single mode
+  // directly. Multi-mode setups (dev: edit + todo + test) keep the picker on
+  // the way IN, and still toggle off on the way OUT.
   let lastShiftAt = 0;
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Shift' && !e.metaKey && !e.ctrlKey && !e.altKey) {
@@ -2727,8 +2733,14 @@
       if (now - lastShiftAt < 300) {
         lastShiftAt = 0;
         e.preventDefault();
-        if (activeMode) setMode(null);
-        else openModePalette();
+        if (activeMode) {
+          setMode(null);
+        } else if (ENABLED.size === 1) {
+          const onlyMode = Array.from(ENABLED)[0];
+          setMode(onlyMode);
+        } else {
+          openModePalette();
+        }
         return;
       }
       lastShiftAt = now;
