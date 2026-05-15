@@ -1,6 +1,6 @@
 {
   "name": "frontend-conqueror-gate",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "private": true,
   "description": "frontend-conqueror — standalone HTTP gate that holds the tester credentials (email + password) and Linear API keys for Test mode in production.",
   "bin": {

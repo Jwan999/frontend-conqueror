@@ -448,12 +448,35 @@ async function updateLinearIssue(linear, issueId, input) {
 // end of its description. This lets the overlay recover the element anchor and
 // the original filer when listing issues later. Plain comment so Linear renders
 // nothing visible. JSON shape: { v:1, anchor:{file,offset}, page, filer, title, note }.
-const FC_META_RE = /<!--\s*fc-meta:\s*(\{[\s\S]*?\})\s*-->/;
+//
+// v0.9.1: encoded as base64 in the comment so Linear's auto-linker can't see
+// any @ / :// inside the payload and rewrite it as a Markdown link (which
+// destroys the JSON). Old format (raw JSON) is still parsed for back-compat,
+// and we attempt to salvage payloads Linear already mangled before this fix.
+const FC_META_B64_RE = /<!--\s*fc-meta-b64:\s*([A-Za-z0-9+/=_-]+)\s*-->/;
+const FC_META_JSON_RE = /<!--\s*fc-meta:\s*(\{[\s\S]*?\})\s*-->/;
+// Linear's auto-linker rewrites `something@example.com` inside the description
+// into a Markdown link like `[CONTENT](<mailto:URL>)`. Strip those wrappers so
+// the original JSON can be reconstructed.
+function unmangleLinearLinks(s) {
+  return s.replace(/\[([^\]]+)\]\(<mailto:[^>]*>\)/g, '$1');
+}
 function parseFcMeta(description) {
   if (typeof description !== 'string') return null;
-  const m = description.match(FC_META_RE);
+  // v0.9.1+ form: base64-encoded.
+  const b64 = description.match(FC_META_B64_RE);
+  if (b64) {
+    try {
+      const json = Buffer.from(b64[1], 'base64').toString('utf8');
+      return JSON.parse(json);
+    } catch { /* fall through */ }
+  }
+  // v0.9.0 form: raw JSON. Try to salvage if Linear has rewritten emails into
+  // Markdown links inside the comment.
+  const m = description.match(FC_META_JSON_RE);
   if (!m) return null;
-  try { return JSON.parse(m[1]); } catch { return null; }
+  try { return JSON.parse(m[1]); } catch {}
+  try { return JSON.parse(unmangleLinearLinks(m[1])); } catch { return null; }
 }
 // Older overlays (v0.7.x / v0.8.x) send `meta.where = "file:offset"` instead of
 // a structured anchor. Salvage what we can so their issues still get a bubble.
@@ -475,6 +498,9 @@ function normalizeAnchor(rawAnchor, rawWhere) {
 function buildIssueDescription({ filer, projectDisplayName, title, note, anchor, page, locale, text, userAgent }) {
   const where = anchor ? `${anchor.file}:${anchor.offset}` : null;
   const meta = { v: 1, anchor: anchor || null, page: page || null, filer, title: title || '', note: note || '' };
+  // base64-encode so Linear's auto-linker can't see the @ in the filer email
+  // and rewrite the JSON into a broken Markdown link.
+  const metaB64 = Buffer.from(JSON.stringify(meta), 'utf8').toString('base64');
   return [
     `**Reported via Test Mode** by \`${filer}\` for project \`${projectDisplayName}\``,
     '',
@@ -487,7 +513,7 @@ function buildIssueDescription({ filer, projectDisplayName, title, note, anchor,
     text ? `**Text:** "${trunc(text, 200)}"` : '',
     userAgent ? `**UA:** ${userAgent}` : '',
     '',
-    `<!-- fc-meta: ${JSON.stringify(meta)} -->`,
+    `<!-- fc-meta-b64: ${metaB64} -->`,
   ].filter((line) => line !== '').join('\n');
 }
 
@@ -878,9 +904,14 @@ async function handle(req, res) {
         wsUrl: null,
       };
       const prelude = `window.__frontendConquerorConfig=${JSON.stringify(cfg)};\n`;
+      // Browser + edge cache: short max-age (5 min) AND s-maxage so Cloudflare
+      // / other reverse proxies don't override us with their default 4-hour
+      // policy. Without `s-maxage`, Cloudflare ignores the upstream and pins
+      // the file for hours — which means overlay hotfixes don't reach testers
+      // until the proxy TTL expires.
       return send(res, 200, prelude + body, {
         'Content-Type': 'application/javascript',
-        'Cache-Control': 'public, max-age=300',
+        'Cache-Control': 'public, max-age=300, s-maxage=300, must-revalidate',
       });
     } catch (e) {
       return send(res, 500, { error: 'overlay-missing', message: e.message });

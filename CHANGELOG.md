@@ -10,6 +10,17 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.9.1] — 2026-05-15
+
+Hotfix for v0.9.0's bubble feature. Two prod issues surfaced the day after release:
+
+### Fixed
+- **Linear auto-linker mangled the fc-meta JSON.** When the filer email (or any URL) appeared inside the `<!-- fc-meta: {…} -->` HTML comment, Linear's renderer rewrote it as a Markdown link with a `<mailto:…>` URL — even inside HTML comments — corrupting the JSON. `parseFcMeta` would fail and the issue dropped out of `/api/issues`, so no bubble. Fix: payload is now base64-encoded as `<!-- fc-meta-b64: BASE64 -->`. No `@` or `://` for the auto-linker to grab onto. Parser still reads the v0.9.0 raw-JSON form and applies a salvage regex (`[CONTENT](<mailto:…>)` → `CONTENT`) so issues filed in the brief v0.9.0 window are recoverable on the next refresh.
+- **Cloudflare ignored the gate's overlay `Cache-Control`** and pinned the file for 4 hours under its default policy, meaning overlay hotfixes didn't reach testers until the proxy TTL expired. Fix: the gate now sends `Cache-Control: public, max-age=300, s-maxage=300, must-revalidate` — `s-maxage` is the one Cloudflare honors. Pair with a `?v=<version>` query on the consumer's `<script src>` to bust already-cached entries on each upgrade.
+
+### Doc
+- DEPLOY hint: when shipping an overlay change, bump the `?v=` query in your `nuxt.config.js` `head.script` entry. The gate's `s-maxage` only helps once Cloudflare fetches the new file; the version query forces that fetch immediately.
+
 ## [0.9.0] — 2026-05-15
 
 **Persistent report bubbles.** When a tester files an issue from Test mode, a small mode-colored dot now stays anchored to that element on the page. Hover/click → list of every open issue at that anchor, with the filer, the note, a link to Linear, and an inline edit button for the original filer. Bubbles disappear automatically the next time the tester focuses the tab if the issue has moved to a Linear state of `type: completed` or `type: canceled` — covering Done / Canceled / Duplicate / any other "closed" state the team has, regardless of display name.
