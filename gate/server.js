@@ -316,8 +316,24 @@ function getCookie(req, name) {
   }
   return null;
 }
-function setCookie(res, name, value, maxAgeSec) {
-  res.setHeader('Set-Cookie', `${name}=${encodeURIComponent(value)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}`);
+function setCookie(res, name, value, maxAgeSec, opts) {
+  // v0.9.7: Secure attribute when we know the connection is HTTPS — Cloudflare
+  // sets x-forwarded-proto; PUBLIC_URL is the deployed external URL. Without
+  // Secure the cookie can be sent over a hypothetical HTTP request and
+  // intercepted; with Secure on a local HTTP dev gate the cookie would never
+  // be sent at all, so we only add it when the connection is actually TLS.
+  const isSecure = !!(opts && opts.secure) ||
+    String((opts && opts.req && opts.req.headers['x-forwarded-proto']) || '').toLowerCase() === 'https' ||
+    PUBLIC_URL.startsWith('https://');
+  const parts = [
+    `${name}=${encodeURIComponent(value)}`,
+    'HttpOnly',
+    'SameSite=Lax',
+    'Path=/',
+    `Max-Age=${maxAgeSec}`,
+  ];
+  if (isSecure) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
 }
 function clearCookie(res, name) {
   res.setHeader('Set-Cookie', `${name}=; Path=/; Max-Age=0`);
@@ -393,29 +409,40 @@ async function createLinearIssue(linear, issue) {
   return data.issueCreate.issue;
 }
 // v0.9.0+: list open issues in a project. Filters out state.type IN (completed,
-// canceled) at the Linear level so we transfer less. Hard-capped at 100 results
-// — projects with more than 100 simultaneously-open Test-mode-filed issues
-// should consider triage; the bubble feature has diminishing returns past that.
+// canceled) at the Linear level so we transfer less. v0.9.7: paginates with
+// endCursor up to a hard cap of 500 (5 × 100). Beyond 500 simultaneously-open
+// Test-mode-filed issues the team should be triaging, not adding bubbles —
+// the cap prevents a runaway against a very large project.
 async function fetchLinearOpenIssues(linear) {
   if (!linear || !linear.apiKey) return [];
   if (!linear.projectId) return [];
-  const data = await linearGraphQL(
-    linear.apiKey,
-    `query($projectId: ID!) {
-      issues(
-        first: 100,
-        filter: {
-          project: { id: { eq: $projectId } },
-          state: { type: { nin: ["completed", "canceled"] } }
-        },
-        orderBy: updatedAt
-      ) {
-        nodes { id identifier url title description updatedAt state { name type } }
-      }
-    }`,
-    { projectId: linear.projectId },
-  );
-  return (data.issues && data.issues.nodes) || [];
+  let all = [];
+  let after = null;
+  for (let pageCount = 0; pageCount < 5; pageCount++) {
+    const data = await linearGraphQL(
+      linear.apiKey,
+      `query($projectId: ID!, $after: String) {
+        issues(
+          first: 100,
+          after: $after,
+          filter: {
+            project: { id: { eq: $projectId } },
+            state: { type: { nin: ["completed", "canceled"] } }
+          },
+          orderBy: updatedAt
+        ) {
+          nodes { id identifier url title description updatedAt state { name type } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      { projectId: linear.projectId, after },
+    );
+    const conn = data.issues || {};
+    if (Array.isArray(conn.nodes)) all = all.concat(conn.nodes);
+    if (!conn.pageInfo || !conn.pageInfo.hasNextPage) break;
+    after = conn.pageInfo.endCursor;
+  }
+  return all;
 }
 async function fetchLinearIssue(linear, issueId) {
   if (!linear || !linear.apiKey) return null;
@@ -990,7 +1017,7 @@ async function handle(req, res) {
     if (!valid) return send(res, 401, { error: 'wrong-password' });
     const exp = Math.floor(Date.now() / 1000) + ADMIN_SESSION_TTL;
     const token = signToken({ role: 'admin', exp });
-    setCookie(res, 'gate_admin', token, ADMIN_SESSION_TTL);
+    setCookie(res, 'gate_admin', token, ADMIN_SESSION_TTL, { req });
     // Tell the client to force a password change if they got in with the default.
     return send(res, 200, { ok: true, mustChangePassword: !data.adminPasswordHash });
   }

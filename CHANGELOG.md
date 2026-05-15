@@ -10,6 +10,26 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.9.7] — 2026-05-15
+
+A focused polish pass turning v0.9.x's bubble feature into something a team can actually live with day-to-day. Eleven changes in one bundle — perceived latency, security, scale, and UX legibility.
+
+### Added
+- **Bubble icon + count.** The dot is now a small pill with a chat-bubble glyph and the open-issue count (always visible, even for `1`). Replaces the previous tiny circle that was easy to mistake for a notification dot from somewhere else on the page.
+- **`TEST MODE · N open` in the top indicator pill.** When bubbles are loading or filtered out, the count answers "are bubbles even working?" at a glance. Also fixed a stale `EDIT MODE` hardcode in `updateIndicator()` — Test and Todo modes now show their own label.
+- **State-colored bubbles.** Most-advanced state in a group wins: amber for backlog, blue for unstarted/Todo, green for started/In Progress/In Review. "This is in flight, don't refile it" vs "this is languishing, refile if you care" in a glance.
+- **Toast when a filer's own issue closes.** Diff between consecutive `/api/issues` refreshes; if an issue you filed disappears (admin moved it to Done/Canceled in Linear), you see `MAK-264 was closed in Linear.` Excludes issues you deleted yourself. Page-scoped — navigating to a new URL doesn't fire stale "closed" toasts.
+- **Sign-out UI in the bubble panel.** Footer reads "signed in as alice@example.com · sign out". Clears the gate token + bubbles; next test-mode interaction re-prompts. Replaces the "open devtools and clear sessionStorage" workaround.
+- **`/api/issues` cursor pagination.** Loops `endCursor` until `hasNextPage` is false, capped at 500 issues (5 × 100). Projects with more than 100 simultaneously-open Test-mode bugs now show bubbles for all of them.
+- **Admin cookie `Secure` attribute** when the connection is TLS (`x-forwarded-proto: https` or PUBLIC_URL is `https://`). Dev gates on `http://localhost:…` keep working — the flag only goes on where TLS actually exists.
+
+### Changed
+- **Mode indicator frame is thicker** (4px → 7px inset border + 32px → 36px glow). Easier to confirm "I'm actually in Test mode" at a glance, especially on sites with their own strong color palette.
+- **Bubble repositioning is rAF-batched.** Pages with 30+ bubbles + aggressive scroll were calling `getBoundingClientRect()` N times per wheel tick. Now coalesced to one frame.
+- **Post-submit bubble appears optimistically.** Used to wait for the next `/api/issues` roundtrip (~500–1000 ms) — now appears immediately using the just-submitted data. The next refresh reconciles to canonical Linear state silently. No more "did the submit work? where's my dot?"
+- **SPA route changes refresh bubbles.** Patches `history.pushState` + `history.replaceState` to dispatch an `fc-route-change` event; combined with a `popstate` listener and a small debounce, navigating between pages via internal Nuxt links now refreshes bubbles automatically (with a 1.5s retry pass to catch client-rendered content). Previously, internal navigation left the bubbles from the prior page on screen.
+- **`visibilitychange` joins `focus` as a refresh trigger.** Some browsers/scenarios fire one but not the other; both should reliably refresh bubbles when the user comes back from another tab.
+
 ## [0.9.6] — 2026-05-15
 
 ### Changed

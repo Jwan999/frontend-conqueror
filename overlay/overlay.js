@@ -214,8 +214,8 @@
     .frame {
       position: fixed; inset: 0;
       pointer-events: none;
-      box-shadow: inset 0 0 0 4px var(--mode-color),
-                  inset 0 0 32px var(--mode-color-glow);
+      box-shadow: inset 0 0 0 7px var(--mode-color),
+                  inset 0 0 36px var(--mode-color-glow);
       z-index: 2147483646;
     }
     .indicator {
@@ -513,18 +513,20 @@
     }
     .fc-bubble {
       position: absolute;
-      width: 18px; height: 18px;
-      border-radius: 50%;
+      display: inline-flex; align-items: center; gap: 3px;
+      height: 22px; padding: 0 8px;
+      border-radius: 999px;
       background: var(--mode-color); color: #fff;
-      font: 700 10px/18px -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-      text-align: center;
+      font: 700 11px/1 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
       cursor: pointer;
       pointer-events: auto;
       box-shadow: 0 2px 6px rgba(0,0,0,0.3), 0 0 0 2px rgba(255,255,255,0.95);
       transition: transform 0.1s;
       user-select: none;
     }
-    .fc-bubble:hover { transform: scale(1.18); }
+    .fc-bubble:hover { transform: scale(1.12); }
+    .fc-bubble-icon { width: 11px; height: 11px; flex: 0 0 auto; }
+    .fc-bubble-count { font: inherit; }
     .fc-bubble-panel {
       position: absolute;
       max-height: 70vh; overflow-y: auto;
@@ -559,6 +561,14 @@
       cursor: pointer;
     }
     .fc-issue-delete-btn:hover { background: rgba(220, 38, 38, 0.08); border-color: #fca5a5; }
+    .fc-bubble-footer {
+      margin-top: 10px; padding-top: 8px;
+      border-top: 1px solid #f3f4f6;
+      font-size: 11px; color: #6b7280;
+    }
+    .fc-bubble-footer strong { color: #111827; font-weight: 600; }
+    .fc-bubble-footer a { color: var(--mode-color); text-decoration: none; font-weight: 600; }
+    .fc-bubble-footer a:hover { text-decoration: underline; }
     /* Red "primary" button used by fcConfirm({ danger: true }) so destructive
        prompts read as destructive at a glance. */
     .fc-confirm-danger {
@@ -612,8 +622,19 @@
   document.documentElement.appendChild(host);
 
   function updateIndicator() {
-    indicator.textContent = connected ? 'EDIT MODE' : 'EDIT MODE (offline)';
-    indicator.classList.toggle('disconnected', !connected);
+    // v0.9.7: stop hardcoding "EDIT MODE" — drive from MODES[activeMode].label
+    // so Test and Todo modes show the right label. Test mode also surfaces
+    // the open-issue count so "are bubbles working?" is answered at a glance.
+    const m = MODES[activeMode];
+    if (!m) return;
+    let label = m.label;
+    if (activeMode === 'edit' && !connected) label += ' (offline)';
+    if (activeMode === 'test' && fcBubbles.length > 0) {
+      const total = fcBubbles.reduce((s, b) => s + b.group.issues.length, 0);
+      label += ' · ' + total + ' open';
+    }
+    indicator.textContent = label;
+    indicator.classList.toggle('disconnected', activeMode === 'edit' && !connected);
   }
 
   function toast(message, kind = 'info') {
@@ -1938,6 +1959,38 @@
   let fcBubblePanelDismiss = null;
   let fcBubbleResizeHandler = null;
   function fcEscAttr(s) { return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"'); }
+  // Build the bubble's contents: a small chat-bubble icon + the issue count.
+  // Extracted so optimistic-insert (after submit), delete-time count update,
+  // and the initial render all produce the same markup. v0.9.7: background
+  // also reflects the most-advanced Linear state in the group (a soft signal
+  // for "this is being worked on" vs "this is still unsorted").
+  function fcRenderDotContents(dot, group) {
+    const count = group.issues.length;
+    dot.innerHTML = '';
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('class', 'fc-bubble-icon');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('fill', 'currentColor');
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', 'M2 3a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H7l-3 3v-3H4a2 2 0 0 1-2-2V3z');
+    svg.appendChild(path);
+    dot.appendChild(svg);
+    const countSpan = document.createElement('span');
+    countSpan.className = 'fc-bubble-count';
+    countSpan.textContent = String(count);
+    dot.appendChild(countSpan);
+    dot.title = count === 1 ? (group.issues[0].title || '1 open issue') : count + ' open issues';
+    // State-colored background. Most-advanced wins: started > unstarted > backlog.
+    let highest = 0;
+    for (const iss of group.issues) {
+      const t = iss.state && iss.state.type;
+      if (t === 'started') { highest = 2; break; }
+      if (t === 'unstarted' && highest < 1) highest = 1;
+    }
+    dot.style.background = highest === 2 ? '#10b981' /* in progress/review */
+                        : highest === 1 ? '#3b82f6' /* triaged/Todo */
+                        : '';                       /* backlog → fall back to mode color */
+  }
   function fcRelTime(iso) {
     const t = typeof iso === 'number' ? iso * 1000 : Date.parse(iso || '');
     if (!t || isNaN(t)) return '';
@@ -1956,6 +2009,7 @@
       window.removeEventListener('scroll', fcBubbleResizeHandler, true);
       fcBubbleResizeHandler = null;
     }
+    updateIndicator();
   }
   function fcCloseBubblePanel() {
     if (fcOpenedBubblePanel) { fcOpenedBubblePanel.remove(); fcOpenedBubblePanel = null; }
@@ -1988,14 +2042,88 @@
       fcPositionBubblePanel(fcOpenedBubblePanel, fcOpenedBubblePanel.__anchorDot);
     }
   }
+  // v0.9.7: track the previous /api/issues snapshot so we can toast the
+  // filer when one of their issues vanishes between refreshes (admin moved it
+  // to Done/Canceled in Linear). Scoped by (page, email) — a page change
+  // wipes the snapshot so cross-page navigation never produces a stale
+  // "closed" toast. Issues the user deleted themselves are excluded.
+  let fcLastListing = null;       // { page, email, issues: Map<id, {identifier, filer}> }
+  const fcLocallyDeleted = new Set();
+  function fcDiffAndToastClosed(newIssues, email, page) {
+    const fresh = !fcLastListing || fcLastListing.page !== page || fcLastListing.email !== email;
+    if (!fresh) {
+      const newIds = new Set(newIssues.map((i) => i.id));
+      const closedMine = [];
+      for (const [id, info] of fcLastListing.issues) {
+        if (newIds.has(id)) continue;
+        if (info.filer !== email) continue;
+        if (fcLocallyDeleted.has(id)) continue;  // user did it themselves
+        closedMine.push(info.identifier || id.slice(0, 8));
+      }
+      if (closedMine.length === 1) toast(closedMine[0] + ' was closed in Linear.', 'success');
+      else if (closedMine.length > 1) toast(closedMine.length + ' of your issues were closed.', 'success');
+    }
+    const m = new Map();
+    for (const i of newIssues) m.set(i.id, { identifier: i.identifier, filer: i.filer });
+    fcLastListing = { page, email, issues: m };
+  }
   async function fcRefreshBubbles() {
-    if (activeMode !== 'test') { fcRemoveBubbles(); return; }
+    if (activeMode !== 'test') { fcRemoveBubbles(); fcLastListing = null; return; }
     const session = getStoredGateToken();
-    if (!session) { fcRemoveBubbles(); return; }
+    if (!session) { fcRemoveBubbles(); fcLastListing = null; return; }
     const page = location.pathname + location.search;
     const res = await gateListIssues(session.token, page);
     if (!res.ok) return;  // Silent — bubbles are a soft feature, no toast on failure.
+    fcDiffAndToastClosed(res.issues, session.email, page);
     fcRenderBubbles(res.issues, session.email);
+  }
+  // v0.9.7: optimistic insert after a successful report submit. The bubble
+  // appears immediately (using the data we just sent) instead of waiting for
+  // the next /api/issues roundtrip. If a bubble already exists at this anchor
+  // (re-reporting), append to the existing group + bump the count. Otherwise
+  // create a fresh dot in place.
+  function fcInsertOptimisticBubble(issueData, currentUserEmail) {
+    if (!issueData || !issueData.anchor || typeof issueData.anchor.file !== 'string') return;
+    const anchorKey = issueData.anchor.file + ':' + issueData.anchor.offset;
+    const existing = fcBubbles.find((b) => b.anchorKey === anchorKey);
+    if (existing) {
+      existing.group.issues.push({ ...issueData, mine: issueData.filer === currentUserEmail });
+      fcRenderDotContents(existing.dot, existing.group);
+      if (fcOpenedBubblePanel) {
+        const header = fcOpenedBubblePanel.querySelector('.panel-title');
+        if (header) header.textContent = existing.group.issues.length === 1 ? '1 OPEN ISSUE' : existing.group.issues.length + ' OPEN ISSUES';
+      }
+      updateIndicator();
+      return;
+    }
+    const sel = `[data-edit-source="${fcEscAttr(issueData.anchor.file + ':' + issueData.anchor.offset)}"]`;
+    const element = document.querySelector(sel);
+    if (!element) return;  // can't anchor — let the next refresh handle it
+    fcEnsureBubbleHost();
+    const group = { anchor: issueData.anchor, issues: [{ ...issueData, mine: issueData.filer === currentUserEmail }] };
+    const dot = document.createElement('div');
+    dot.className = 'fc-bubble';
+    fcRenderDotContents(dot, group);
+    dot.addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      fcOpenBubblePanel(group, dot, currentUserEmail);
+    });
+    fcBubbleHost.appendChild(dot);
+    const b = { anchorKey, group, element, dot };
+    fcBubbles.push(b);
+    fcPositionBubble(b);
+    if (!fcBubbleResizeHandler) {
+      let pending = false;
+      fcBubbleResizeHandler = () => {
+        if (pending) return;
+        pending = true;
+        requestAnimationFrame(() => { pending = false; fcRepositionAll(); });
+      };
+      window.addEventListener('resize', fcBubbleResizeHandler);
+      window.addEventListener('scroll', fcBubbleResizeHandler, true);
+    }
+    updateIndicator();
   }
   function fcRenderBubbles(issues, currentUserEmail) {
     fcRemoveBubbles();
@@ -2017,8 +2145,7 @@
       if (!element) continue;  // anchor exists in Linear but element isn't on the page right now — skip silently
       const dot = document.createElement('div');
       dot.className = 'fc-bubble';
-      dot.textContent = group.issues.length > 1 ? String(group.issues.length) : '';
-      dot.title = group.issues.length === 1 ? group.issues[0].title : group.issues.length + ' open issues';
+      fcRenderDotContents(dot, group);
       dot.addEventListener('click', (e) => {
         e.stopPropagation();
         e.preventDefault();
@@ -2029,10 +2156,19 @@
     }
     fcRepositionAll();
     if (!fcBubbleResizeHandler) {
-      fcBubbleResizeHandler = () => fcRepositionAll();
+      // v0.9.7: rAF-batched. A page with N bubbles + aggressive scroll was
+      // doing N getBoundingClientRect reads on every wheel tick — janky past
+      // ~30 bubbles. Coalesce to one per animation frame.
+      let pending = false;
+      fcBubbleResizeHandler = () => {
+        if (pending) return;
+        pending = true;
+        requestAnimationFrame(() => { pending = false; fcRepositionAll(); });
+      };
       window.addEventListener('resize', fcBubbleResizeHandler);
       window.addEventListener('scroll', fcBubbleResizeHandler, true);
     }
+    updateIndicator();
   }
   function fcPositionBubblePanel(panel, dot) {
     const r = dot.getBoundingClientRect();
@@ -2061,6 +2197,35 @@
 
     for (const iss of group.issues) {
       panel.appendChild(fcBuildIssueRow(iss, group, currentUserEmail));
+    }
+
+    // v0.9.7: identity footer + sign-out. Lets a tester switch users without
+    // pasting `sessionStorage.clear()` into devtools.
+    if (currentUserEmail) {
+      const footer = document.createElement('div');
+      footer.className = 'fc-bubble-footer';
+      const who = document.createElement('span');
+      who.textContent = 'signed in as ';
+      const whoBold = document.createElement('strong');
+      whoBold.textContent = currentUserEmail;
+      who.appendChild(whoBold);
+      footer.appendChild(who);
+      const sep = document.createElement('span');
+      sep.textContent = ' · ';
+      sep.style.color = '#d1d5db';
+      footer.appendChild(sep);
+      const signOut = document.createElement('a');
+      signOut.href = '#';
+      signOut.textContent = 'sign out';
+      signOut.addEventListener('click', (e) => {
+        e.preventDefault();
+        clearGateToken();
+        fcCloseBubblePanel();
+        fcRemoveBubbles();
+        toast('Signed out.', 'success');
+      });
+      footer.appendChild(signOut);
+      panel.appendChild(footer);
     }
 
     shadow.appendChild(panel);
@@ -2170,6 +2335,9 @@
       toast(res.status === 403 ? 'Only the original filer can delete this.' : (res.error || 'Delete failed.'), 'error');
       return;
     }
+    // Mark so the next refresh doesn't fire a "closed in Linear" toast — the
+    // user knows they just deleted it; reporting it back is noise.
+    fcLocallyDeleted.add(iss.id);
     // Resolve the LIVE bubble entry by anchor identity rather than the
     // group-object reference we captured at click time. If a window.focus
     // re-rendered bubbles while the confirm dialog was open (or the user
@@ -2189,15 +2357,13 @@
         fcBubbles = fcBubbles.filter((x) => x !== liveB);
       }
     } else {
-      if (liveB) {
-        liveB.dot.textContent = liveGroup.issues.length > 1 ? String(liveGroup.issues.length) : '';
-        liveB.dot.title = liveGroup.issues.length === 1 ? liveGroup.issues[0].title : liveGroup.issues.length + ' open issues';
-      }
+      if (liveB) fcRenderDotContents(liveB.dot, liveGroup);
       if (fcOpenedBubblePanel) {
         const header = fcOpenedBubblePanel.querySelector('.panel-title');
         if (header) header.textContent = liveGroup.issues.length === 1 ? '1 OPEN ISSUE' : liveGroup.issues.length + ' OPEN ISSUES';
       }
     }
+    updateIndicator();
     toast('Deleted.', 'success');
     // Backstop: re-sync from server in case anything diverged. Cache was just
     // busted by the gate, so this hits Linear fresh.
@@ -2323,11 +2489,45 @@
     row.replaceWith(editRow);
     titleInput.focus();
   }
-  // Re-render on window focus while in Test mode. This is the live-update path
-  // for "admin moves issue to Done in Linear → next time tester focuses the
-  // tab, bubble disappears." No background polling.
+  // Re-render on window focus + visibility change while in Test mode. This
+  // is the live-update path for "admin moves issue to Done in Linear → next
+  // time tester focuses the tab, bubble disappears." No background polling.
   window.addEventListener('focus', () => {
     if (activeMode === 'test') fcRefreshBubbles();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && activeMode === 'test') fcRefreshBubbles();
+  });
+  // v0.9.7: SPA route-change detection. Nuxt (and most SPA frameworks) navigate
+  // via history.pushState — no `load` or `focus` event fires, so bubbles for
+  // the new page never appear without intervention. Patch pushState +
+  // replaceState to dispatch a synthetic event we can listen on, plus catch
+  // the browser-driven back/forward via popstate. Small debounce lets the new
+  // DOM mount before we look for anchor elements.
+  (function patchHistory() {
+    const fire = () => window.dispatchEvent(new Event('fc-route-change'));
+    const wrap = (m) => {
+      const orig = history[m];
+      if (!orig || orig.__fcWrapped) return;
+      const wrapped = function () { const r = orig.apply(this, arguments); fire(); return r; };
+      wrapped.__fcWrapped = true;
+      history[m] = wrapped;
+    };
+    wrap('pushState');
+    wrap('replaceState');
+    window.addEventListener('popstate', fire);
+  })();
+  let fcRouteRefreshTimer = null;
+  window.addEventListener('fc-route-change', () => {
+    if (activeMode !== 'test') return;
+    // Debounce — Nuxt sometimes fires multiple history events on a single
+    // navigation. Wait for the dust to settle, then refresh + retry once more
+    // 1.5s later in case client-rendered content arrives late.
+    clearTimeout(fcRouteRefreshTimer);
+    fcRouteRefreshTimer = setTimeout(() => {
+      fcRefreshBubbles();
+      setTimeout(fcRefreshBubbles, 1500);
+    }, 150);
   });
 
   // ---------- Test mode (gate-backed) ----------
@@ -2551,8 +2751,23 @@
       const ref = created ? (created.identifier || created.id) : 'created';
       toast(`Reported: ${ref}${created && created.mock ? ' (mock)' : ''}`, 'success');
       close();
-      // Show the new bubble immediately — gate just busted the issues cache.
-      fcRefreshBubbles();
+      // v0.9.7: optimistically render the bubble using the data we just sent
+      // — no network roundtrip in the visible path. The next refresh
+      // reconciles to canonical Linear state.
+      if (activeMode === 'test' && created) {
+        fcInsertOptimisticBubble({
+          id: created.id,
+          identifier: created.identifier,
+          url: created.url,
+          title: titleVal,
+          note: ta.value.trim(),
+          filer: session.email,
+          anchor: src ? { file: src.file, offset: src.offset } : null,
+          page: location.pathname + location.search,
+          updatedAt: new Date().toISOString(),
+          state: { name: 'Backlog', type: 'unstarted' },
+        }, session.email);
+      }
     }
     cancelBtn.addEventListener('click', close);
     sendBtn.addEventListener('click', submit);
@@ -2605,7 +2820,12 @@
     document.addEventListener('click', onDocClick, true);
     window.addEventListener('scroll', onScrollOrResize, true);
     window.addEventListener('resize', onScrollOrResize, true);
-    if (modeKey === 'test') fcRefreshBubbles();
+    if (modeKey === 'test') {
+      fcRefreshBubbles();
+      // v0.9.7: catch late-rendering client-side content with one retry pass.
+      // The gate cache makes the second call near-free (~50ms cache hit).
+      setTimeout(fcRefreshBubbles, 1500);
+    }
   }
   // v0.9.5: persist the active mode across page navigation + reload so testers
   // don't lose Test mode every time they click an internal link. Tab-scoped
