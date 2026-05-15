@@ -10,6 +10,31 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.9.0] — 2026-05-15
+
+**Persistent report bubbles.** When a tester files an issue from Test mode, a small mode-colored dot now stays anchored to that element on the page. Hover/click → list of every open issue at that anchor, with the filer, the note, a link to Linear, and an inline edit button for the original filer. Bubbles disappear automatically the next time the tester focuses the tab if the issue has moved to a Linear state of `type: completed` or `type: canceled` — covering Done / Canceled / Duplicate / any other "closed" state the team has, regardless of display name.
+
+### Added
+- **`<!-- fc-meta: {…} -->` marker** appended to every issue description the gate creates. Carries `{ v, anchor, page, filer, title, note }` so the overlay can recover the bubble anchor on later page loads. Plain HTML comment → invisible in Linear's rendered view.
+- **`GET /api/issues?page=`** (gate). JWT-gated (Bearer). Returns open issues for the current project filtered to the requested page URL. Filters out `state.type IN (completed, canceled)` at the Linear level. 30s in-memory cache keyed by project so dozens of testers loading the same page share a single Linear call.
+- **`PUT /api/issues/:id`** (gate). JWT-gated. Body `{ title?, note? }`. Server-side ownership check against `fc-meta.filer` — returns `403 not-owner` if anyone else tries to edit. Rebuilds the description (preserving the marker) and calls `issueUpdate`. Busts the cache.
+- **Bubble UI** (overlay). Renders only while in Test mode and only for logged-in testers. One bubble per unique `data-edit-source` anchor; if N>1 issues share the anchor, the dot shows a count and the panel lists all N. Hover panel surfaces filer, state name, relative time, issue ID linking to Linear. Edit button only appears on issues you filed. Click outside to dismiss; Escape from the edit form to cancel.
+- **`window.focus` refresh.** When the tester switches back to the tab, the bubble list re-fetches — that's how Done/Canceled state changes propagate from Linear back into the overlay. No background polling: zero traffic while the tab is idle.
+
+### Changed
+- Overlay's `report-issue` payload now carries a structured `meta.anchor = { file, offset }` alongside the existing human-readable `meta.where` string. Older overlays (v0.7/v0.8) still work — the gate salvages anchor data from the legacy `where` string when no structured anchor is present.
+- Linear API helpers expanded: `fetchLinearOpenIssues`, `fetchLinearIssue`, `updateLinearIssue`.
+
+### Compatibility
+- **Mixed-version safe.** v0.7/v0.8 overlays talking to a v0.9 gate keep working — they just don't render bubbles. v0.9 overlays talking to a v0.7/v0.8 gate get a 404 on the bubble endpoints and silently skip rendering (bubbles are a soft feature, no user-facing error).
+- Issues filed before v0.9.0 don't have an fc-meta marker so they never get a bubble. Only new reports surface. No backfill needed.
+
+### What you'll need to test in prod
+- File a new test-mode issue → confirm the bubble appears on the element after a brief delay.
+- Move it to Done (or Canceled) in Linear → switch focus to another tab and back → bubble should disappear.
+- File a second issue on the same element → bubble should now show `2` and list both.
+- Try to edit a teammate's issue → server returns 403 (UI just doesn't show the Edit button for non-filers).
+
 ## [0.8.0] — 2026-05-14
 
 **Test-mode auth: email → email + password.** The email-only allowlist was theatre — anyone who knew an allowlisted address could file issues. v0.8.0 replaces it with per-tester passwords set by the gate admin.

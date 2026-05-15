@@ -80,6 +80,28 @@
     try { data = text ? JSON.parse(text) : null; } catch {}
     return { ok: r.ok, status: r.status, data };
   }
+  // v0.9.0: list open Linear issues filed against the current page so the
+  // overlay can render bubbles. Bearer auth — keeps the report-issue body
+  // shape unchanged (which still uses body-token for back-compat).
+  async function gateListIssues(token, page) {
+    const r = await fetch(`${GATE.url}/api/issues?page=${encodeURIComponent(page)}`, {
+      headers: { 'Authorization': 'Bearer ' + token },
+    });
+    if (!r.ok) return { ok: false, status: r.status, issues: [] };
+    const data = await r.json().catch(() => null);
+    return { ok: true, issues: (data && data.issues) || [] };
+  }
+  async function gateUpdateIssue(token, id, body) {
+    const r = await fetch(`${GATE.url}/api/issues/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    let data = null;
+    try { data = await r.json(); } catch {}
+    if (!r.ok) return { ok: false, error: (data && (data.message || data.error)) || 'update-failed', status: r.status };
+    return { ok: true, issue: data && data.issue };
+  }
 
   // ---------- Heartbeat ----------
   // Lets the gate auto-discover this project and surface activity to the admin.
@@ -465,6 +487,75 @@
     @keyframes slideIn {
       from { transform: translateY(10px); opacity: 0; }
       to { transform: translateY(0); opacity: 1; }
+    }
+    /* v0.9.0: report-bubble feature. Persistent dot anchored to each element
+       with one or more open Linear issues. Click → list panel. */
+    .fc-bubble-host {
+      position: absolute; top: 0; left: 0;
+      width: 0; height: 0;
+      pointer-events: none;
+      z-index: 2147483645;
+    }
+    .fc-bubble {
+      position: absolute;
+      width: 18px; height: 18px;
+      border-radius: 50%;
+      background: var(--mode-color); color: #fff;
+      font: 700 10px/18px -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      text-align: center;
+      cursor: pointer;
+      pointer-events: auto;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3), 0 0 0 2px rgba(255,255,255,0.95);
+      transition: transform 0.1s;
+      user-select: none;
+    }
+    .fc-bubble:hover { transform: scale(1.18); }
+    .fc-bubble-panel {
+      position: absolute;
+      max-height: 70vh; overflow-y: auto;
+      width: 320px;
+    }
+    .fc-issue-row {
+      padding: 8px 0;
+      border-bottom: 1px solid #f3f4f6;
+    }
+    .fc-issue-row:last-child { border-bottom: 0; padding-bottom: 0; }
+    .fc-issue-row:first-child { padding-top: 0; }
+    .fc-issue-meta { font-size: 11px; color: #6b7280; margin-bottom: 4px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .fc-issue-meta a { color: var(--mode-color); text-decoration: none; font-weight: 600; }
+    .fc-issue-meta a:hover { text-decoration: underline; }
+    .fc-issue-meta .fc-state-pill {
+      display: inline-block; padding: 1px 7px; border-radius: 999px;
+      background: #f3f4f6; color: #6b7280; font-size: 10px;
+    }
+    .fc-issue-title { font-weight: 600; color: #111827; margin-bottom: 4px; }
+    .fc-issue-note { color: #374151; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+    .fc-issue-edit-btn {
+      margin-top: 6px;
+      font: 600 11px/1 inherit;
+      padding: 4px 10px; border-radius: 4px; border: 0;
+      background: #f3f4f6; color: #111827; cursor: pointer;
+    }
+    .fc-issue-edit-btn:hover { background: #e5e7eb; }
+    .fc-edit-input {
+      width: 100%; padding: 6px 8px; margin-bottom: 6px;
+      border: 1px solid #d1d5db; border-radius: 4px;
+      font: inherit; color: inherit;
+      outline: none;
+    }
+    .fc-edit-input:focus { border-color: var(--mode-color); box-shadow: 0 0 0 2px var(--mode-color-glow); }
+    .fc-edit-textarea {
+      width: 100%; min-height: 56px; resize: vertical;
+      padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 4px;
+      font: inherit; color: inherit; outline: none;
+    }
+    .fc-edit-textarea:focus { border-color: var(--mode-color); box-shadow: 0 0 0 2px var(--mode-color-glow); }
+    .fc-edit-actions {
+      display: flex; gap: 6px; justify-content: flex-end; align-items: center;
+      margin-top: 6px;
+    }
+    .fc-edit-actions .fc-edit-err {
+      flex: 1; color: #dc2626; font-size: 11px; min-height: 14px;
     }
   `;
   shadow.appendChild(style);
@@ -1803,6 +1894,285 @@
     });
   }
 
+  // ---------- Test-mode report bubbles (v0.9.0) ----------
+  // For every element with one or more open Linear issues filed against it
+  // on the current page, render a small mode-colored dot at its top-right
+  // corner. Hover/click → list panel with each issue's note + edit (if the
+  // current tester is the filer). Bubbles disappear automatically when their
+  // issues move to Linear state.type = completed or canceled — refresh
+  // happens on Test-mode enter and on window focus (no background polling).
+  let fcBubbleHost = null;
+  let fcBubbles = [];                  // [{ anchorKey, group, element, dot }]
+  let fcOpenedBubblePanel = null;
+  let fcBubblePanelDismiss = null;
+  let fcBubbleResizeHandler = null;
+  function fcEscAttr(s) { return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"'); }
+  function fcRelTime(iso) {
+    const t = typeof iso === 'number' ? iso * 1000 : Date.parse(iso || '');
+    if (!t || isNaN(t)) return '';
+    const diff = Math.max(0, (Date.now() - t) / 1000);
+    if (diff < 60) return 'just now';
+    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+    if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+    return Math.floor(diff / 86400) + 'd ago';
+  }
+  function fcRemoveBubbles() {
+    fcCloseBubblePanel();
+    if (fcBubbleHost) { fcBubbleHost.remove(); fcBubbleHost = null; }
+    fcBubbles = [];
+    if (fcBubbleResizeHandler) {
+      window.removeEventListener('resize', fcBubbleResizeHandler);
+      window.removeEventListener('scroll', fcBubbleResizeHandler, true);
+      fcBubbleResizeHandler = null;
+    }
+  }
+  function fcCloseBubblePanel() {
+    if (fcOpenedBubblePanel) { fcOpenedBubblePanel.remove(); fcOpenedBubblePanel = null; }
+    if (fcBubblePanelDismiss) {
+      document.removeEventListener('mousedown', fcBubblePanelDismiss, true);
+      fcBubblePanelDismiss = null;
+    }
+  }
+  function fcEnsureBubbleHost() {
+    if (fcBubbleHost && fcBubbleHost.isConnected) return;
+    fcBubbleHost = document.createElement('div');
+    fcBubbleHost.className = 'fc-bubble-host';
+    shadow.appendChild(fcBubbleHost);
+  }
+  function fcPositionBubble(b) {
+    const r = b.element.getBoundingClientRect();
+    // The host is position:fixed at (0,0); we want viewport-relative coords,
+    // which is exactly what getBoundingClientRect gives us. Place at top-right
+    // of the element, peeking outside its edge.
+    b.dot.style.top = (r.top - 9) + 'px';
+    b.dot.style.left = (r.right - 9) + 'px';
+    // Hide bubble if anchor is off-screen vertically — avoids stranded dots
+    // when the page scrolls past where the element was.
+    const offscreen = r.bottom < 0 || r.top > window.innerHeight;
+    b.dot.style.display = offscreen ? 'none' : '';
+  }
+  function fcRepositionAll() {
+    for (const b of fcBubbles) fcPositionBubble(b);
+    if (fcOpenedBubblePanel && fcOpenedBubblePanel.__anchorDot) {
+      fcPositionBubblePanel(fcOpenedBubblePanel, fcOpenedBubblePanel.__anchorDot);
+    }
+  }
+  async function fcRefreshBubbles() {
+    if (activeMode !== 'test') { fcRemoveBubbles(); return; }
+    const session = getStoredGateToken();
+    if (!session) { fcRemoveBubbles(); return; }
+    const page = location.pathname + location.search;
+    const res = await gateListIssues(session.token, page);
+    if (!res.ok) return;  // Silent — bubbles are a soft feature, no toast on failure.
+    fcRenderBubbles(res.issues, session.email);
+  }
+  function fcRenderBubbles(issues, currentUserEmail) {
+    fcRemoveBubbles();
+    if (!issues.length) return;
+    // Group by anchor identity. One bubble per unique data-edit-source target.
+    const byAnchor = new Map();
+    for (const iss of issues) {
+      const a = iss.anchor;
+      if (!a || typeof a.file !== 'string' || typeof a.offset !== 'number') continue;
+      const k = a.file + ':' + a.offset;
+      if (!byAnchor.has(k)) byAnchor.set(k, { anchor: a, issues: [] });
+      byAnchor.get(k).issues.push({ ...iss, mine: iss.filer === currentUserEmail });
+    }
+    if (!byAnchor.size) return;
+    fcEnsureBubbleHost();
+    for (const [anchorKey, group] of byAnchor) {
+      const sel = `[data-edit-source="${fcEscAttr(group.anchor.file + ':' + group.anchor.offset)}"]`;
+      const element = document.querySelector(sel);
+      if (!element) continue;  // anchor exists in Linear but element isn't on the page right now — skip silently
+      const dot = document.createElement('div');
+      dot.className = 'fc-bubble';
+      dot.textContent = group.issues.length > 1 ? String(group.issues.length) : '';
+      dot.title = group.issues.length === 1 ? group.issues[0].title : group.issues.length + ' open issues';
+      dot.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        fcOpenBubblePanel(group, dot, currentUserEmail);
+      });
+      fcBubbleHost.appendChild(dot);
+      fcBubbles.push({ anchorKey, group, element, dot });
+    }
+    fcRepositionAll();
+    if (!fcBubbleResizeHandler) {
+      fcBubbleResizeHandler = () => fcRepositionAll();
+      window.addEventListener('resize', fcBubbleResizeHandler);
+      window.addEventListener('scroll', fcBubbleResizeHandler, true);
+    }
+  }
+  function fcPositionBubblePanel(panel, dot) {
+    const r = dot.getBoundingClientRect();
+    // Prefer below+right of the dot; if it would overflow, swap sides/up.
+    let top = r.bottom + 6;
+    let left = r.left - 16;
+    const panelRect = panel.getBoundingClientRect();
+    if (left + panelRect.width > window.innerWidth - 8) left = window.innerWidth - panelRect.width - 8;
+    if (left < 8) left = 8;
+    if (top + panelRect.height > window.innerHeight - 8) top = r.top - panelRect.height - 6;
+    if (top < 8) top = 8;
+    panel.style.top = top + 'px';
+    panel.style.left = left + 'px';
+  }
+  function fcOpenBubblePanel(group, dot, currentUserEmail) {
+    fcCloseBubblePanel();
+    const panel = document.createElement('div');
+    panel.className = 'panel fc-bubble-panel';
+    panel.__anchorDot = dot;
+    panel.addEventListener('click', (e) => e.stopPropagation());
+
+    const header = document.createElement('div');
+    header.className = 'panel-title';
+    header.textContent = group.issues.length === 1 ? '1 OPEN ISSUE' : group.issues.length + ' OPEN ISSUES';
+    panel.appendChild(header);
+
+    for (const iss of group.issues) {
+      panel.appendChild(fcBuildIssueRow(iss, group, currentUserEmail));
+    }
+
+    shadow.appendChild(panel);
+    fcOpenedBubblePanel = panel;
+    fcPositionBubblePanel(panel, dot);
+
+    // Dismiss on outside click. Defer to next tick so the click that opened
+    // it doesn't immediately close it.
+    setTimeout(() => {
+      fcBubblePanelDismiss = (e) => {
+        if (!fcOpenedBubblePanel) return;
+        if (fcOpenedBubblePanel.contains(e.target)) return;
+        if (e.target === dot) return;
+        fcCloseBubblePanel();
+      };
+      document.addEventListener('mousedown', fcBubblePanelDismiss, true);
+    }, 0);
+  }
+  function fcBuildIssueRow(iss, group, currentUserEmail) {
+    const row = document.createElement('div');
+    row.className = 'fc-issue-row';
+
+    const meta = document.createElement('div');
+    meta.className = 'fc-issue-meta';
+    if (iss.url) {
+      const idLink = document.createElement('a');
+      idLink.href = iss.url; idLink.target = '_blank'; idLink.rel = 'noreferrer';
+      idLink.textContent = iss.identifier || '';
+      meta.appendChild(idLink);
+    } else if (iss.identifier) {
+      const idSpan = document.createElement('strong');
+      idSpan.textContent = iss.identifier;
+      meta.appendChild(idSpan);
+    }
+    if (iss.state && iss.state.name) {
+      const pill = document.createElement('span');
+      pill.className = 'fc-state-pill';
+      pill.textContent = iss.state.name;
+      meta.appendChild(pill);
+    }
+    if (iss.filer) {
+      const filerSpan = document.createElement('span');
+      filerSpan.textContent = iss.filer;
+      meta.appendChild(filerSpan);
+    }
+    if (iss.updatedAt) {
+      const timeSpan = document.createElement('span');
+      timeSpan.textContent = fcRelTime(iss.updatedAt);
+      meta.appendChild(timeSpan);
+    }
+    row.appendChild(meta);
+
+    const title = document.createElement('div');
+    title.className = 'fc-issue-title';
+    title.textContent = iss.title || '(no title)';
+    row.appendChild(title);
+
+    if (iss.note) {
+      const note = document.createElement('div');
+      note.className = 'fc-issue-note';
+      note.textContent = iss.note;
+      row.appendChild(note);
+    }
+
+    if (iss.mine) {
+      const editBtn = document.createElement('button');
+      editBtn.className = 'fc-issue-edit-btn';
+      editBtn.textContent = 'Edit';
+      editBtn.addEventListener('click', () => fcSwapRowToEdit(row, iss, group, currentUserEmail));
+      row.appendChild(editBtn);
+    }
+
+    return row;
+  }
+  function fcSwapRowToEdit(row, iss, group, currentUserEmail) {
+    const editRow = document.createElement('div');
+    editRow.className = 'fc-issue-row';
+
+    const titleInput = document.createElement('input');
+    titleInput.type = 'text';
+    titleInput.className = 'fc-edit-input';
+    titleInput.value = iss.title || '';
+    titleInput.placeholder = 'Title';
+    editRow.appendChild(titleInput);
+
+    const noteTa = document.createElement('textarea');
+    noteTa.className = 'fc-edit-textarea';
+    noteTa.value = iss.note || '';
+    noteTa.placeholder = 'Your note';
+    editRow.appendChild(noteTa);
+
+    const actions = document.createElement('div');
+    actions.className = 'fc-edit-actions';
+    const err = document.createElement('div');
+    err.className = 'fc-edit-err';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'fc-issue-edit-btn';
+    cancelBtn.textContent = 'Cancel';
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'fc-issue-edit-btn';
+    saveBtn.style.background = 'var(--mode-color)';
+    saveBtn.style.color = '#fff';
+    saveBtn.textContent = 'Save';
+    actions.appendChild(err);
+    actions.appendChild(cancelBtn);
+    actions.appendChild(saveBtn);
+    editRow.appendChild(actions);
+
+    cancelBtn.addEventListener('click', () => {
+      editRow.replaceWith(fcBuildIssueRow(iss, group, currentUserEmail));
+    });
+    saveBtn.addEventListener('click', async () => {
+      const t = titleInput.value.trim();
+      const n = noteTa.value.trim();
+      if (!t) { err.textContent = 'Title required.'; titleInput.focus(); return; }
+      err.textContent = '';
+      saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+      const session = getStoredGateToken();
+      if (!session) { err.textContent = 'Session expired. Sign in again.'; saveBtn.disabled = false; saveBtn.textContent = 'Save'; return; }
+      const res = await gateUpdateIssue(session.token, iss.id, { title: t, note: n });
+      if (!res.ok) {
+        err.textContent = res.status === 403 ? 'Only the original filer can edit this.' : (res.error || 'Update failed.');
+        saveBtn.disabled = false; saveBtn.textContent = 'Save';
+        return;
+      }
+      // Sync group + replace row in place.
+      const updated = { ...res.issue, mine: true };
+      for (let i = 0; i < group.issues.length; i++) {
+        if (group.issues[i].id === iss.id) group.issues[i] = updated;
+      }
+      editRow.replaceWith(fcBuildIssueRow(updated, group, currentUserEmail));
+    });
+
+    row.replaceWith(editRow);
+    titleInput.focus();
+  }
+  // Re-render on window focus while in Test mode. This is the live-update path
+  // for "admin moves issue to Done in Linear → next time tester focuses the
+  // tab, bubble disappears." No background polling.
+  window.addEventListener('focus', () => {
+    if (activeMode === 'test') fcRefreshBubbles();
+  });
+
   // ---------- Test mode (gate-backed) ----------
   // Renders an issue-report form on click; gates first use with an email +
   // password prompt that calls the gate's /api/login. JWT cached in
@@ -1897,6 +2267,9 @@
       }
       storeGateToken(v.token, v.expiresAt, email);
       close({ ok: true, email });
+      // Fresh session → fetch the bubbles too. Test-mode was already active
+      // when this prompt fired (it's how the user landed here).
+      if (activeMode === 'test') fcRefreshBubbles();
     }
     cancelBtn.addEventListener('click', () => close({ ok: false }));
     okBtn.addEventListener('click', submit);
@@ -1992,6 +2365,10 @@
         title: titleVal,
         description: ta.value.trim(),
         meta: {
+          // v0.9.0+: structured anchor for the bubble feature. The gate persists
+          // this in an fc-meta marker on the Linear description so subsequent
+          // page loads can find this element again via [data-edit-source].
+          anchor: src ? { file: src.file, offset: src.offset } : null,
           where: src ? `${src.file}:${src.offset}` : null,
           page: location.pathname + location.search,
           locale: getActiveLocale(),
@@ -2017,6 +2394,8 @@
       const ref = created ? (created.identifier || created.id) : 'created';
       toast(`Reported: ${ref}${created && created.mock ? ' (mock)' : ''}`, 'success');
       close();
+      // Show the new bubble immediately — gate just busted the issues cache.
+      fcRefreshBubbles();
     }
     cancelBtn.addEventListener('click', close);
     sendBtn.addEventListener('click', submit);
@@ -2048,6 +2427,7 @@
       window.removeEventListener('resize', onScrollOrResize, true);
       setTarget(null);
       closeChoicePicker();
+      if (activeMode === 'test') fcRemoveBubbles();
     }
     activeMode = modeKey;
     if (!modeKey) return;
@@ -2062,6 +2442,7 @@
     document.addEventListener('click', onDocClick, true);
     window.addEventListener('scroll', onScrollOrResize, true);
     window.addEventListener('resize', onScrollOrResize, true);
+    if (modeKey === 'test') fcRefreshBubbles();
   }
 
   // ---------- Mode palette (Shift-Shift) ----------

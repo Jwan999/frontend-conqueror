@@ -392,6 +392,129 @@ async function createLinearIssue(linear, issue) {
   }
   return data.issueCreate.issue;
 }
+// v0.9.0+: list open issues in a project. Filters out state.type IN (completed,
+// canceled) at the Linear level so we transfer less. Hard-capped at 100 results
+// — projects with more than 100 simultaneously-open Test-mode-filed issues
+// should consider triage; the bubble feature has diminishing returns past that.
+async function fetchLinearOpenIssues(linear) {
+  if (!linear || !linear.apiKey) return [];
+  if (!linear.projectId) return [];
+  const data = await linearGraphQL(
+    linear.apiKey,
+    `query($projectId: ID!) {
+      issues(
+        first: 100,
+        filter: {
+          project: { id: { eq: $projectId } },
+          state: { type: { nin: ["completed", "canceled"] } }
+        },
+        orderBy: updatedAt
+      ) {
+        nodes { id identifier url title description updatedAt state { name type } }
+      }
+    }`,
+    { projectId: linear.projectId },
+  );
+  return (data.issues && data.issues.nodes) || [];
+}
+async function fetchLinearIssue(linear, issueId) {
+  if (!linear || !linear.apiKey) return null;
+  const data = await linearGraphQL(
+    linear.apiKey,
+    `query($id: String!) { issue(id: $id) { id identifier url title description updatedAt state { name type } } }`,
+    { id: issueId },
+  );
+  return data.issue || null;
+}
+async function updateLinearIssue(linear, issueId, input) {
+  const data = await linearGraphQL(
+    linear.apiKey,
+    `mutation($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) {
+        success
+        issue { id identifier url title description updatedAt state { name type } }
+      }
+    }`,
+    { id: issueId, input },
+  );
+  if (!data.issueUpdate || !data.issueUpdate.success) {
+    throw new Error('Linear issueUpdate rejected: ' + JSON.stringify(data));
+  }
+  return data.issueUpdate.issue;
+}
+
+// ---------- fc-meta marker (v0.9.0+) ----------
+// Each issue the gate creates carries a structured HTML-comment marker at the
+// end of its description. This lets the overlay recover the element anchor and
+// the original filer when listing issues later. Plain comment so Linear renders
+// nothing visible. JSON shape: { v:1, anchor:{file,offset}, page, filer, title, note }.
+const FC_META_RE = /<!--\s*fc-meta:\s*(\{[\s\S]*?\})\s*-->/;
+function parseFcMeta(description) {
+  if (typeof description !== 'string') return null;
+  const m = description.match(FC_META_RE);
+  if (!m) return null;
+  try { return JSON.parse(m[1]); } catch { return null; }
+}
+// Older overlays (v0.7.x / v0.8.x) send `meta.where = "file:offset"` instead of
+// a structured anchor. Salvage what we can so their issues still get a bubble.
+function normalizeAnchor(rawAnchor, rawWhere) {
+  if (rawAnchor && typeof rawAnchor === 'object' && typeof rawAnchor.file === 'string') {
+    const off = Number(rawAnchor.offset);
+    if (Number.isFinite(off)) return { file: rawAnchor.file, offset: off };
+  }
+  if (typeof rawWhere === 'string') {
+    const i = rawWhere.lastIndexOf(':');
+    if (i > 0) {
+      const file = rawWhere.slice(0, i);
+      const off = Number(rawWhere.slice(i + 1));
+      if (file && Number.isFinite(off)) return { file, offset: off };
+    }
+  }
+  return null;
+}
+function buildIssueDescription({ filer, projectDisplayName, title, note, anchor, page, locale, text, userAgent }) {
+  const where = anchor ? `${anchor.file}:${anchor.offset}` : null;
+  const meta = { v: 1, anchor: anchor || null, page: page || null, filer, title: title || '', note: note || '' };
+  return [
+    `**Reported via Test Mode** by \`${filer}\` for project \`${projectDisplayName}\``,
+    '',
+    note || '',
+    '',
+    '---',
+    where ? `**Where:** \`${where}\`` : '',
+    page ? `**Page:** ${page}` : '',
+    locale ? `**Locale:** ${locale}` : '',
+    text ? `**Text:** "${trunc(text, 200)}"` : '',
+    userAgent ? `**UA:** ${userAgent}` : '',
+    '',
+    `<!-- fc-meta: ${JSON.stringify(meta)} -->`,
+  ].filter((line) => line !== '').join('\n');
+}
+
+// ---------- Issues cache ----------
+// 30s in-memory TTL per project. Lets dozens of testers loading the same page
+// share a single Linear API call. Busted on issue create + edit so writes show
+// up immediately for the writer.
+const issuesCache = new Map(); // projKey -> { fetchedAt, issues }
+const ISSUES_CACHE_TTL_MS = 30_000;
+async function fetchOpenIssuesCached(projKey, linCreds) {
+  const cached = issuesCache.get(projKey);
+  const now = Date.now();
+  if (cached && now - cached.fetchedAt < ISSUES_CACHE_TTL_MS) return cached.issues;
+  const issues = await fetchLinearOpenIssues(linCreds);
+  issuesCache.set(projKey, { fetchedAt: now, issues });
+  return issues;
+}
+function bustIssuesCache(projKey) { issuesCache.delete(projKey); }
+
+// Tester JWT lookup for the new bubble endpoints. Bearer-only — the report-issue
+// endpoint kept its body-token shape for back-compat, but new endpoints pick
+// the cleaner header pattern.
+function readTesterToken(req) {
+  const auth = String(req.headers.authorization || '');
+  if (!auth.startsWith('Bearer ')) return null;
+  return verifyToken(auth.slice(7));
+}
 
 // Hide API key value; signal presence only.
 function publicLinear(linear) {
@@ -538,27 +661,136 @@ async function handle(req, res) {
     if (!linCreds.projectId) return send(res, 503, { error: 'linear-project-not-set' });
     const title = trunc(issue.title.trim(), 200);
     const meta = issue.meta || {};
-    const description = [
-      `**Reported via Test Mode** by \`${payload.email}\` for project \`${proj.displayName}\``,
-      '',
-      issue.description ? issue.description.trim() : '',
-      '',
-      '---',
-      meta.where ? `**Where:** \`${meta.where}\`` : '',
-      meta.page ? `**Page:** ${meta.page}` : '',
-      meta.locale ? `**Locale:** ${meta.locale}` : '',
-      meta.text ? `**Text:** "${trunc(meta.text, 200)}"` : '',
-      meta.userAgent ? `**UA:** ${meta.userAgent}` : '',
-    ].filter(Boolean).join('\n');
+    const note = issue.description ? issue.description.trim() : '';
+    const anchor = normalizeAnchor(meta.anchor, meta.where);
+    const description = buildIssueDescription({
+      filer: payload.email,
+      projectDisplayName: proj.displayName,
+      title,
+      note,
+      anchor,
+      page: meta.page,
+      locale: meta.locale,
+      text: meta.text,
+      userAgent: meta.userAgent,
+    });
     try {
       const created = await createLinearIssue(linCreds, { title, description });
       proj.activity = proj.activity || emptyActivity();
       proj.activity.reportsCount = (proj.activity.reportsCount || 0) + 1;
       saveData(data);
+      bustIssuesCache(proj.key);
       console.log(`[gate] issue ${created.identifier || created.id} for ${proj.key} by ${payload.email}`);
       return send(res, 200, { ok: true, issue: created });
     } catch (e) {
       console.error('[gate] linear error:', e.message);
+      return send(res, 502, { error: 'linear-failed', message: e.message });
+    }
+  }
+
+  // v0.9.0: list open issues for the current page so the overlay can render
+  // bubbles. Auth via Authorization: Bearer <jwt>. Page passed as ?page=.
+  // Cache TTL 30s per project — when 50 testers load the same page only the
+  // first call hits Linear.
+  if (method === 'GET' && route === '/api/issues') {
+    if (!rateLimit('issues-list', getClientIp(req), 60, 60_000)) return send(res, 429, { error: 'rate-limited' });
+    const payload = readTesterToken(req);
+    if (!payload || !payload.project) return send(res, 401, { error: 'not-authorized' });
+    const data = loadData();
+    const proj = data.projects[payload.project];
+    if (!proj || proj.status !== 'active') return send(res, 401, { error: 'project-gone' });
+    if (!(proj.users || {})[payload.email]) return send(res, 401, { error: 'revoked' });
+    const linCreds = projectLinear(data, proj);
+    if (!linCreds.apiKey || !linCreds.projectId) return send(res, 503, { error: 'linear-not-configured' });
+    const reqPage = String((parsed.query && parsed.query.page) || '').slice(0, 500);
+    try {
+      const all = await fetchOpenIssuesCached(proj.key, linCreds);
+      const issues = all
+        .map((iss) => {
+          const fc = parseFcMeta(iss.description);
+          if (!fc || fc.v !== 1) return null;
+          if (reqPage && fc.page && fc.page !== reqPage) return null;
+          return {
+            id: iss.id,
+            identifier: iss.identifier,
+            url: iss.url,
+            title: iss.title,
+            note: typeof fc.note === 'string' ? fc.note : '',
+            filer: fc.filer || null,
+            anchor: fc.anchor || null,
+            page: fc.page || null,
+            updatedAt: iss.updatedAt,
+            state: iss.state || null,
+            mine: !!(fc.filer && fc.filer === payload.email),
+          };
+        })
+        .filter(Boolean);
+      return send(res, 200, { issues });
+    } catch (e) {
+      console.error('[gate] linear list error:', e.message);
+      return send(res, 502, { error: 'linear-failed', message: e.message });
+    }
+  }
+
+  // v0.9.0: edit the note (and optionally title) on an issue you filed. Only
+  // the original filer can edit; ownership is enforced from the fc-meta marker
+  // we wrote on creation, not from the JWT alone.
+  const issueEditMatch = route.match(/^\/api\/issues\/([A-Za-z0-9-]{8,})$/);
+  if (method === 'PUT' && issueEditMatch) {
+    if (!rateLimit('issues-edit', getClientIp(req), 20, 60_000)) return send(res, 429, { error: 'rate-limited' });
+    const payload = readTesterToken(req);
+    if (!payload || !payload.project) return send(res, 401, { error: 'not-authorized' });
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+    const data = loadData();
+    const proj = data.projects[payload.project];
+    if (!proj || proj.status !== 'active') return send(res, 401, { error: 'project-gone' });
+    if (!(proj.users || {})[payload.email]) return send(res, 401, { error: 'revoked' });
+    const linCreds = projectLinear(data, proj);
+    if (!linCreds.apiKey) return send(res, 503, { error: 'linear-not-configured' });
+    const issueId = issueEditMatch[1];
+    try {
+      const current = await fetchLinearIssue(linCreds, issueId);
+      if (!current) return send(res, 404, { error: 'no-such-issue' });
+      const fc = parseFcMeta(current.description);
+      if (!fc || fc.v !== 1) return send(res, 409, { error: 'no-fc-meta', message: 'This issue was filed before v0.9.0 and can’t be edited from the overlay.' });
+      if (fc.filer !== payload.email) return send(res, 403, { error: 'not-owner' });
+      const newTitle = typeof body.title === 'string' && body.title.trim() ? trunc(body.title.trim(), 200) : current.title;
+      const newNote = typeof body.note === 'string' ? body.note.trim() : (fc.note || '');
+      const newDescription = buildIssueDescription({
+        filer: fc.filer,
+        projectDisplayName: proj.displayName,
+        title: newTitle,
+        note: newNote,
+        anchor: fc.anchor || null,
+        page: fc.page || null,
+        // Locale, text, userAgent aren't re-collected on edit. Preserve from
+        // the original description tail if you want them; for now drop — they
+        // were point-in-time facts about the original report.
+        locale: null,
+        text: null,
+        userAgent: null,
+      });
+      const updated = await updateLinearIssue(linCreds, issueId, { title: newTitle, description: newDescription });
+      bustIssuesCache(proj.key);
+      return send(res, 200, {
+        ok: true,
+        issue: {
+          id: updated.id,
+          identifier: updated.identifier,
+          url: updated.url,
+          title: updated.title,
+          note: newNote,
+          filer: fc.filer,
+          anchor: fc.anchor || null,
+          page: fc.page || null,
+          updatedAt: updated.updatedAt,
+          state: updated.state || null,
+          mine: true,
+        },
+      });
+    } catch (e) {
+      console.error('[gate] linear update error:', e.message);
       return send(res, 502, { error: 'linear-failed', message: e.message });
     }
   }
