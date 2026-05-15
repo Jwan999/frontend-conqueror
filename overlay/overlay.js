@@ -2043,18 +2043,21 @@
     // Dismiss on outside click. Defer to next tick so the click that opened
     // it doesn't immediately close it.
     //
-    // The panel lives inside a closed shadow root, so events that originate
-    // on its descendants get retargeted at the document boundary: `e.target`
-    // becomes the shadow host, and `panel.contains(e.target)` is false even
-    // for clicks inside the panel. composedPath() walks the real DOM through
-    // the shadow and lets us check membership correctly — without this the
-    // Edit button gets pre-empted by the dismiss handler.
+    // We use a geometric hit-test against the panel/dot bounding rects rather
+    // than DOM membership. The overlay shadow root is `mode: 'closed'`, which
+    // means composedPath() called from a document-level listener does NOT
+    // include nodes inside the shadow (per spec). `panel.contains(e.target)`
+    // is similarly fooled because events retarget to the shadow host at the
+    // document boundary. The bounding-rect approach sidesteps the whole
+    // shadow-traversal problem — click coordinates are coordinates regardless
+    // of which DOM tree the event came from.
     setTimeout(() => {
       fcBubblePanelDismiss = (e) => {
         if (!fcOpenedBubblePanel) return;
-        const path = (typeof e.composedPath === 'function') ? e.composedPath() : [];
-        if (path.includes(fcOpenedBubblePanel)) return;
-        if (path.includes(dot)) return;
+        const hit = (rect) => e.clientX >= rect.left && e.clientX <= rect.right
+                            && e.clientY >= rect.top && e.clientY <= rect.bottom;
+        if (hit(fcOpenedBubblePanel.getBoundingClientRect())) return;
+        if (hit(dot.getBoundingClientRect())) return;
         fcCloseBubblePanel();
       };
       document.addEventListener('mousedown', fcBubblePanelDismiss, true);

@@ -10,6 +10,11 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.9.3] — 2026-05-15
+
+### Fixed
+- **Edit button STILL dismissed the bubble panel after the v0.9.2 `composedPath` attempt.** Per spec, `composedPath()` called from outside a *closed* shadow root **does not include** the nodes inside the shadow — so the document-level dismiss listener saw an empty-ish path, decided the click was outside the panel, and removed it before the Edit button's click handler could fire. Our overlay shadow root is `mode: 'closed'` (a deliberate isolation choice), so neither `Node.contains` nor `composedPath` can detect inside-panel clicks from a document listener. Fix: do a plain geometric hit-test against the panel/dot bounding rects. Click coordinates work the same regardless of which DOM tree the event originated in.
+
 ## [0.9.2] — 2026-05-15
 
 Two UI fixes on top of v0.9.1's data fixes.
