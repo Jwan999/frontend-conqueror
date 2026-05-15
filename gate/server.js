@@ -442,6 +442,20 @@ async function updateLinearIssue(linear, issueId, input) {
   }
   return data.issueUpdate.issue;
 }
+// Linear soft-deletes (moves to trash; recoverable for 30 days). We don't
+// expose an "archive" alternative — testers should think of this as "I
+// reported this by mistake, take it off the board."
+async function deleteLinearIssue(linear, issueId) {
+  const data = await linearGraphQL(
+    linear.apiKey,
+    `mutation($id: String!) { issueDelete(id: $id) { success } }`,
+    { id: issueId },
+  );
+  if (!data.issueDelete || !data.issueDelete.success) {
+    throw new Error('Linear issueDelete rejected: ' + JSON.stringify(data));
+  }
+  return true;
+}
 
 // ---------- fc-meta marker (v0.9.0+) ----------
 // Each issue the gate creates carries a structured HTML-comment marker at the
@@ -817,6 +831,36 @@ async function handle(req, res) {
       });
     } catch (e) {
       console.error('[gate] linear update error:', e.message);
+      return send(res, 502, { error: 'linear-failed', message: e.message });
+    }
+  }
+
+  // v0.9.4: delete an issue you filed. Ownership again enforced from the
+  // fc-meta marker — not the JWT — so a stolen token still can't delete
+  // someone else's issue. Linear's issueDelete is a soft-delete (30-day
+  // trash); admins can restore from the Linear UI if needed.
+  if (method === 'DELETE' && issueEditMatch) {
+    if (!rateLimit('issues-delete', getClientIp(req), 10, 60_000)) return send(res, 429, { error: 'rate-limited' });
+    const payload = readTesterToken(req);
+    if (!payload || !payload.project) return send(res, 401, { error: 'not-authorized' });
+    const data = loadData();
+    const proj = data.projects[payload.project];
+    if (!proj || proj.status !== 'active') return send(res, 401, { error: 'project-gone' });
+    if (!(proj.users || {})[payload.email]) return send(res, 401, { error: 'revoked' });
+    const linCreds = projectLinear(data, proj);
+    if (!linCreds.apiKey) return send(res, 503, { error: 'linear-not-configured' });
+    const issueId = issueEditMatch[1];
+    try {
+      const current = await fetchLinearIssue(linCreds, issueId);
+      if (!current) return send(res, 404, { error: 'no-such-issue' });
+      const fc = parseFcMeta(current.description);
+      if (!fc || fc.v !== 1) return send(res, 409, { error: 'no-fc-meta', message: 'This issue was filed before v0.9.0 and can’t be deleted from the overlay.' });
+      if (fc.filer !== payload.email) return send(res, 403, { error: 'not-owner' });
+      await deleteLinearIssue(linCreds, issueId);
+      bustIssuesCache(proj.key);
+      return send(res, 200, { ok: true });
+    } catch (e) {
+      console.error('[gate] linear delete error:', e.message);
       return send(res, 502, { error: 'linear-failed', message: e.message });
     }
   }

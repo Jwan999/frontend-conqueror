@@ -10,6 +10,12 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.9.4] — 2026-05-15
+
+### Added
+- **Delete button in the bubble panel** alongside Edit. Same ownership rules: only the original filer sees the button, and the gate enforces the same check server-side from the fc-meta marker — a stolen token can't delete someone else's issue. Click → native confirm() → Linear `issueDelete` mutation. Soft-delete (30-day trash); an admin can restore from the Linear UI if it was a mistake. On success the row disappears from the panel locally; if it was the last issue at that anchor, the panel closes and the bubble dot is removed too — no extra Linear round-trip.
+- **`DELETE /api/issues/:id`** on the gate. JWT-bearer-gated, rate-limited (10/min/IP), busts the issues cache so other testers see the deletion on their next refresh.
+
 ## [0.9.3] — 2026-05-15
 
 ### Fixed

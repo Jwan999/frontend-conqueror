@@ -102,6 +102,17 @@
     if (!r.ok) return { ok: false, error: (data && (data.message || data.error)) || 'update-failed', status: r.status };
     return { ok: true, issue: data && data.issue };
   }
+  // v0.9.4: soft-delete (Linear's issueDelete — 30-day trash, admin-recoverable).
+  async function gateDeleteIssue(token, id) {
+    const r = await fetch(`${GATE.url}/api/issues/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': 'Bearer ' + token },
+    });
+    let data = null;
+    try { data = await r.json(); } catch {}
+    if (!r.ok) return { ok: false, error: (data && (data.message || data.error)) || 'delete-failed', status: r.status };
+    return { ok: true };
+  }
 
   // ---------- Heartbeat ----------
   // Lets the gate auto-discover this project and surface activity to the admin.
@@ -535,12 +546,19 @@
     .fc-issue-title { font-weight: 600; color: #111827; margin-bottom: 4px; }
     .fc-issue-note { color: #374151; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
     .fc-issue-edit-btn {
-      margin-top: 6px;
       font: 600 11px/1 inherit;
       padding: 4px 10px; border-radius: 4px; border: 0;
       background: #f3f4f6; color: #111827; cursor: pointer;
     }
     .fc-issue-edit-btn:hover { background: #e5e7eb; }
+    .fc-issue-delete-btn {
+      font: 600 11px/1 inherit;
+      padding: 4px 10px; border-radius: 4px;
+      background: transparent; color: #dc2626;
+      border: 1px solid #fecaca;
+      cursor: pointer;
+    }
+    .fc-issue-delete-btn:hover { background: rgba(220, 38, 38, 0.08); border-color: #fca5a5; }
     .fc-edit-input {
       width: 100%; padding: 6px 8px; margin-bottom: 6px;
       border: 1px solid #d1d5db; border-radius: 4px;
@@ -2110,14 +2128,50 @@
     }
 
     if (iss.mine) {
+      const actions = document.createElement('div');
+      actions.style.cssText = 'display:flex;gap:6px;margin-top:6px;';
       const editBtn = document.createElement('button');
       editBtn.className = 'fc-issue-edit-btn';
       editBtn.textContent = 'Edit';
       editBtn.addEventListener('click', () => fcSwapRowToEdit(row, iss, group, currentUserEmail));
-      row.appendChild(editBtn);
+      actions.appendChild(editBtn);
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'fc-issue-delete-btn';
+      deleteBtn.textContent = 'Delete';
+      deleteBtn.addEventListener('click', () => fcDeleteIssue(row, iss, group));
+      actions.appendChild(deleteBtn);
+      row.appendChild(actions);
     }
 
     return row;
+  }
+  async function fcDeleteIssue(row, iss, group) {
+    if (!window.confirm('Delete ' + (iss.identifier || 'this issue') + ' from Linear?\n\nIt moves to Linear\'s trash for 30 days — an admin can restore it from there if needed.')) return;
+    const session = getStoredGateToken();
+    if (!session) { toast('Session expired. Sign in again.', 'error'); return; }
+    const res = await gateDeleteIssue(session.token, iss.id);
+    if (!res.ok) {
+      toast(res.status === 403 ? 'Only the original filer can delete this.' : (res.error || 'Delete failed.'), 'error');
+      return;
+    }
+    // Local update: drop the row, drop the issue from the group. If that was
+    // the last issue at this anchor, close the panel and remove the dot too —
+    // skips a network round-trip to /api/issues.
+    row.remove();
+    group.issues = group.issues.filter((x) => x.id !== iss.id);
+    if (group.issues.length === 0) {
+      fcCloseBubblePanel();
+      const b = fcBubbles.find((x) => x.group === group);
+      if (b) {
+        b.dot.remove();
+        fcBubbles = fcBubbles.filter((x) => x !== b);
+      }
+    } else if (fcOpenedBubblePanel) {
+      // Update header count.
+      const header = fcOpenedBubblePanel.querySelector('.panel-title');
+      if (header) header.textContent = group.issues.length === 1 ? '1 OPEN ISSUE' : group.issues.length + ' OPEN ISSUES';
+    }
+    toast('Deleted.', 'success');
   }
   function fcSwapRowToEdit(row, iss, group, currentUserEmail) {
     const editRow = document.createElement('div');
