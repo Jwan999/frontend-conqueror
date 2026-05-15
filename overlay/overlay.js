@@ -559,6 +559,15 @@
       cursor: pointer;
     }
     .fc-issue-delete-btn:hover { background: rgba(220, 38, 38, 0.08); border-color: #fca5a5; }
+    /* Red "primary" button used by fcConfirm({ danger: true }) so destructive
+       prompts read as destructive at a glance. */
+    .fc-confirm-danger {
+      background: #dc2626; color: #fff;
+      border: 0; padding: 6px 14px; border-radius: 6px;
+      font: 600 12px/1 inherit; cursor: pointer;
+    }
+    .fc-confirm-danger:hover { background: #b91c1c; }
+    .fc-confirm-danger:focus { outline: 2px solid #fecaca; outline-offset: 2px; }
     .fc-edit-input {
       width: 100%; padding: 6px 8px; margin-bottom: 6px;
       border: 1px solid #d1d5db; border-radius: 4px;
@@ -2146,7 +2155,14 @@
     return row;
   }
   async function fcDeleteIssue(row, iss, group) {
-    if (!window.confirm('Delete ' + (iss.identifier || 'this issue') + ' from Linear?\n\nIt moves to Linear\'s trash for 30 days — an admin can restore it from there if needed.')) return;
+    const ok = await fcConfirm({
+      title: 'DELETE ISSUE',
+      body: 'Delete ' + (iss.identifier || 'this issue') + ' from Linear?\n\nIt moves to Linear\'s trash for 30 days — an admin can restore it from there if needed.',
+      confirmText: 'Delete',
+      cancelText: 'Cancel',
+      danger: true,
+    });
+    if (!ok) return;
     const session = getStoredGateToken();
     if (!session) { toast('Session expired. Sign in again.', 'error'); return; }
     const res = await gateDeleteIssue(session.token, iss.id);
@@ -2154,24 +2170,96 @@
       toast(res.status === 403 ? 'Only the original filer can delete this.' : (res.error || 'Delete failed.'), 'error');
       return;
     }
-    // Local update: drop the row, drop the issue from the group. If that was
-    // the last issue at this anchor, close the panel and remove the dot too —
-    // skips a network round-trip to /api/issues.
+    // Resolve the LIVE bubble entry by anchor identity rather than the
+    // group-object reference we captured at click time. If a window.focus
+    // re-rendered bubbles while the confirm dialog was open (or the user
+    // paused inside it long enough for any other refresh to fire), the
+    // closure's `group` is now an orphan and its `dot` is already detached.
+    // Operating on the live entry guarantees the dot the user actually sees
+    // gets updated.
+    const anchorKey = iss.anchor ? (iss.anchor.file + ':' + iss.anchor.offset) : null;
+    const liveB = anchorKey ? fcBubbles.find((x) => x.anchorKey === anchorKey) : null;
+    const liveGroup = liveB ? liveB.group : group;
     row.remove();
-    group.issues = group.issues.filter((x) => x.id !== iss.id);
-    if (group.issues.length === 0) {
+    liveGroup.issues = liveGroup.issues.filter((x) => x.id !== iss.id);
+    if (liveGroup.issues.length === 0) {
       fcCloseBubblePanel();
-      const b = fcBubbles.find((x) => x.group === group);
-      if (b) {
-        b.dot.remove();
-        fcBubbles = fcBubbles.filter((x) => x !== b);
+      if (liveB) {
+        liveB.dot.remove();
+        fcBubbles = fcBubbles.filter((x) => x !== liveB);
       }
-    } else if (fcOpenedBubblePanel) {
-      // Update header count.
-      const header = fcOpenedBubblePanel.querySelector('.panel-title');
-      if (header) header.textContent = group.issues.length === 1 ? '1 OPEN ISSUE' : group.issues.length + ' OPEN ISSUES';
+    } else {
+      if (liveB) {
+        liveB.dot.textContent = liveGroup.issues.length > 1 ? String(liveGroup.issues.length) : '';
+        liveB.dot.title = liveGroup.issues.length === 1 ? liveGroup.issues[0].title : liveGroup.issues.length + ' open issues';
+      }
+      if (fcOpenedBubblePanel) {
+        const header = fcOpenedBubblePanel.querySelector('.panel-title');
+        if (header) header.textContent = liveGroup.issues.length === 1 ? '1 OPEN ISSUE' : liveGroup.issues.length + ' OPEN ISSUES';
+      }
     }
     toast('Deleted.', 'success');
+    // Backstop: re-sync from server in case anything diverged. Cache was just
+    // busted by the gate, so this hits Linear fresh.
+    fcRefreshBubbles();
+  }
+  // Styled, in-shadow confirm dialog. Returns Promise<boolean>. Replaces
+  // window.confirm() so destructive prompts match the overlay's look.
+  function fcConfirm({ title, body, confirmText = 'OK', cancelText = 'Cancel', danger = false }) {
+    return new Promise((resolve) => {
+      const backdrop = document.createElement('div');
+      backdrop.className = 'palette-backdrop';
+
+      const panel = document.createElement('div');
+      panel.className = 'panel';
+      panel.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:400px;';
+      panel.addEventListener('click', (e) => e.stopPropagation());
+
+      const t = document.createElement('div');
+      t.className = 'panel-title';
+      t.textContent = title;
+      panel.appendChild(t);
+
+      const b = document.createElement('div');
+      b.style.cssText = 'font-size:13px;line-height:1.5;color:#374151;margin-bottom:14px;white-space:pre-wrap;';
+      b.textContent = body;
+      panel.appendChild(b);
+
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;';
+
+      const cancelBtn = document.createElement('button');
+      cancelBtn.className = 'cancel';
+      cancelBtn.textContent = cancelText;
+
+      const confirmBtn = document.createElement('button');
+      confirmBtn.className = danger ? 'fc-confirm-danger' : 'save';
+      confirmBtn.textContent = confirmText;
+
+      row.appendChild(cancelBtn);
+      row.appendChild(confirmBtn);
+      panel.appendChild(row);
+      backdrop.appendChild(panel);
+      shadow.appendChild(backdrop);
+
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        window.removeEventListener('keydown', onKey, true);
+        backdrop.remove();
+        resolve(val);
+      };
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+        else if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      };
+      cancelBtn.addEventListener('click', () => finish(false));
+      confirmBtn.addEventListener('click', () => finish(true));
+      backdrop.addEventListener('click', () => finish(false));
+      window.addEventListener('keydown', onKey, true);
+      setTimeout(() => confirmBtn.focus(), 50);
+    });
   }
   function fcSwapRowToEdit(row, iss, group, currentUserEmail) {
     const editRow = document.createElement('div');
@@ -2512,6 +2600,25 @@
     window.addEventListener('scroll', onScrollOrResize, true);
     window.addEventListener('resize', onScrollOrResize, true);
     if (modeKey === 'test') fcRefreshBubbles();
+    fcSaveMode(modeKey);
+  }
+  // v0.9.5: persist the active mode across page navigation + reload so testers
+  // don't lose Test mode every time they click an internal link. Tab-scoped
+  // (sessionStorage) — when the tab closes, the mode resets. Only restored if
+  // the saved mode is still in the overlay's enabled list (prod overlays
+  // restrict to ['test']).
+  const FC_MODE_STORAGE_KEY = '__fc_mode';
+  function fcSaveMode(modeKey) {
+    try {
+      if (modeKey) sessionStorage.setItem(FC_MODE_STORAGE_KEY, modeKey);
+      else sessionStorage.removeItem(FC_MODE_STORAGE_KEY);
+    } catch {}
+  }
+  function fcRestoreMode() {
+    try {
+      const saved = sessionStorage.getItem(FC_MODE_STORAGE_KEY);
+      if (saved && ENABLED.has(saved)) setMode(saved);
+    } catch {}
   }
 
   // ---------- Mode palette (Shift-Shift) ----------
@@ -2609,26 +2716,33 @@
   }, true);
 
   // ---------- Activation: Shift-Shift mode palette + legacy ⌘+Shift+E ----------
+  // v0.9.5: when a mode is already active, shift-shift now toggles it OFF.
+  // When no mode is active, it opens the picker. This matches the mental
+  // model "double-shift is the on/off switch" and lets users exit without
+  // hunting for Esc on a page that may have its own keyboard handlers.
   let lastShiftAt = 0;
   window.addEventListener('keydown', (e) => {
-    // Shift-Shift double-tap (≤300 ms) — opens the mode picker palette.
     if (e.key === 'Shift' && !e.metaKey && !e.ctrlKey && !e.altKey) {
       const now = Date.now();
       if (now - lastShiftAt < 300) {
         lastShiftAt = 0;
         e.preventDefault();
-        openModePalette();
+        if (activeMode) setMode(null);
+        else openModePalette();
         return;
       }
       lastShiftAt = now;
       return;
     }
-    // Esc exits any active mode.
+    // Esc still exits any active mode (keeps existing power-user shortcut).
     if (e.key === 'Escape' && activeMode && !editingTarget && !activePicker) {
-      // Only if no editor panel is open (Esc inside panel closes the panel)
       setMode(null);
     }
   });
+
+  // Restore the persisted mode on load. Deferred to next macrotask so all the
+  // module-level functions and event listeners are wired up first.
+  setTimeout(fcRestoreMode, 0);
 
   // While an editor panel is open, swallow any keydown that originated inside
   // our shadow DOM at the capture phase so page-level handlers (e.g., arrow-key

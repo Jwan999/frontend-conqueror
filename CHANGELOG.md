@@ -10,6 +10,16 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.9.5] — 2026-05-15
+
+### Added
+- **Mode persists across navigation + reload** (tab-scoped via sessionStorage). Click an internal link, accidentally hit F5, or paste a deep URL — Test mode stays on. When the tab closes, the mode clears. The saved mode is only restored if it's still in the overlay's `enabledModes` list, so a prod overlay that ships `['test']` never restores a stale `'edit'` saved from dev.
+- **Shift-Shift now toggles the active mode off.** Same shortcut, dual purpose: with no mode active it opens the picker palette (existing behavior); with a mode active it exits. Matches "double-shift is the on/off switch" mental model. The Escape shortcut still exits — kept for power-user muscle memory.
+- **Styled confirm dialog** (`fcConfirm`) replacing `window.confirm()` for destructive prompts. Matches the overlay's panel aesthetic — title, body, [Cancel] / [Delete] buttons, Enter to confirm, Escape/backdrop to cancel. Reusable across any future destructive action.
+
+### Fixed
+- **Deleted issue's bubble dot didn't disappear until refresh.** The local-update path looked up the live bubble entry by *object reference* (`x.group === group`). If anything triggered `fcRefreshBubbles` between the panel opening and the confirm-dialog being acknowledged — most commonly `window.focus` if the user paused on the dialog — the closure's captured `group` is suddenly an orphan and its `dot` is detached from the DOM. The local update operated on the orphan; the freshly-rendered visible dot stayed put. Fix: look up the live entry by anchor identity (`x.anchorKey === file + ":" + offset`). A second-pass `fcRefreshBubbles()` runs as a backstop after a successful delete in case something else diverged.
+
 ## [0.9.4] — 2026-05-15
 
 ### Added
