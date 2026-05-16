@@ -223,11 +223,29 @@ Tell your tester:
 
 1. Visit the prod site (`https://my-domain.com`).
 2. Press **Shift Shift**.
-3. Pick **Test** in the palette.
+3. Pick **Test** in the palette (in production this step is skipped — Test is the only mode and Shift-Shift toggles it directly).
 4. Sign in with the email **and password** you set for them in the gate admin.
 5. Hover the component that's broken → click → fill in the report → submit.
 
 The issue lands in Linear within ~1 second, with the page URL, component hint, and reporter email attached. The tester sees a green confirmation. After 5 wrong passwords for the same email the gate locks that email out for 15 minutes — reset the password in the admin to clear it.
+
+---
+
+## For testers
+
+The message you paste to a teammate the first time you invite them. Customise the project name + URL.
+
+> **You're invited to file bug reports on `<your-site>` from inside the page itself.**
+>
+> 1. Go to **`https://<your-site>`**.
+> 2. Press **Shift twice in a row** (within ~300 ms). An orange border around the page means Test mode is on. Press Shift Shift again to exit. (The mode stays on if you click internal links or accidentally refresh.)
+> 3. The first time you click something, you'll be asked to sign in. Use the email + password I'll DM you. If you forget the password, ping me — I'll reset it.
+> 4. Click any component on the page → describe the bug → **Send to Linear**. A small chat-bubble icon appears at the top-right of that component within ~1 second. Click the icon to re-read the issue, **Edit** your note, or **Delete** if you reported by mistake.
+> 5. Anyone in Test mode sees everyone's bubbles. You can only edit/delete the ones you filed.
+> 6. **Colour code:** amber = newly filed, blue = triaged and queued, green = in progress or in review. When I move an issue to **Done** in Linear, your bubble disappears the next time you focus the tab and you'll get a quick toast.
+> 7. **Five wrong passwords = 15-minute lockout** on that email. Just ping me to unlock.
+
+That's the whole flow. Filing a bug takes about 20 seconds end-to-end.
 
 ---
 
