@@ -10,6 +10,18 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.9.8] — 2026-05-24
+
+Admin-UI polish for the auto-discovery → configure flow. Gate-only release — overlay and plugin are byte-identical to v0.9.7, so consumer projects don't strictly need to bump (though they should, to stay in sync).
+
+### Added
+- **Configure → button on pending project cards.** Sits next to the "pending" pill on each card in the project list. One click jumps straight to the 2-step wizard, skipping the previous detour through the project detail page. The click intercepts the card's outer anchor so it doesn't navigate to detail by accident.
+- **"Used by X, Y" suffix on Linear destination options** in both places that pick one: the project-configure wizard's existing-project `<select>`, and the changeLinearProject prompt. Now you can tell at a glance whether picking "Q3 Bugs" means "shared with tawtheef" vs "fresh destination" — instead of guessing or hunting through other projects' detail pages.
+- **Richer auto-detect banner on pending projects' detail page** — names the most-active origin, total heartbeat count, and time since first heartbeat. Replaces the old generic "auto-detected from a heartbeat" copy. Helps confirm the plugin is wired up to the right gate project key before you commit to configuring it.
+
+### Internal
+- New `fcUsedByMap(excludeKey)` admin-side helper builds the projectId → list-of-gate-projects-using-it map from STATE.projects. Reused by both the prompt and the select-population paths.
+
 ## [0.9.7] — 2026-05-15
 
 A focused polish pass turning v0.9.x's bubble feature into something a team can actually live with day-to-day. Eleven changes in one bundle — perceived latency, security, scale, and UX legibility.

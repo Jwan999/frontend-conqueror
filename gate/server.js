@@ -1728,14 +1728,34 @@ function renderList() {
       \` : ''}
     </main>\`;
 }
+// v0.9.8: for each Linear projectId currently used as a gate destination,
+// return the list of gate-project display names using it. excludeKey skips
+// self so the "Change Linear destination" UI on project X doesn't list X
+// itself as a user of its own destination.
+function fcUsedByMap(excludeKey) {
+  const m = new Map();
+  for (const proj of (STATE && STATE.projects) || []) {
+    if (!proj.linearProjectId) continue;
+    if (excludeKey && proj.key === excludeKey) continue;
+    if (!m.has(proj.linearProjectId)) m.set(proj.linearProjectId, []);
+    m.get(proj.linearProjectId).push(proj.displayName);
+  }
+  return m;
+}
 function projectCard(p) {
   const lastSeen = p.activity.lastSeenAt ? relTime(p.activity.lastSeenAt) : 'never';
   const linearDest = p.linearProjectName || (p.status === 'pending' ? '(needs configuring)' : '(not set)');
+  // v0.9.8: surface the Configure action directly on pending cards so the
+  // pending → active flow is one click from the list view (used to require
+  // clicking into the detail page first).
+  const configureBtn = p.status === 'pending'
+    ? '<button class="primary" style="font-size:11px;padding:5px 12px;margin-right:8px;" onclick="event.preventDefault();event.stopPropagation();go(\\'#/p/' + esc(p.key) + '/configure\\');return false;">Configure →</button>'
+    : '';
   return html\`
     <a class="project-card \${p.status}" href="#/p/\${esc(p.key)}">
       <div class="title">
         <span class="name">\${esc(p.displayName)} <span class="sub-muted" style="font-weight:normal;font-size:12px;margin-left:6px;">\${esc(p.key)}</span></span>
-        <span class="pill \${p.status} dot">\${p.status}</span>
+        <span style="display:flex;align-items:center;">\${configureBtn}<span class="pill \${p.status} dot">\${p.status}</span></span>
       </div>
       <div class="meta">
         <span>📬 \${p.usersCount} \${p.usersCount === 1 ? 'tester' : 'testers'}\${p.usersNeedingPassword > 0 ? ' (' + p.usersNeedingPassword + ' need password)' : ''}</span>
@@ -1771,6 +1791,11 @@ async function renderProjectDetail(key) {
   const needsConfig = detail.status === 'pending' || !detail.linearProjectId || detail.usersCount === 0;
   const overlayTag = '<' + 'script src="' + location.origin + '/' + detail.key + '/overlay.js" defer><' + '/script>';
   const pluginCfg = "gate: { url: '" + location.origin + "', project: '" + detail.key + "' }";
+  // v0.9.8: pull the busiest origin so the auto-detect banner can name it.
+  const _origins = (detail.activity && detail.activity.origins) || {};
+  const _topOriginEntry = Object.entries(_origins).sort((a, b) => b[1] - a[1])[0];
+  const _topOrigin = _topOriginEntry ? _topOriginEntry[0] : null;
+  const _topOriginHits = _topOriginEntry ? _topOriginEntry[1] : 0;
 
   root().innerHTML = html\`
     <header>
@@ -1786,8 +1811,14 @@ async function renderProjectDetail(key) {
 
       \${needsConfig ? html\`
         <div class="card" style="border-left:3px solid var(--warn);">
-          <h3>Finish configuring this project</h3>
-          <div class="body sub-muted">This project was auto-detected from a heartbeat or just created. It won't accept bug reports until it has a Linear destination and at least one tester email.</div>
+          <h3>\${detail.status === 'pending' ? '⚡ Auto-detected — finish setup' : '⚙ Finish configuring this project'}</h3>
+          \${detail.status === 'pending' && detail.activity.firstSeenAt ? html\`
+            <div class="body" style="font-size:13px;margin-bottom:6px;">
+              Heartbeats started arriving <strong>\${esc(relTime(detail.activity.firstSeenAt))}</strong> — <strong>\${detail.activity.totalHeartbeats}</strong> total so far.
+              \${_topOrigin ? '<br>Most-active origin: <code>' + esc(_topOrigin) + '</code> (' + _topOriginHits + ' ' + (_topOriginHits === 1 ? 'hit' : 'hits') + ').' : ''}
+            </div>
+          \` : ''}
+          <div class="body sub-muted">This project won't accept bug reports until it has a Linear destination and at least one tester.</div>
           <div class="row" style="justify-content:flex-end;margin-top:10px;">
             <button class="primary" onclick="(()=>go('#/p/' + \${JSON.stringify(detail.key)} + '/configure'))()">Configure now →</button>
           </div>
@@ -1895,7 +1926,13 @@ async function renderProjectDetail(key) {
 window.changeLinearProject = async function(key) {
   let projects;
   try { projects = (await api('GET', '/frontend-conqueror/linear/projects')).projects || []; } catch (e) { return toast(e.message, 'err'); }
-  const lines = projects.map((p, i) => (i + 1) + ') ' + p.name).join('\\n');
+  // v0.9.8: surface which gate projects are already using each Linear
+  // destination so reuse is obvious from the picker.
+  const usedBy = fcUsedByMap(key);
+  const lines = projects.map((p, i) => {
+    const u = usedBy.get(p.id);
+    return (i + 1) + ') ' + p.name + (u && u.length > 0 ? ' [used by: ' + u.join(', ') + ']' : '');
+  }).join('\\n');
   const choice = prompt('Pick a Linear project number, or type a name to create new:\\n\\n' + lines);
   if (!choice) return;
   const n = parseInt(choice, 10);
@@ -1977,11 +2014,16 @@ async function renderProjectWizard(key) {
         let projects = [];
         try { projects = (await api('GET', '/frontend-conqueror/linear/projects')).projects || []; }
         catch (e) { return ($('projLoad').textContent = e.message); }
+        const usedBy = fcUsedByMap(detail.key);
         $('projLoad').outerHTML = html\`
           <label for="existing">Existing Linear project</label>
           <select id="existing">
             <option value="">— pick one —</option>
-            \${projects.map(p => '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>').join('')}
+            \${projects.map(p => {
+              const u = usedBy.get(p.id);
+              const label = p.name + (u && u.length > 0 ? ' (used by ' + u.join(', ') + ')' : '');
+              return '<option value="' + esc(p.id) + '">' + esc(label) + '</option>';
+            }).join('')}
           </select>
           <div style="text-align:center;color:var(--muted);margin:14px 0;font-size:12px;">— or —</div>
           <label for="newName">Create a new Linear project</label>
