@@ -1827,6 +1827,20 @@
       if (node.getAttribute) {
         const v = node.getAttribute('data-edit-source');
         if (v) {
+          // v0.10.0+ format: file:offset:line:column (4 trailing numbers)
+          // Pre-v0.10.0 format: file:offset (1 trailing number)
+          // File path itself can contain ':' on Windows so we parse from
+          // the right rather than splitting blindly.
+          const parts = v.split(':');
+          if (parts.length >= 4) {
+            const col = Number(parts[parts.length - 1]);
+            const line = Number(parts[parts.length - 2]);
+            const offset = Number(parts[parts.length - 3]);
+            if (Number.isFinite(col) && Number.isFinite(line) && Number.isFinite(offset)) {
+              return { file: parts.slice(0, parts.length - 3).join(':'), offset, line, column: col };
+            }
+          }
+          // Legacy 2-part fallback.
           const i = v.lastIndexOf(':');
           if (i < 0) return null;
           const file = v.slice(0, i);
@@ -2723,9 +2737,16 @@
         description: ta.value.trim(),
         meta: {
           // v0.9.0+: structured anchor for the bubble feature. The gate persists
-          // this in an fc-meta marker on the Linear description so subsequent
-          // page loads can find this element again via [data-edit-source].
-          anchor: src ? { file: src.file, offset: src.offset } : null,
+          // this in an fc-meta marker on the description so subsequent page
+          // loads can find this element again via [data-edit-source].
+          // v0.10.0+: also includes line + column so the gate can emit
+          // IDE-clickable "file:line:col" in the visible issue body.
+          anchor: src ? {
+            file: src.file,
+            offset: src.offset,
+            line: src.line != null ? src.line : null,
+            column: src.column != null ? src.column : null,
+          } : null,
           where: src ? `${src.file}:${src.offset}` : null,
           page: location.pathname + location.search,
           locale: getActiveLocale(),
@@ -2762,7 +2783,12 @@
           title: titleVal,
           note: ta.value.trim(),
           filer: session.email,
-          anchor: src ? { file: src.file, offset: src.offset } : null,
+          anchor: src ? {
+            file: src.file,
+            offset: src.offset,
+            line: src.line != null ? src.line : null,
+            column: src.column != null ? src.column : null,
+          } : null,
           page: location.pathname + location.search,
           updatedAt: new Date().toISOString(),
           state: { name: 'Backlog', type: 'unstarted' },

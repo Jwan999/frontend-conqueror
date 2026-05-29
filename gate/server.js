@@ -48,6 +48,7 @@ const DEFAULT_MODE_COLORS = { edit: '#2563eb', test: '#f59e0b', todo: '#059669' 
 const DEFAULT_DATA = () => ({
   modeColors: { ...DEFAULT_MODE_COLORS },
   linear: null,    // { apiKey, teamId, teamName, availableTeams }
+  github: null,    // v0.10.0+: { token } — global PAT used as a fallback when a project has no per-project token
   projects: {},
 });
 function emptyActivity() {
@@ -67,10 +68,16 @@ function emptyProject(key, displayName) {
     displayName: displayName || key,
     status: 'pending',                   // pending | active | disabled
     users: {},                           // { [email]: { passwordHash, createdAt, lastLoginAt, lockedUntil } }
+    // v0.10.0+: which tracker this project writes to.
+    backend: 'linear',                   // 'linear' | 'github'
+    // Linear-specific (used when backend === 'linear')
     linearProjectId: '',
     linearProjectName: '',
     linearApiKey: null,                  // per-project override
     linearTeamId: null,
+    // GitHub-specific (used when backend === 'github')
+    githubRepo: '',                      // 'owner/repo'
+    githubToken: null,                   // per-project override; otherwise inherits global
     activity: emptyActivity(),
     createdAt: Math.floor(Date.now() / 1000),
   };
@@ -149,9 +156,13 @@ function loadData() {
   if (!data.modeColors) data.modeColors = { ...DEFAULT_MODE_COLORS };
   if (!data.projects) data.projects = {};
   if (data.linear === undefined) data.linear = null;
+  if (data.github === undefined) data.github = null;
 
   // v0.8.0 migration: convert per-project emails[] to users{} (with no
   // password — admin must set one). Idempotent — leaves existing users{} alone.
+  // v0.10.0 migration: default backend='linear' on any project that doesn't
+  // have one (i.e., existed before the GitHub feature). New projects get
+  // backend assigned in the wizard.
   for (const proj of Object.values(data.projects)) {
     if (!proj) continue;
     if (!proj.users) proj.users = {};
@@ -162,6 +173,9 @@ function loadData() {
       }
       delete proj.emails;
     }
+    if (!proj.backend) proj.backend = 'linear';
+    if (proj.githubRepo === undefined) proj.githubRepo = '';
+    if (proj.githubToken === undefined) proj.githubToken = null;
   }
   return data;
 }
@@ -197,6 +211,12 @@ function projectLinear(data, proj) {
     projectId: proj.linearProjectId || '',
     projectName: proj.linearProjectName || '',
   };
+}
+// v0.10.0+: resolve GitHub credentials for a project. Per-project token wins;
+// falls back to the gate-wide token. Repo is project-scoped only.
+function projectGithub(data, proj) {
+  const token = proj.githubToken || (data.github && data.github.token) || null;
+  return { token, repo: proj.githubRepo || '' };
 }
 // SHA-256 of an IP + the gate's daily salt. Daily salt rotates each UTC day,
 // so we can compute unique-IP counts without storing raw IPs.
@@ -484,6 +504,151 @@ async function deleteLinearIssue(linear, issueId) {
   return true;
 }
 
+// ---------- GitHub (v0.10.0+) ----------
+// All gate↔GitHub traffic goes through here. The rest of the gate doesn't
+// know which backend a project uses — request handlers branch on proj.backend
+// and call either the Linear or the GitHub helpers.
+//
+// All bug Issues the gate creates carry the `fc:bug` label so we can filter
+// them out from manually-filed Issues in the repo (otherwise every Issue in
+// the repo would render a bubble on the page).
+const FC_BUG_LABEL = 'fc:bug';
+const GITHUB_API = 'https://api.github.com';
+async function githubREST(token, method, pathAndQuery, body) {
+  const r = await fetch(GITHUB_API + pathAndQuery, {
+    method,
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Accept': 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'frontend-conqueror-gate',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await r.text();
+  let data = null; try { data = text ? JSON.parse(text) : null; } catch {}
+  if (!r.ok) {
+    const msg = (data && data.message) || r.statusText;
+    throw new Error(`GitHub ${method} ${pathAndQuery} → ${r.status}: ${msg}`);
+  }
+  return data;
+}
+// Parse "owner/repo" → { owner, repo }. Throws on malformed input.
+function parseGithubRepo(s) {
+  const m = String(s || '').match(/^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/);
+  if (!m) throw new Error('GitHub repo must be in the form "owner/repo" — got "' + s + '"');
+  return { owner: m[1], repo: m[2] };
+}
+// Best-effort: the label exists if we 200 on the GET, otherwise we POST to
+// create it. Idempotent — only fires once per gate boot per repo.
+const _ghLabelEnsured = new Set();
+async function ensureFcBugLabel(token, owner, repo) {
+  const key = owner + '/' + repo;
+  if (_ghLabelEnsured.has(key)) return;
+  try {
+    await githubREST(token, 'GET', `/repos/${owner}/${repo}/labels/${encodeURIComponent(FC_BUG_LABEL)}`);
+  } catch {
+    try {
+      await githubREST(token, 'POST', `/repos/${owner}/${repo}/labels`, {
+        name: FC_BUG_LABEL,
+        color: 'f59e0b',
+        description: 'Filed via frontend-conqueror Test mode (auto-managed).',
+      });
+    } catch (e) {
+      // If both fail, the issues we file just don't get tagged — they'll
+      // still appear in the list query (we fall back to filtering by fc-meta
+      // marker in the body). Don't bomb on labels alone.
+      console.warn('[gate] could not ensure fc:bug label on ' + key + ':', e.message);
+    }
+  }
+  _ghLabelEnsured.add(key);
+}
+// Open issues tagged fc:bug in the project's repo. Paginates via the Link
+// header up to a 500-issue cap (5 × 100, same as the Linear path).
+async function fetchGithubOpenIssues(token, repoStr) {
+  if (!token || !repoStr) return [];
+  const { owner, repo } = parseGithubRepo(repoStr);
+  let all = [];
+  for (let page = 1; page <= 5; page++) {
+    const data = await githubREST(token, 'GET',
+      `/repos/${owner}/${repo}/issues?state=open&labels=${encodeURIComponent(FC_BUG_LABEL)}&per_page=100&page=${page}`);
+    const arr = Array.isArray(data) ? data : [];
+    // /issues endpoint also returns PRs; skip them.
+    const issues = arr.filter((x) => !x.pull_request);
+    all = all.concat(issues);
+    if (arr.length < 100) break;
+  }
+  return all;
+}
+async function fetchGithubIssue(token, repoStr, number) {
+  if (!token || !repoStr) return null;
+  const { owner, repo } = parseGithubRepo(repoStr);
+  try { return await githubREST(token, 'GET', `/repos/${owner}/${repo}/issues/${number}`); }
+  catch { return null; }
+}
+async function createGithubIssue(token, repoStr, { title, body }) {
+  const { owner, repo } = parseGithubRepo(repoStr);
+  await ensureFcBugLabel(token, owner, repo);
+  return await githubREST(token, 'POST', `/repos/${owner}/${repo}/issues`, {
+    title, body, labels: [FC_BUG_LABEL],
+  });
+}
+async function updateGithubIssue(token, repoStr, number, { title, body }) {
+  const { owner, repo } = parseGithubRepo(repoStr);
+  return await githubREST(token, 'PATCH', `/repos/${owner}/${repo}/issues/${number}`, { title, body });
+}
+// GitHub doesn't allow true deletion (only admins via GraphQL `deleteIssue`,
+// and even that's not exposed via PATs). "Delete" maps to "close as not
+// planned" — the bubble disappears (closed issues are filtered out) and the
+// record is preserved with intent.
+async function deleteGithubIssue(token, repoStr, number) {
+  const { owner, repo } = parseGithubRepo(repoStr);
+  return await githubREST(token, 'PATCH', `/repos/${owner}/${repo}/issues/${number}`, {
+    state: 'closed', state_reason: 'not_planned',
+  });
+}
+// Convert a GitHub Issue into the same shape the overlay/admin already expect
+// from the Linear path: id is the GitHub node_id (opaque string), identifier
+// is "#NN" (or use the issue number as plain string), state.type is one of
+// backlog/unstarted/started by inspecting workflow labels. The overlay uses
+// state.type for bubble color; everything else is for human display.
+function _ghStateFromLabels(issue) {
+  const names = ((issue.labels || []).map((l) => (typeof l === 'string' ? l : l.name)) || []);
+  if (names.includes('fc:in-progress')) return { name: 'In Progress', type: 'started' };
+  if (names.includes('fc:in-review')) return { name: 'In Review', type: 'started' };
+  if (names.includes('fc:todo')) return { name: 'Todo', type: 'unstarted' };
+  return { name: 'Open', type: 'backlog' };
+}
+function normalizeGithubIssue(issue, repoStr) {
+  return {
+    // Encode the (repo, number) tuple so PUT/DELETE handlers can decode the
+    // id back into "which repo + which issue number" without storing extra
+    // state. base64url keeps it URL-safe inside the /api/issues/:id route.
+    id: ghEncodeIssueId(repoStr, issue.number),
+    identifier: '#' + issue.number,
+    url: issue.html_url,
+    title: issue.title,
+    description: issue.body || '',
+    updatedAt: issue.updated_at,
+    state: _ghStateFromLabels(issue),
+  };
+}
+function ghEncodeIssueId(repoStr, number) {
+  return 'gh-' + Buffer.from(repoStr + '#' + number, 'utf8').toString('base64url');
+}
+function ghDecodeIssueId(id) {
+  if (typeof id !== 'string' || !id.startsWith('gh-')) return null;
+  try {
+    const decoded = Buffer.from(id.slice(3), 'base64url').toString('utf8');
+    const hash = decoded.lastIndexOf('#');
+    if (hash < 0) return null;
+    const number = parseInt(decoded.slice(hash + 1), 10);
+    if (!Number.isFinite(number)) return null;
+    return { repo: decoded.slice(0, hash), number };
+  } catch { return null; }
+}
+
 // ---------- fc-meta marker (v0.9.0+) ----------
 // Each issue the gate creates carries a structured HTML-comment marker at the
 // end of its description. This lets the overlay recover the element anchor and
@@ -524,7 +689,16 @@ function parseFcMeta(description) {
 function normalizeAnchor(rawAnchor, rawWhere) {
   if (rawAnchor && typeof rawAnchor === 'object' && typeof rawAnchor.file === 'string') {
     const off = Number(rawAnchor.offset);
-    if (Number.isFinite(off)) return { file: rawAnchor.file, offset: off };
+    if (Number.isFinite(off)) {
+      const a = { file: rawAnchor.file, offset: off };
+      // v0.10.0+: optional line+column from the plugin-emitted
+      // data-edit-source attribute. Used to build IDE-clickable Where lines.
+      const line = Number(rawAnchor.line);
+      const col = Number(rawAnchor.column);
+      if (Number.isFinite(line)) a.line = line;
+      if (Number.isFinite(col)) a.column = col;
+      return a;
+    }
   }
   if (typeof rawWhere === 'string') {
     const i = rawWhere.lastIndexOf(':');
@@ -537,25 +711,32 @@ function normalizeAnchor(rawAnchor, rawWhere) {
   return null;
 }
 function buildIssueDescription({ filer, projectDisplayName, title, note, anchor, page, locale, text, userAgent }) {
-  const where = anchor ? `${anchor.file}:${anchor.offset}` : null;
+  // v0.10.0+: rewritten to use clean ## Markdown sections that humans AND
+  // Claude Code / scripted readers can extract deterministically. The visible
+  // "Where" line uses file:line:column so terminals / editors treat it as a
+  // jump target; the byte offset stays inside the hidden fc-meta marker for
+  // the overlay's bubble matching.
+  const whereForHuman = anchor
+    ? (anchor.line != null && anchor.column != null
+        ? `${anchor.file}:${anchor.line}:${anchor.column}`
+        : `${anchor.file}:${anchor.offset}`)
+    : null;
   const meta = { v: 1, anchor: anchor || null, page: page || null, filer, title: title || '', note: note || '' };
-  // base64-encode so Linear's auto-linker can't see the @ in the filer email
-  // and rewrite the JSON into a broken Markdown link.
   const metaB64 = Buffer.from(JSON.stringify(meta), 'utf8').toString('base64');
-  return [
-    `**Reported via Test Mode** by \`${filer}\` for project \`${projectDisplayName}\``,
-    '',
-    note || '',
-    '',
+  const sections = [
+    `**Reported via Test Mode** by \`${filer}\` for project \`${projectDisplayName}\`.`,
+    note ? '## What\'s wrong\n\n' + note : '',
+    whereForHuman ? '## Where\n\n`' + whereForHuman + '`' : '',
+    page ? '## Page\n\n' + page : '',
+    text || locale ? '## What the tester saw\n\n' + [
+      text ? '"' + trunc(text, 200) + '"' : '',
+      locale ? '(locale: `' + locale + '`)' : '',
+    ].filter(Boolean).join(' ') : '',
+    userAgent ? '## User agent\n\n`' + userAgent + '`' : '',
     '---',
-    where ? `**Where:** \`${where}\`` : '',
-    page ? `**Page:** ${page}` : '',
-    locale ? `**Locale:** ${locale}` : '',
-    text ? `**Text:** "${trunc(text, 200)}"` : '',
-    userAgent ? `**UA:** ${userAgent}` : '',
-    '',
     `<!-- fc-meta-b64: ${metaB64} -->`,
-  ].filter((line) => line !== '').join('\n');
+  ].filter((s) => s !== '');
+  return sections.join('\n\n');
 }
 
 // ---------- Issues cache ----------
@@ -573,6 +754,28 @@ async function fetchOpenIssuesCached(projKey, linCreds) {
   return issues;
 }
 function bustIssuesCache(projKey) { issuesCache.delete(projKey); }
+// v0.10.0: backend-aware fetch wrapper. Reads from the cache (30s TTL keyed by
+// project key) and dispatches to the right backend on miss. The cache key is
+// project-scoped, so changing a project's backend automatically segregates
+// its cached results from the previous backend's.
+async function fetchOpenIssuesForProject(data, proj) {
+  const cached = issuesCache.get(proj.key);
+  const now = Date.now();
+  if (cached && now - cached.fetchedAt < ISSUES_CACHE_TTL_MS) return cached.issues;
+  let issues = [];
+  if (proj.backend === 'github') {
+    const gh = projectGithub(data, proj);
+    if (!gh.token || !gh.repo) return [];
+    const raw = await fetchGithubOpenIssues(gh.token, gh.repo);
+    issues = raw.map((iss) => normalizeGithubIssue(iss, gh.repo));
+  } else {
+    const lin = projectLinear(data, proj);
+    if (!lin.apiKey || !lin.projectId) return [];
+    issues = await fetchLinearOpenIssues(lin);
+  }
+  issuesCache.set(proj.key, { fetchedAt: now, issues });
+  return issues;
+}
 
 // Tester JWT lookup for the new bubble endpoints. Bearer-only — the report-issue
 // endpoint kept its body-token shape for back-compat, but new endpoints pick
@@ -593,6 +796,11 @@ function publicLinear(linear) {
     availableTeams: linear.availableTeams || null,
   };
 }
+// v0.10.0+: hide PAT, surface only the username that owns it.
+function publicGithub(github) {
+  if (!github) return null;
+  return { hasToken: !!github.token, username: github.username || '' };
+}
 // Per-project summary for the admin list (no allowlist values leaked here).
 function publicProjectSummary(p) {
   const a = p.activity || emptyActivity();
@@ -605,8 +813,11 @@ function publicProjectSummary(p) {
     status: p.status,
     usersCount: userCount,
     usersNeedingPassword: usersWithoutPassword,
+    backend: p.backend || 'linear',
     linearProjectName: p.linearProjectName || '',
     hasLinearOverride: !!(p.linearApiKey || p.linearTeamId),
+    githubRepo: p.githubRepo || '',
+    hasGithubOverride: !!p.githubToken,
     activity: {
       firstSeenAt: a.firstSeenAt,
       lastSeenAt: a.lastSeenAt,
@@ -723,9 +934,6 @@ async function handle(req, res) {
     if (!issue || typeof issue.title !== 'string' || !issue.title.trim()) {
       return send(res, 400, { error: 'missing-title' });
     }
-    const linCreds = projectLinear(data, proj);
-    if (!linCreds.apiKey) return send(res, 503, { error: 'linear-not-configured' });
-    if (!linCreds.projectId) return send(res, 503, { error: 'linear-project-not-set' });
     const title = trunc(issue.title.trim(), 200);
     const meta = issue.meta || {};
     const note = issue.description ? issue.description.trim() : '';
@@ -742,15 +950,27 @@ async function handle(req, res) {
       userAgent: meta.userAgent,
     });
     try {
-      const created = await createLinearIssue(linCreds, { title, description });
+      let created;
+      if (proj.backend === 'github') {
+        const gh = projectGithub(data, proj);
+        if (!gh.token) return send(res, 503, { error: 'github-not-configured', message: 'No GitHub PAT set — add one in admin Settings.' });
+        if (!gh.repo) return send(res, 503, { error: 'github-repo-not-set', message: 'No GitHub repo set for this project.' });
+        const raw = await createGithubIssue(gh.token, gh.repo, { title, body: description });
+        created = normalizeGithubIssue(raw, gh.repo);
+      } else {
+        const linCreds = projectLinear(data, proj);
+        if (!linCreds.apiKey) return send(res, 503, { error: 'linear-not-configured' });
+        if (!linCreds.projectId) return send(res, 503, { error: 'linear-project-not-set' });
+        created = await createLinearIssue(linCreds, { title, description });
+      }
       proj.activity = proj.activity || emptyActivity();
       proj.activity.reportsCount = (proj.activity.reportsCount || 0) + 1;
       saveData(data);
       bustIssuesCache(proj.key);
-      console.log(`[gate] issue ${created.identifier || created.id} for ${proj.key} by ${payload.email}`);
+      console.log(`[gate] issue ${created.identifier || created.id} for ${proj.key} (${proj.backend}) by ${payload.email}`);
       return send(res, 200, { ok: true, issue: created });
     } catch (e) {
-      console.error('[gate] linear error:', e.message);
+      console.error('[gate] backend error:', e.message);
       return send(res, 502, { error: 'linear-failed', message: e.message });
     }
   }
@@ -767,26 +987,30 @@ async function handle(req, res) {
     const proj = data.projects[payload.project];
     if (!proj || proj.status !== 'active') return send(res, 401, { error: 'project-gone' });
     if (!(proj.users || {})[payload.email]) return send(res, 401, { error: 'revoked' });
-    const linCreds = projectLinear(data, proj);
-    if (!linCreds.apiKey || !linCreds.projectId) return send(res, 503, { error: 'linear-not-configured' });
     const reqPage = String((parsed.query && parsed.query.page) || '').slice(0, 500);
     try {
-      const all = await fetchOpenIssuesCached(proj.key, linCreds);
+      const all = await fetchOpenIssuesForProject(data, proj);
       const issues = all
         .map((iss) => {
-          const fc = parseFcMeta(iss.description);
+          // Linear returns iss.description; GitHub returns iss.body. Treat
+          // them uniformly here by reading whichever exists.
+          const bodyText = iss.description || iss.body || '';
+          const fc = parseFcMeta(bodyText);
           if (!fc || fc.v !== 1) return null;
           if (reqPage && fc.page && fc.page !== reqPage) return null;
+          // For GitHub the iss object comes from normalizeGithubIssue and
+          // already has the expected shape; Linear's fetchLinearOpenIssues
+          // returns raw nodes with the same field names.
           return {
-            id: iss.id,
-            identifier: iss.identifier,
-            url: iss.url,
+            id: iss.id || iss.node_id,
+            identifier: iss.identifier || ('#' + iss.number),
+            url: iss.url || iss.html_url,
             title: iss.title,
             note: typeof fc.note === 'string' ? fc.note : '',
             filer: fc.filer || null,
             anchor: fc.anchor || null,
             page: fc.page || null,
-            updatedAt: iss.updatedAt,
+            updatedAt: iss.updatedAt || iss.updated_at,
             state: iss.state || null,
             mine: !!(fc.filer && fc.filer === payload.email),
           };
@@ -794,15 +1018,17 @@ async function handle(req, res) {
         .filter(Boolean);
       return send(res, 200, { issues });
     } catch (e) {
-      console.error('[gate] linear list error:', e.message);
-      return send(res, 502, { error: 'linear-failed', message: e.message });
+      console.error('[gate] list error:', e.message);
+      return send(res, 502, { error: 'backend-failed', message: e.message });
     }
   }
 
   // v0.9.0: edit the note (and optionally title) on an issue you filed. Only
   // the original filer can edit; ownership is enforced from the fc-meta marker
   // we wrote on creation, not from the JWT alone.
-  const issueEditMatch = route.match(/^\/api\/issues\/([A-Za-z0-9-]{8,})$/);
+  // v0.10.0: id format extended to allow base64url chars so GitHub-encoded IDs
+  // (gh-<base64url>) work alongside Linear's UUID strings.
+  const issueEditMatch = route.match(/^\/api\/issues\/([A-Za-z0-9_-]{8,})$/);
   if (method === 'PUT' && issueEditMatch) {
     if (!rateLimit('issues-edit', getClientIp(req), 20, 60_000)) return send(res, 429, { error: 'rate-limited' });
     const payload = readTesterToken(req);
@@ -813,13 +1039,26 @@ async function handle(req, res) {
     const proj = data.projects[payload.project];
     if (!proj || proj.status !== 'active') return send(res, 401, { error: 'project-gone' });
     if (!(proj.users || {})[payload.email]) return send(res, 401, { error: 'revoked' });
-    const linCreds = projectLinear(data, proj);
-    if (!linCreds.apiKey) return send(res, 503, { error: 'linear-not-configured' });
     const issueId = issueEditMatch[1];
+    const ghRef = ghDecodeIssueId(issueId);
     try {
-      const current = await fetchLinearIssue(linCreds, issueId);
-      if (!current) return send(res, 404, { error: 'no-such-issue' });
-      const fc = parseFcMeta(current.description);
+      // Fetch current state — branch on backend (encoded in the ID for GitHub,
+      // determined by proj.backend for Linear).
+      let current, currentDesc;
+      if (ghRef) {
+        const gh = projectGithub(data, proj);
+        if (!gh.token) return send(res, 503, { error: 'github-not-configured' });
+        current = await fetchGithubIssue(gh.token, ghRef.repo, ghRef.number);
+        if (!current) return send(res, 404, { error: 'no-such-issue' });
+        currentDesc = current.body || '';
+      } else {
+        const linCreds = projectLinear(data, proj);
+        if (!linCreds.apiKey) return send(res, 503, { error: 'linear-not-configured' });
+        current = await fetchLinearIssue(linCreds, issueId);
+        if (!current) return send(res, 404, { error: 'no-such-issue' });
+        currentDesc = current.description || '';
+      }
+      const fc = parseFcMeta(currentDesc);
       if (!fc || fc.v !== 1) return send(res, 409, { error: 'no-fc-meta', message: 'This issue was filed before v0.9.0 and can’t be edited from the overlay.' });
       if (fc.filer !== payload.email) return send(res, 403, { error: 'not-owner' });
       const newTitle = typeof body.title === 'string' && body.title.trim() ? trunc(body.title.trim(), 200) : current.title;
@@ -838,34 +1077,43 @@ async function handle(req, res) {
         text: null,
         userAgent: null,
       });
-      const updated = await updateLinearIssue(linCreds, issueId, { title: newTitle, description: newDescription });
+      let outIssue;
+      if (ghRef) {
+        const gh = projectGithub(data, proj);
+        const updated = await updateGithubIssue(gh.token, ghRef.repo, ghRef.number, { title: newTitle, body: newDescription });
+        outIssue = normalizeGithubIssue(updated, ghRef.repo);
+      } else {
+        const linCreds = projectLinear(data, proj);
+        outIssue = await updateLinearIssue(linCreds, issueId, { title: newTitle, description: newDescription });
+      }
       bustIssuesCache(proj.key);
       return send(res, 200, {
         ok: true,
         issue: {
-          id: updated.id,
-          identifier: updated.identifier,
-          url: updated.url,
-          title: updated.title,
+          id: outIssue.id,
+          identifier: outIssue.identifier,
+          url: outIssue.url,
+          title: outIssue.title,
           note: newNote,
           filer: fc.filer,
           anchor: fc.anchor || null,
           page: fc.page || null,
-          updatedAt: updated.updatedAt,
-          state: updated.state || null,
+          updatedAt: outIssue.updatedAt,
+          state: outIssue.state || null,
           mine: true,
         },
       });
     } catch (e) {
-      console.error('[gate] linear update error:', e.message);
-      return send(res, 502, { error: 'linear-failed', message: e.message });
+      console.error('[gate] update error:', e.message);
+      return send(res, 502, { error: 'backend-failed', message: e.message });
     }
   }
 
   // v0.9.4: delete an issue you filed. Ownership again enforced from the
   // fc-meta marker — not the JWT — so a stolen token still can't delete
   // someone else's issue. Linear's issueDelete is a soft-delete (30-day
-  // trash); admins can restore from the Linear UI if needed.
+  // trash); GitHub's "delete" closes with state_reason: not_planned (GitHub
+  // doesn't allow true deletion without admin GraphQL access).
   if (method === 'DELETE' && issueEditMatch) {
     if (!rateLimit('issues-delete', getClientIp(req), 10, 60_000)) return send(res, 429, { error: 'rate-limited' });
     const payload = readTesterToken(req);
@@ -874,21 +1122,38 @@ async function handle(req, res) {
     const proj = data.projects[payload.project];
     if (!proj || proj.status !== 'active') return send(res, 401, { error: 'project-gone' });
     if (!(proj.users || {})[payload.email]) return send(res, 401, { error: 'revoked' });
-    const linCreds = projectLinear(data, proj);
-    if (!linCreds.apiKey) return send(res, 503, { error: 'linear-not-configured' });
     const issueId = issueEditMatch[1];
+    const ghRef = ghDecodeIssueId(issueId);
     try {
-      const current = await fetchLinearIssue(linCreds, issueId);
-      if (!current) return send(res, 404, { error: 'no-such-issue' });
-      const fc = parseFcMeta(current.description);
+      let current, currentDesc;
+      if (ghRef) {
+        const gh = projectGithub(data, proj);
+        if (!gh.token) return send(res, 503, { error: 'github-not-configured' });
+        current = await fetchGithubIssue(gh.token, ghRef.repo, ghRef.number);
+        if (!current) return send(res, 404, { error: 'no-such-issue' });
+        currentDesc = current.body || '';
+      } else {
+        const linCreds = projectLinear(data, proj);
+        if (!linCreds.apiKey) return send(res, 503, { error: 'linear-not-configured' });
+        current = await fetchLinearIssue(linCreds, issueId);
+        if (!current) return send(res, 404, { error: 'no-such-issue' });
+        currentDesc = current.description || '';
+      }
+      const fc = parseFcMeta(currentDesc);
       if (!fc || fc.v !== 1) return send(res, 409, { error: 'no-fc-meta', message: 'This issue was filed before v0.9.0 and can’t be deleted from the overlay.' });
       if (fc.filer !== payload.email) return send(res, 403, { error: 'not-owner' });
-      await deleteLinearIssue(linCreds, issueId);
+      if (ghRef) {
+        const gh = projectGithub(data, proj);
+        await deleteGithubIssue(gh.token, ghRef.repo, ghRef.number);
+      } else {
+        const linCreds = projectLinear(data, proj);
+        await deleteLinearIssue(linCreds, issueId);
+      }
       bustIssuesCache(proj.key);
       return send(res, 200, { ok: true });
     } catch (e) {
-      console.error('[gate] linear delete error:', e.message);
-      return send(res, 502, { error: 'linear-failed', message: e.message });
+      console.error('[gate] delete error:', e.message);
+      return send(res, 502, { error: 'backend-failed', message: e.message });
     }
   }
 
@@ -1038,6 +1303,7 @@ async function handle(req, res) {
     return send(res, 200, {
       modeColors: data.modeColors,
       linear: publicLinear(data.linear),
+      github: publicGithub(data.github),
       projects,
       pendingCount: projects.filter((p) => p.status === 'pending').length,
     });
@@ -1145,10 +1411,37 @@ async function handle(req, res) {
         }
         proj.linearProjectId = linProj.id;
         proj.linearProjectName = linProj.name;
+        proj.backend = 'linear';
         saveData(data);
+        bustIssuesCache(proj.key);
         return send(res, 200, { project: publicProjectDetail(proj) });
       } catch (e) {
         return send(res, 502, { error: 'linear-unreachable', message: e.message });
+      }
+    }
+    // v0.10.0+: set the GitHub repo destination. Flips backend to 'github'.
+    if (method === 'PUT' && sub === 'github-repo') {
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+      const gh = projectGithub(data, proj);
+      if (!gh.token) return send(res, 400, { error: 'no-token', message: 'No GitHub PAT set in Settings.' });
+      const repoStr = typeof body.repo === 'string' ? body.repo.trim() : '';
+      if (!repoStr) return send(res, 400, { error: 'missing-repo' });
+      let parsed;
+      try { parsed = parseGithubRepo(repoStr); }
+      catch (e) { return send(res, 400, { error: 'bad-repo', message: e.message }); }
+      try {
+        // Confirm access + that issues are enabled.
+        const repoInfo = await githubREST(gh.token, 'GET', `/repos/${parsed.owner}/${parsed.repo}`);
+        if (!repoInfo.has_issues) return send(res, 400, { error: 'issues-disabled', message: 'Issues are disabled on this repo. Enable them in GitHub repo settings first.' });
+        await ensureFcBugLabel(gh.token, parsed.owner, parsed.repo);
+        proj.githubRepo = repoInfo.full_name;
+        proj.backend = 'github';
+        saveData(data);
+        bustIssuesCache(proj.key);
+        return send(res, 200, { project: publicProjectDetail(proj) });
+      } catch (e) {
+        return send(res, 502, { error: 'github-unreachable', message: e.message });
       }
     }
     return send(res, 404, { error: 'not-found' });
@@ -1252,6 +1545,66 @@ async function handle(req, res) {
     data.linear = null;
     saveData(data);
     return send(res, 200, { linear: null });
+  }
+
+  // ----- Admin: GitHub (v0.10.0+) -----
+  // Mirrors the Linear admin shape: set/clear a gate-wide token, list
+  // accessible repos for the wizard's repo picker.
+  if (method === 'PUT' && route === '/frontend-conqueror/github/token') {
+    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+    const token = typeof body.token === 'string' ? body.token.trim() : '';
+    if (!token) return send(res, 400, { error: 'missing-token' });
+    // Validate by hitting /user and see whose token this is.
+    let username;
+    try {
+      const me = await githubREST(token, 'GET', '/user');
+      username = me && me.login;
+      if (!username) throw new Error('unexpected /user response');
+    } catch (e) {
+      return send(res, 400, { error: 'token-invalid', message: 'GitHub rejected this token: ' + e.message });
+    }
+    const data = loadData();
+    data.github = { token, username };
+    saveData(data);
+    return send(res, 200, { github: publicGithub(data.github) });
+  }
+  if (method === 'DELETE' && route === '/frontend-conqueror/github') {
+    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
+    const data = loadData();
+    data.github = null;
+    saveData(data);
+    return send(res, 200, { github: null });
+  }
+  // Repo search for the wizard picker. `q` is matched against name+owner.
+  // Returns the user's own repos + repos in their orgs they can read.
+  if (method === 'GET' && route === '/frontend-conqueror/github/repos') {
+    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
+    const data = loadData();
+    const token = data.github && data.github.token;
+    if (!token) return send(res, 400, { error: 'no-token' });
+    const q = String((parsed.query && parsed.query.q) || '').trim();
+    try {
+      // GitHub Search API needs a user prefix or org prefix; without `q` we
+      // list the user's own repos (cheapest call).
+      let items = [];
+      if (q) {
+        const search = await githubREST(token, 'GET',
+          `/search/repositories?q=${encodeURIComponent(q + ' fork:true')}&per_page=20&sort=updated`);
+        items = (search && search.items) || [];
+      } else {
+        items = await githubREST(token, 'GET', '/user/repos?per_page=30&sort=updated&affiliation=owner,collaborator,organization_member');
+      }
+      const repos = (items || []).map((r) => ({
+        full_name: r.full_name,
+        description: r.description || '',
+        private: !!r.private,
+      }));
+      return send(res, 200, { repos });
+    } catch (e) {
+      return send(res, 502, { error: 'github-unreachable', message: e.message });
+    }
   }
 
   // ----- Admin page -----
@@ -1826,15 +2179,29 @@ async function renderProjectDetail(key) {
       \` : ''}
 
       <div class="card">
-        <h3>Linear destination</h3>
-        \${detail.linearProjectName ? html\`
-          <div class="body">Reports go to: <strong>\${esc(detail.linearProjectName)}</strong></div>
-          <div class="meta">Team: \${esc(STATE.linear ? STATE.linear.teamName : '')}</div>
-          <div class="row" style="margin-top:10px;justify-content:flex-end;">
-            <button class="ghost" onclick="changeLinearProject('\${esc(detail.key)}')">Change</button>
-          </div>
+        <h3>Destination</h3>
+        \${detail.backend === 'github' ? html\`
+          \${detail.githubRepo ? html\`
+            <div class="body">Reports go to: <strong><a href="https://github.com/\${esc(detail.githubRepo)}/issues" target="_blank" rel="noreferrer">\${esc(detail.githubRepo)}</a></strong> (GitHub Issues)</div>
+            <div class="meta">Token: @\${esc(STATE.github ? STATE.github.username : '?')}\${detail.hasGithubOverride ? ' (per-project override)' : ''}</div>
+            <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
+              <button class="ghost" onclick="changeGithubRepo('\${esc(detail.key)}')">Change repo</button>
+              <button class="ghost" onclick="switchToLinear('\${esc(detail.key)}')">Switch to Linear</button>
+            </div>
+          \` : html\`
+            <div class="empty">Not set. <a href="#" onclick="changeGithubRepo('\${esc(detail.key)}');return false;">Pick a GitHub repo</a></div>
+          \`}
         \` : html\`
-          <div class="empty">Not set. <a href="#" onclick="changeLinearProject('\${esc(detail.key)}');return false;">Pick a Linear project</a></div>
+          \${detail.linearProjectName ? html\`
+            <div class="body">Reports go to: <strong>\${esc(detail.linearProjectName)}</strong> (Linear)</div>
+            <div class="meta">Team: \${esc(STATE.linear ? STATE.linear.teamName : '')}</div>
+            <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
+              <button class="ghost" onclick="changeLinearProject('\${esc(detail.key)}')">Change project</button>
+              <button class="ghost" onclick="switchToGithub('\${esc(detail.key)}')">Switch to GitHub</button>
+            </div>
+          \` : html\`
+            <div class="empty">Not set. Pick a destination: <a href="#" onclick="changeLinearProject('\${esc(detail.key)}');return false;">Linear project</a> · <a href="#" onclick="changeGithubRepo('\${esc(detail.key)}');return false;">GitHub repo</a></div>
+          \`}
         \`}
       </div>
 
@@ -1944,6 +2311,39 @@ window.changeLinearProject = async function(key) {
     toast('Linear destination updated.');
     navigate();
   } catch (e) { toast(e.message, 'err'); }
+};
+// v0.10.0+: pick a GitHub repo destination. Uses the gate's GitHub search
+// route to autocomplete from your accessible repos. Switches the project's
+// backend to 'github'.
+window.changeGithubRepo = async function(key) {
+  if (!STATE.github || !STATE.github.hasToken) {
+    if (confirm('No GitHub PAT set yet. Go to Settings to add one?')) go('#/settings');
+    return;
+  }
+  const q = prompt('Type repo name to search (e.g. "messarat" or "owner/repo"), or leave blank to see your recent repos:');
+  if (q === null) return;
+  let repos = [];
+  try { repos = (await api('GET', '/frontend-conqueror/github/repos?q=' + encodeURIComponent(q || ''))).repos || []; }
+  catch (e) { return toast(e.message, 'err'); }
+  if (repos.length === 0) return toast('No matching repos.', 'err');
+  const lines = repos.map((r, i) => (i + 1) + ') ' + r.full_name + (r.private ? ' (private)' : '')).join('\\n');
+  const choice = prompt('Pick a repo number, or type "owner/repo" directly:\\n\\n' + lines);
+  if (!choice) return;
+  const n = parseInt(choice, 10);
+  const repo = (!isNaN(n) && repos[n - 1]) ? repos[n - 1].full_name : choice.trim();
+  try {
+    await api('PUT', '/frontend-conqueror/projects/' + key + '/github-repo', { repo });
+    toast('GitHub destination set to ' + repo + '.');
+    navigate();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.switchToGithub = async function(key) {
+  if (!confirm('Switch this project to GitHub backend? You\\'ll pick a repo next. Existing Linear-filed bugs will keep working but new reports go to GitHub.')) return;
+  window.changeGithubRepo(key);
+};
+window.switchToLinear = async function(key) {
+  if (!confirm('Switch this project back to Linear backend? You\\'ll pick a Linear destination next.')) return;
+  window.changeLinearProject(key);
 };
 window.addUser = async function(key) {
   const email = $('newEmail').value.trim();
@@ -2096,10 +2496,28 @@ async function renderSettings() {
       <h2>Global settings<span class="sub">Affects all projects on this gate.</span></h2>
 
       <div class="card">
+        <h3>GitHub access token</h3>
+        \${s.github && s.github.hasToken ? html\`
+          <div class="body">Connected as <strong>@\${esc(s.github.username || '?')}</strong>.</div>
+          <div class="meta">Every project with backend = github uses this token unless it has a per-project override.</div>
+          <div class="row" style="justify-content:flex-end;margin-top:10px;">
+            <button class="ghost" onclick="replaceGithubToken()">Replace</button>
+            <button class="danger" onclick="removeGithubToken()">Disconnect</button>
+          </div>
+        \` : html\`
+          <div class="empty">No GitHub PAT set.</div>
+          <div class="sub-muted" style="margin:8px 0 0;">Create one at <a href="https://github.com/settings/tokens?type=beta" target="_blank" rel="noreferrer">github.com/settings/tokens (fine-grained)</a>. Permissions needed: <strong>Issues: Read &amp; Write</strong> on the repos you'll route bugs to.</div>
+          <div class="row" style="justify-content:flex-end;margin-top:8px;">
+            <button class="primary" onclick="replaceGithubToken()">Connect GitHub</button>
+          </div>
+        \`}
+      </div>
+
+      <div class="card">
         <h3>Linear API key</h3>
         \${s.linear && s.linear.hasApiKey ? html\`
           <div class="body">Connected to <strong>\${esc(s.linear.teamName || s.linear.teamId || 'a team')}</strong></div>
-          <div class="meta">All projects use this key unless they override it.</div>
+          <div class="meta">Projects with backend = linear use this key unless they override it.</div>
           <div class="row" style="justify-content:flex-end;margin-top:10px;">
             <button class="ghost" onclick="replaceApiKey()">Replace</button>
             <button class="danger" onclick="removeApiKey()">Disconnect</button>
@@ -2159,11 +2577,31 @@ window.replaceApiKey = async function() {
   } catch (e) { toast(e.message, 'err'); }
 };
 window.removeApiKey = async function() {
-  if (!confirm('Disconnect Linear? All projects will stop accepting reports until a new key is set (or per-project override is configured).')) return;
+  if (!confirm('Disconnect Linear? All projects with backend = linear will stop accepting reports until a new key is set (or per-project override is configured).')) return;
   try {
     await api('DELETE', '/frontend-conqueror/linear');
     STATE = null;
     toast('Linear disconnected.');
+    navigate();
+  } catch (e) { toast(e.message, 'err'); }
+};
+// v0.10.0+: GitHub PAT management. Same UX shape as Linear, paste-driven.
+window.replaceGithubToken = async function() {
+  const token = prompt('Paste GitHub fine-grained PAT (Issues: R/W on the destination repos):');
+  if (!token) return;
+  try {
+    await api('PUT', '/frontend-conqueror/github/token', { token });
+    STATE = null;
+    toast('GitHub connected.');
+    navigate();
+  } catch (e) { toast(e.message, 'err'); }
+};
+window.removeGithubToken = async function() {
+  if (!confirm('Disconnect GitHub? All projects with backend = github will stop accepting reports until a new token is set.')) return;
+  try {
+    await api('DELETE', '/frontend-conqueror/github');
+    STATE = null;
+    toast('GitHub disconnected.');
     navigate();
   } catch (e) { toast(e.message, 'err'); }
 };

@@ -802,14 +802,18 @@ function transformVueSource(code, fileRel, deps, options) {
   function walk(node) {
     if (!node) return;
     if (node.type === 1) {
-      // Every real element gets a data-edit-source pointer back to its opening tag
-      // offset in the source file. Used by Test mode (Linear issue source ref) and
-      // Dev TODO mode (comment insertion point) — both modes hover the whole
-      // component, not individual text nodes.
+      // Every real element gets a data-edit-source pointer back to its opening
+      // tag in the source file. v0.10.0+ extends the previous file:offset
+      // format with line:column so the gate can emit IDE-clickable
+      // "Where: app/components/Foo.vue:42:8" lines in GitHub issue bodies.
+      // The byte offset remains the second field — every existing overlay
+      // (and the bubble system) keeps working unchanged because they parse
+      // by byte-offset, not by line/col.
       const elementSourceOffset = templateOffset + node.loc.start.offset;
+      const { line: elLine, col: elCol } = getLineCol(code, elementSourceOffset);
       transforms.push({
         at: insertionPoint(node),
-        str: ` data-edit-source="${escapeAttr(fileRel)}:${elementSourceOffset}"`,
+        str: ` data-edit-source="${escapeAttr(fileRel)}:${elementSourceOffset}:${elLine}:${elCol + 1}"`,
       });
 
       // v-for / v-slot bindings introduce new scope variables. Push for the

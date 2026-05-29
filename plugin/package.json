@@ -1,6 +1,6 @@
 {
   "name": "frontend-conqueror-plugin",
-  "version": "0.9.8",
+  "version": "0.10.0",
   "private": true,
   "main": "index.js",
   "type": "commonjs",

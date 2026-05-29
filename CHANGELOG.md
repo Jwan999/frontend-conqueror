@@ -10,6 +10,33 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.10.0] — 2026-05-24
+
+**GitHub Issues backend.** The gate now writes bugs to GitHub Issues in addition to Linear. Per-project `backend` flag selects between them; mixed-backend gates work fine. The overlay, the plugin, and the entire `nuxt.config.js` consumer-side config are unchanged.
+
+### Added
+- **Plugin emits `line:column` in `data-edit-source`** alongside the existing byte offset. New format: `file:offset:line:col`. The plugin reads the file once at build time and computes line/col cheaply.
+- **Overlay parses the 4-part format** (with 2-part fallback so older plugin output keeps working) and forwards `line`/`column` through `meta.anchor` to the gate.
+- **Structured Markdown issue body.** Replaces the old prose template. Clean `## What's wrong / ## Where / ## Page / ## What the tester saw / ## User agent` sections so terminal readers (humans and Claude Code alike) can extract fields deterministically. The visible "Where" line is `file:line:column` — every modern editor accepts that as a click-target. The byte offset stays inside the `fc-meta-b64` marker for the overlay's bubble matching.
+- **GitHub helpers in the gate** parallel to the Linear ones: `fetchGithubOpenIssues` (paginated, 500 cap), `fetchGithubIssue`, `createGithubIssue`, `updateGithubIssue`, `deleteGithubIssue` (which maps to "close with `state_reason: not_planned`" — GitHub doesn't allow true deletion via PATs).
+- **`fc:bug` label.** Auto-created on the target repo on first issue creation. The list query filters by this label so manually-filed Issues in the repo don't render as bubbles.
+- **Per-project `backend` field** ('linear' | 'github'). Existing projects auto-default to `linear` on load. New projects can pick either via the admin UI; switching after the fact is supported.
+- **Admin UI: GitHub PAT card** in Settings (mirrors the Linear API key card). Token validation on save — PATs that GitHub rejects don't get stored.
+- **Admin UI: GitHub repo picker** in the project destination card. Type a query, the gate searches your accessible repos via the GitHub Search API and renders a numbered picker. Validates the repo has Issues enabled before linking. Switching to GitHub from Linear or back is a single click.
+- **`GET /frontend-conqueror/github/repos`** admin route — backs the picker.
+- **`PUT /frontend-conqueror/projects/:key/github-repo`** admin route — sets the destination and flips backend to `github`.
+- **`tools/migrate-linear-to-github.js`** one-time migration script. Lists all open Linear issues in a gate project, recreates each in a target GitHub repo (preserving the `fc-meta-b64` marker so bubbles keep working without any tester refresh), comments on each Linear original with the new GitHub URL, flips the gate project's backend to `github`. Idempotent — re-runs skip issues that already have a "Migrated to" comment. Supports `--dry-run`.
+
+### Changed
+- **Issue ID format** for GitHub: `gh-<base64url(owner/repo#number)>`. The overlay receives this as `iss.id`; PUT/DELETE handlers decode it to route to the right repo. Linear UUID IDs continue to work unchanged.
+- **Route regex** for `/api/issues/:id` extended to include `_` (base64url char) so encoded GitHub IDs fit.
+- **Error names** in route catch blocks generalized from `linear-failed` to `backend-failed` since the same code path now serves both backends.
+
+### Compatibility
+- Existing Linear-backed gate projects keep working untouched. The data-shape migration is idempotent and additive (`backend: 'linear'` default + empty `githubRepo`/`githubToken` fields).
+- Pre-v0.10.0 plugins (no line/col in `data-edit-source`) still work: the gate falls back to byte-offset-only in the visible "Where" line. Bubbles continue to match correctly.
+- Pre-v0.10.0 overlays (no `line`/`column` in `meta.anchor`) work: the gate's `normalizeAnchor` treats the extra fields as optional.
+
 ## [0.9.8] — 2026-05-24
 
 Admin-UI polish for the auto-discovery → configure flow. Gate-only release — overlay and plugin are byte-identical to v0.9.7, so consumer projects don't strictly need to bump (though they should, to stay in sync).
