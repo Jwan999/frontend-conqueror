@@ -1213,10 +1213,17 @@ async function handle(req, res) {
     if (!key) return send(res, 400, { error: 'missing-project' });
     const data = loadData();
     let proj = data.projects[key];
+    // v0.10.6: track whether THIS heartbeat is the one that created the
+    // pending entry, so the overlay can show a one-time toast pointing the
+    // dev at the admin UI. We always return a JSON status object now (the
+    // overlay's heartbeat call is fire-and-forget but reads the response if
+    // it gets one).
+    let justCreated = false;
     if (!proj) {
       proj = emptyProject(key, body.displayName || key);
       proj.status = 'pending';
       data.projects[key] = proj;
+      justCreated = true;
       console.log(`[gate] pending project auto-registered: ${key}`);
     }
     const a = proj.activity = proj.activity || emptyActivity();
@@ -1253,7 +1260,7 @@ async function handle(req, res) {
       if (today_entry.hashes.length > 10_000) today_entry.hashes.shift();
     }
     saveData(data);
-    return send(res, 204, null);
+    return send(res, 200, { pending: proj.status === 'pending', justCreated });
   }
 
   if (method === 'GET' && route === '/api/mode-colors') {

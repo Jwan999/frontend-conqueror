@@ -10,6 +10,14 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.10.6] — 2026-05-31
+
+### Added
+- **Pending-project hint in the overlay.** When a heartbeat to a brand-new gate project key auto-registers a pending entry, the overlay shows a one-time toast: `First time this project ("X") has been seen by the gate — open admin to configure`. Throttled per `(gate URL, project key)` via sessionStorage so a page reload doesn't re-toast. Previously the dev had no in-page signal that the gate had silently created a pending project.
+
+### Changed
+- **`/api/heartbeat`** now returns `200 { pending, justCreated }` instead of `204 No Content`. Backward compatible — pre-v0.10.6 overlays ignored the response body. The `justCreated` flag is true only on the heartbeat that performs the auto-registration; subsequent heartbeats for the same pending project return `justCreated: false` so the toast doesn't fire on every page load.
+
 ## [0.10.5] — 2026-05-31
 
 ### Fixed

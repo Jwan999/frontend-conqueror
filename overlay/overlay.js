@@ -118,6 +118,11 @@
   // Lets the gate auto-discover this project and surface activity to the admin.
   // Fired on load and every 5 minutes while the page stays open.
   // No-op (and fail-silent) when no gate or no project key configured.
+  // v0.10.6: when the gate responds with `pending: true` AND this is a
+  // brand-new pending registration (justCreated), surface a one-time toast
+  // pointing the dev at the admin UI. Throttled via sessionStorage so a
+  // page reload doesn't re-fire — the gate's auto-registration is
+  // idempotent but the message would be confusing on subsequent loads.
   function gateHeartbeat() {
     if (!GATE || !GATE.url || !gateProject()) return;
     try {
@@ -130,8 +135,21 @@
           url: location.href.slice(0, 300),
         }),
         keepalive: true,
-      }).catch(() => {});
+      })
+        .then((r) => r.ok ? r.json().catch(() => null) : null)
+        .then((data) => { if (data && data.justCreated) fcMaybeHintPendingProject(); })
+        .catch(() => {});
     } catch {}
+  }
+  function fcMaybeHintPendingProject() {
+    const key = '__fc_pending_hinted:' + GATE.url + ':' + gateProject();
+    try { if (sessionStorage.getItem(key)) return; sessionStorage.setItem(key, '1'); } catch { /* private mode etc — better to spam than crash */ }
+    setTimeout(() => {
+      toast(
+        "First time this project (\"" + gateProject() + "\") has been seen by the gate — open admin to configure",
+        'info'
+      );
+    }, 1200);
   }
 
   // Multi-mode state. Mutually exclusive: only one mode is active at a time.
