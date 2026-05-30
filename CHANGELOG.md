@@ -10,6 +10,24 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.11.0] — 2026-05-31
+
+**Backend chooser lands in both wizards.** v0.10.0 introduced GitHub Issues as a peer backend to Linear in the data model and admin API, but the wizards still hardcoded Linear. v0.11.0 closes the gap — a fresh `/setup` flow lets you pick the tracker at step 1, and every per-project configure wizard does the same.
+
+### Added
+- **Setup wizard step 1 is now a backend chooser.** "Where will bugs land? [Linear] [GitHub]". The rest of the flow adapts: Linear path is 5 steps (single-team) or 6 (multi-team); GitHub path is 5 steps (PAT → project name → repo picker → tester). The dots widget shows 6 dots consistently with the visible "Step X of Y" label tracking the real count.
+- **GitHub PAT paste step in the setup wizard** with a direct link to the fine-grained PAT generator and the exact scopes needed (`Issues: Read & Write` on destination repos).
+- **GitHub repo picker step** in both the setup wizard AND the per-project configure wizard. Search by name or owner/repo prefix; results show description + private badge; or paste `owner/repo` directly. Hits `/frontend-conqueror/github/repos` which the gate proxies to GitHub's Search Repositories API.
+- **Per-project configure wizard now adapts to backend.** Three logical steps (backend chooser → destination → tester) when both Linear and GitHub are configured globally and the project doesn't have a destination yet. Falls back to the previous 2-step flow when only one backend is configured globally. Existing Linear-configured projects skip straight to the tester step on re-entry.
+
+### Changed
+- The per-project wizard's "Where should bugs land?" step is now backend-aware. The Linear variant is unchanged; the GitHub variant is new.
+- Setup wizard step labels moved from "Step X of 5" (hardcoded) to "Step X of \${totalSteps()}" (dynamic) so the count is honest in every flow shape.
+
+### Compatibility
+- Pre-v0.11.0 gate projects continue to work — they have `backend: 'linear'` from the v0.10.0 migration. The per-project wizard auto-skips the backend chooser when re-entered for a project with a destination already set.
+- Setup wizard only runs on fresh gates (when there are no projects and no Linear key). Existing deployed gates never re-enter it.
+
 ## [0.10.6] — 2026-05-31
 
 ### Added

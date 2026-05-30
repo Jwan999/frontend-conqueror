@@ -1949,16 +1949,22 @@ function renderForcedPasswordChange() {
 
 // ============================== FIRST-TIME SETUP WIZARD ==============================
 async function renderSetup() {
+  // v0.11.0: setup wizard is backend-aware. New step 1 is a backend chooser;
+  // existing 5 steps renumbered to 2-6. The Linear flow's auto-skip from step
+  // 2 (was step 1, multi-team detection) is preserved. GitHub flow skips
+  // directly from credential paste to project naming — no team concept.
   let step = 1;
   const ctx = {
+    backend: null,
     apiKey: '',
+    githubToken: '',
     teamId: null,
     teamName: null,
     teams: [],
     projectKey: '',
     projectDisplayName: '',
     linearProjectId: null,
-    linearProjectNewName: '',
+    githubRepo: '',
   };
   function nav(html_) {
     root().innerHTML = html\`
@@ -1970,21 +1976,46 @@ async function renderSetup() {
       </header>
       <main>\${html_}</main>\`;
   }
+  // Total step count varies: Linear with multi-team = 6, Linear single-team
+  // or GitHub = 5. The dots widget reflects the worst case (6) to keep
+  // pixel layout stable across renders; the visible label tells the truth.
   const dots = (n) => '<div class="step-dots">' +
-    [1,2,3,4,5].map(i => '<div class="d ' + (i < n ? 'done' : i === n ? 'on' : '') + '"></div>').join('') +
+    [1,2,3,4,5,6].map(i => '<div class="d ' + (i < n ? 'done' : i === n ? 'on' : '') + '"></div>').join('') +
     '</div>';
+  const totalSteps = () => (ctx.backend === 'github' ? 5 : (ctx.teams.length > 1 ? 6 : 5));
 
   function renderStep() {
     if (step === 1) {
+      // Backend chooser (NEW in v0.11.0). Setup used to assume Linear; this
+      // is the first decision now.
       nav(html\`
         \${dots(1)}
-        <h2>Let's set up your gate<span class="sub">Step 1 of 5 — Linear API key. This is shared across all your projects (unless you override it per project later).</span></h2>
+        <h2>Where will bugs land?<span class="sub">Step 1 of \${totalSteps()} — pick the issue tracker the gate will write to. You can add more backends per-project later.</span></h2>
+        <div class="card">
+          <button class="palette-option" id="pickLinear" style="margin-bottom:8px;">
+            <span class="dot" style="background:#5e6ad2;"></span>
+            <span class="name">Linear</span>
+            <span class="desc">Bugs land as Linear issues. Best if your team triages in Linear today.</span>
+          </button>
+          <button class="palette-option" id="pickGithub">
+            <span class="dot" style="background:#24292e;"></span>
+            <span class="name">GitHub Issues</span>
+            <span class="desc">Bugs land as GitHub Issues in a repo, tagged <code>fc:bug</code>. Best if devs triage from <code>gh</code> CLI or the repo's Issues tab.</span>
+          </button>
+        </div>\`);
+      $('pickLinear').addEventListener('click', () => { ctx.backend = 'linear'; step = 2; renderStep(); });
+      $('pickGithub').addEventListener('click', () => { ctx.backend = 'github'; step = 2; renderStep(); });
+    } else if (step === 2 && ctx.backend === 'linear') {
+      nav(html\`
+        \${dots(2)}
+        <h2>Linear API key<span class="sub">Step 2 of \${totalSteps()} — shared across all Linear-backed projects on this gate (you can override per-project later).</span></h2>
         <div class="card">
           <label for="apiKey">Linear API key</label>
           <input id="apiKey" type="password" placeholder="lin_api_..." autofocus value="\${esc(ctx.apiKey)}">
           <div class="sub-muted" style="margin-top:6px;">Get one from <a href="https://linear.app/settings/api" target="_blank" rel="noreferrer">Linear → Settings → API</a>. Personal API keys work fine.</div>
           <div class="err" id="err"></div>
-          <div class="row" style="justify-content:flex-end;margin-top:14px;">
+          <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
+            <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
             <button class="primary" id="next">Continue →</button>
           </div>
         </div>\`);
@@ -1998,24 +2029,50 @@ async function renderSetup() {
           if (res.resolution === 'auto-team') {
             ctx.teamId = res.linear.teamId;
             ctx.teamName = res.linear.teamName;
-            step = 3;
+            step = 4;  // skip team picker
           } else {
             ctx.teams = res.linear.availableTeams || [];
-            step = 2;
+            step = 3;
           }
           renderStep();
         } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
       });
-    } else if (step === 2) {
+    } else if (step === 2 && ctx.backend === 'github') {
+      // v0.11.0: GitHub equivalent of the Linear API key paste step.
       nav(html\`
         \${dots(2)}
-        <h2>Pick your Linear team<span class="sub">Step 2 of 5 — your key has access to multiple teams. Bugs will land in this one.</span></h2>
+        <h2>GitHub access token<span class="sub">Step 2 of \${totalSteps()} — shared across all GitHub-backed projects on this gate.</span></h2>
+        <div class="card">
+          <label for="ghToken">Personal access token</label>
+          <input id="ghToken" type="password" placeholder="github_pat_..." autofocus value="\${esc(ctx.githubToken)}">
+          <div class="sub-muted" style="margin-top:6px;">Create a fine-grained PAT at <a href="https://github.com/settings/tokens?type=beta" target="_blank" rel="noreferrer">github.com/settings/tokens</a> with <strong>Issues: Read &amp; Write</strong> on the repos you'll route bugs to.</div>
+          <div class="err" id="err"></div>
+          <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
+            <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
+            <button class="primary" id="next">Continue →</button>
+          </div>
+        </div>\`);
+      $('next').addEventListener('click', async () => {
+        ctx.githubToken = $('ghToken').value.trim();
+        if (!ctx.githubToken) return ($('err').textContent = 'Paste your GitHub PAT.');
+        $('next').disabled = true;
+        try {
+          await api('PUT', '/frontend-conqueror/github/token', { token: ctx.githubToken });
+          step = 4;  // GitHub has no team concept; jump straight to project naming
+          renderStep();
+        } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
+      });
+    } else if (step === 3) {
+      // Pick Linear team (Linear multi-team only). v0.11.0: renumbered.
+      nav(html\`
+        \${dots(3)}
+        <h2>Pick your Linear team<span class="sub">Step 3 of \${totalSteps()} — your key has access to multiple teams. Bugs will land in this one.</span></h2>
         <div class="card">
           <label for="team">Team</label>
           <select id="team">\${ctx.teams.map(t => '<option value="' + esc(t.id) + '">' + esc(t.name) + ' (' + esc(t.key) + ')</option>').join('')}</select>
           <div class="err" id="err"></div>
-          <div class="row" style="justify-content:flex-end;margin-top:14px;">
-            <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
+          <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
+            <button class="ghost" onclick="(()=>{step=2;renderStep();})()">← Back</button>
             <button class="primary" id="next">Continue →</button>
           </div>
         </div>\`);
@@ -2025,14 +2082,15 @@ async function renderSetup() {
           const res = await api('PUT', '/frontend-conqueror/linear/team', { teamId });
           ctx.teamId = res.linear.teamId;
           ctx.teamName = res.linear.teamName;
-          step = 3;
+          step = 4;
           renderStep();
         } catch (e) { $('err').textContent = e.message; }
       });
-    } else if (step === 3) {
+    } else if (step === 4) {
+      // Project name + key (was step 3 pre-v0.11.0).
       nav(html\`
-        \${dots(3)}
-        <h2>Name your first project<span class="sub">Step 3 of 5 — this is what you'll use in your plugin config (<code>gate.project = '...'</code>). Letters, numbers, dashes.</span></h2>
+        \${dots(4)}
+        <h2>Name your first project<span class="sub">Step 4 of \${totalSteps()} — this is what you'll use in your plugin config (<code>gate.project = '...'</code>). Letters, numbers, dashes.</span></h2>
         <div class="card">
           <label for="displayName">Display name</label>
           <input id="displayName" placeholder="Messarat" autofocus value="\${esc(ctx.projectDisplayName)}">
@@ -2040,8 +2098,8 @@ async function renderSetup() {
           <input id="key" placeholder="messarat" value="\${esc(ctx.projectKey)}">
           <div class="sub-muted" style="margin-top:4px;">Used in <code>gate.project</code> and the overlay URL.</div>
           <div class="err" id="err"></div>
-          <div class="row" style="justify-content:flex-end;margin-top:14px;">
-            <button class="ghost" onclick="(()=>{step=2;renderStep();})()">← Back</button>
+          <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
+            <button class="ghost" onclick="(()=>{step=ctx.backend==='github'?2:(ctx.teams.length>1?3:2);renderStep();})()">← Back</button>
             <button class="primary" id="next">Continue →</button>
           </div>
         </div>\`);
@@ -2061,21 +2119,22 @@ async function renderSetup() {
           await api('POST', '/frontend-conqueror/projects', { key, displayName });
           ctx.projectKey = key;
           ctx.projectDisplayName = displayName;
-          step = 4;
+          step = 5;
           renderStep();
         } catch (e) {
           if (e.payload && e.payload.error === 'already-exists') {
             ctx.projectKey = key;
             ctx.projectDisplayName = displayName;
-            step = 4;
+            step = 5;
             renderStep();
           } else $('err').textContent = e.message;
         }
       });
-    } else if (step === 4) {
+    } else if (step === 5 && ctx.backend === 'linear') {
+      // Linear destination picker (was step 4 pre-v0.11.0).
       nav(html\`
-        \${dots(4)}
-        <h2>Where should bugs land?<span class="sub">Step 4 of 5 — pick or create a Linear project. Bugs from \${esc(ctx.projectDisplayName)} will file there.</span></h2>
+        \${dots(5)}
+        <h2>Where should bugs land?<span class="sub">Step 5 of \${totalSteps()} — pick or create a Linear project. Bugs from \${esc(ctx.projectDisplayName)} will file there.</span></h2>
         <div class="card">
           <div id="projLoad" class="sub-muted">Loading Linear projects…</div>
         </div>\`);
@@ -2084,8 +2143,8 @@ async function renderSetup() {
         try { projects = (await api('GET', '/frontend-conqueror/linear/projects')).projects || []; }
         catch (e) { $('projLoad').textContent = e.message; return; }
         nav(html\`
-          \${dots(4)}
-          <h2>Where should bugs land?<span class="sub">Step 4 of 5 — pick or create a Linear project. Bugs from \${esc(ctx.projectDisplayName)} will file there.</span></h2>
+          \${dots(5)}
+          <h2>Where should bugs land?<span class="sub">Step 5 of \${totalSteps()} — pick or create a Linear project. Bugs from \${esc(ctx.projectDisplayName)} will file there.</span></h2>
           <div class="card">
             <label for="existing">Existing Linear project</label>
             <select id="existing">
@@ -2096,8 +2155,8 @@ async function renderSetup() {
             <label for="newName">Create a new Linear project</label>
             <input id="newName" placeholder="\${esc(ctx.projectDisplayName)} Bugs">
             <div class="err" id="err"></div>
-            <div class="row" style="justify-content:flex-end;margin-top:14px;">
-              <button class="ghost" onclick="(()=>{step=3;renderStep();})()">← Back</button>
+            <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
+              <button class="ghost" onclick="(()=>{step=4;renderStep();})()">← Back</button>
               <button class="primary" id="next">Continue →</button>
             </div>
           </div>\`);
@@ -2109,15 +2168,57 @@ async function renderSetup() {
           try {
             const body = existingId ? { projectId: existingId } : { newName };
             await api('PUT', '/frontend-conqueror/projects/' + ctx.projectKey + '/linear-project', body);
-            step = 5;
+            step = 6;
             renderStep();
           } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
         });
       })();
-    } else if (step === 5) {
+    } else if (step === 5 && ctx.backend === 'github') {
+      // v0.11.0: GitHub repo picker for the setup wizard. Same shape as the
+      // per-project wizard's GitHub step.
       nav(html\`
         \${dots(5)}
-        <h2>Add your first testers<span class="sub">Step 5 of 5 — only these emails will be able to file bugs from \${esc(ctx.projectDisplayName)}. You can add more later.</span></h2>
+        <h2>Which GitHub repo?<span class="sub">Step 5 of \${totalSteps()} — bugs from \${esc(ctx.projectDisplayName)} will land in this repo's Issues tab, tagged <code>fc:bug</code>.</span></h2>
+        <div class="card">
+          <label for="ghQuery">Search your repos</label>
+          <input id="ghQuery" placeholder="messarat, owner/repo, or leave blank to list recent" autofocus>
+          <div class="row" style="justify-content:flex-end;margin-top:6px;gap:6px;">
+            <button class="ghost" id="ghSearch">Search</button>
+          </div>
+          <div id="ghResults" style="margin-top:10px;"></div>
+          <div class="err" id="err" style="margin-top:6px;"></div>
+          <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
+            <button class="ghost" onclick="(()=>{step=4;renderStep();})()">← Back</button>
+          </div>
+        </div>\`);
+      const runSearch = async () => {
+        $('ghResults').innerHTML = '<div class="sub-muted">Searching…</div>';
+        try {
+          const q = $('ghQuery').value.trim();
+          const repos = (await api('GET', '/frontend-conqueror/github/repos?q=' + encodeURIComponent(q))).repos || [];
+          if (repos.length === 0) { $('ghResults').innerHTML = '<div class="empty">No matching repos. Try a different search, or type the full owner/repo directly:</div><div class="row" style="margin-top:6px;"><input id="ghDirect" placeholder="owner/repo"><button class="primary" id="ghPickDirect">Use this repo →</button></div>'; $('ghPickDirect').addEventListener('click', () => pickRepo($('ghDirect').value.trim())); return; }
+          $('ghResults').innerHTML = repos.map((r) => '<button class="palette-option" data-repo="' + esc(r.full_name) + '"><span class="name" style="font:600 12px/1.2 ui-monospace,Menlo,monospace;">' + esc(r.full_name) + '</span>' + (r.private ? ' <span class="kbd">private</span>' : '') + (r.description ? '<span class="desc" style="display:block;margin-top:4px;">' + esc(r.description) + '</span>' : '') + '</button>').join('');
+          $('ghResults').querySelectorAll('button.palette-option').forEach((btn) => {
+            btn.addEventListener('click', () => pickRepo(btn.getAttribute('data-repo')));
+          });
+        } catch (e) { $('ghResults').innerHTML = '<div class="err">' + esc(e.message) + '</div>'; }
+      };
+      const pickRepo = async (repo) => {
+        if (!repo || !repo.includes('/')) return ($('err').textContent = 'Repo must be in the form "owner/repo".');
+        try {
+          await api('PUT', '/frontend-conqueror/projects/' + ctx.projectKey + '/github-repo', { repo });
+          step = 6;
+          renderStep();
+        } catch (e) { $('err').textContent = e.message; }
+      };
+      $('ghSearch').addEventListener('click', runSearch);
+      $('ghQuery').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSearch(); } });
+      runSearch();
+    } else if (step === 6) {
+      // First tester (was step 5 pre-v0.11.0).
+      nav(html\`
+        \${dots(6)}
+        <h2>Add your first tester<span class="sub">Step 6 of \${totalSteps()} — only people whose email + password you set here will be able to file bugs from \${esc(ctx.projectDisplayName)}. You can add more later.</span></h2>
         <div class="card">
           <label for="firstEmail">First tester email</label>
           <input id="firstEmail" type="email" placeholder="alice@example.com" autofocus>
@@ -2125,8 +2226,8 @@ async function renderSetup() {
           <input id="firstPassword" type="text" placeholder="password">
           <div class="sub-muted" style="margin-top:6px;">You can add more testers from the project page after setup.</div>
           <div class="err" id="err"></div>
-          <div class="row" style="justify-content:flex-end;margin-top:14px;">
-            <button class="ghost" onclick="(()=>{step=4;renderStep();})()">← Back</button>
+          <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
+            <button class="ghost" onclick="(()=>{step=5;renderStep();})()">← Back</button>
             <button class="primary" id="finish">Finish setup →</button>
           </div>
         </div>\`);
@@ -2501,19 +2602,64 @@ async function renderProjectWizard(key) {
   let detail;
   try { detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project; }
   catch (e) { return renderError(e); }
-  const dots2 = (n) => '<div class="step-dots">' +
-    [1,2].map(i => '<div class="d ' + (i < n ? 'done' : i === n ? 'on' : '') + '"></div>').join('') +
+
+  // v0.11.0: backend-aware. Three logical steps now:
+  //   1. (skipped when only one backend is configured globally) backend chooser
+  //   2. destination picker (Linear projects OR GitHub repos based on backend)
+  //   3. add first tester
+  // The dots-progress widget adapts to the actual step count.
+  const linearReady = STATE.linear && STATE.linear.hasApiKey && STATE.linear.teamId;
+  const githubReady = STATE.github && STATE.github.hasToken;
+  const hasDestination = (detail.backend === 'github')
+    ? !!detail.githubRepo
+    : !!detail.linearProjectId;
+  // Show the chooser only when BOTH backends are configured globally AND this
+  // project doesn't have a destination yet. Otherwise auto-pick.
+  const showChooser = linearReady && githubReady && !hasDestination;
+  // Default backend: whatever the project already has, or the only configured
+  // option, or 'linear' as the historical default.
+  let backend = detail.backend || (githubReady && !linearReady ? 'github' : 'linear');
+  const totalSteps = (showChooser ? 3 : 2);
+  const dots = (n) => '<div class="step-dots">' +
+    Array.from({ length: totalSteps }, (_, i) => i + 1)
+      .map(i => '<div class="d ' + (i < n ? 'done' : i === n ? 'on' : '') + '"></div>').join('') +
     '</div>';
-  let step = detail.linearProjectId ? 2 : 1;
+  // The "first step" of the wizard depends on what's configured / done.
+  let step = 1;
+  if (!showChooser) step = hasDestination ? 3 : 2;
+  else if (hasDestination) step = 3;
 
   function renderStep() {
     if (step === 1) {
+      // Backend chooser. Only reached when both Linear + GitHub are configured.
       root().innerHTML = html\`
         <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
         <main>
           <div class="crumbs"><a href="#/">← Projects</a></div>
-          \${dots2(1)}
-          <h2>Where should bugs land?<span class="sub">Step 1 of 2 — pick or create a Linear project for \${esc(detail.displayName)}.</span></h2>
+          \${dots(1)}
+          <h2>Where do bugs land?<span class="sub">Step 1 of \${totalSteps} — pick a backend for \${esc(detail.displayName)}.</span></h2>
+          <div class="card">
+            <button class="palette-option" id="pickLinear" style="margin-bottom:8px;">
+              <span class="dot" style="background:#5e6ad2;"></span>
+              <span class="name">Linear project</span>
+              <span class="desc">Bugs land in a Linear project. Triage in Linear's UI.</span>
+            </button>
+            <button class="palette-option" id="pickGithub">
+              <span class="dot" style="background:#24292e;"></span>
+              <span class="name">GitHub Issues</span>
+              <span class="desc">Bugs land as GitHub Issues in a repo. Triage from \`gh\` CLI or the repo's Issues tab.</span>
+            </button>
+          </div>
+        </main>\`;
+      $('pickLinear').addEventListener('click', () => { backend = 'linear'; step = 2; renderStep(); });
+      $('pickGithub').addEventListener('click', () => { backend = 'github'; step = 2; renderStep(); });
+    } else if (step === 2 && backend === 'linear') {
+      root().innerHTML = html\`
+        <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
+        <main>
+          <div class="crumbs"><a href="#/">← Projects</a></div>
+          \${dots(showChooser ? 2 : 1)}
+          <h2>Where should bugs land?<span class="sub">Step \${showChooser ? 2 : 1} of \${totalSteps} — pick or create a Linear project for \${esc(detail.displayName)}.</span></h2>
           <div class="card"><div id="projLoad" class="sub-muted">Loading…</div></div>
         </main>\`;
       (async () => {
@@ -2535,9 +2681,11 @@ async function renderProjectWizard(key) {
           <label for="newName">Create a new Linear project</label>
           <input id="newName" placeholder="\${esc(detail.displayName)} Bugs">
           <div class="err" id="err"></div>
-          <div class="row" style="justify-content:flex-end;margin-top:14px;">
+          <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
+            \${showChooser ? '<button class="ghost" id="back">← Back</button>' : ''}
             <button class="primary" id="next">Continue →</button>
           </div>\`;
+        if (showChooser) $('back').addEventListener('click', () => { step = 1; renderStep(); });
         $('next').addEventListener('click', async () => {
           const existingId = $('existing').value;
           const newName = $('newName').value.trim();
@@ -2546,26 +2694,72 @@ async function renderProjectWizard(key) {
           try {
             const body = existingId ? { projectId: existingId } : { newName };
             await api('PUT', '/frontend-conqueror/projects/' + detail.key + '/linear-project', body);
-            step = 2;
+            step = 3;
             renderStep();
           } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
         });
       })();
-    } else if (step === 2) {
+    } else if (step === 2 && backend === 'github') {
+      // v0.11.0: GitHub repo picker. Same shape as the Linear step but talks
+      // to GitHub's Search Repositories API via the gate.
       root().innerHTML = html\`
         <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
         <main>
           <div class="crumbs"><a href="#/">← Projects</a></div>
-          \${dots2(2)}
-          <h2>Add your first tester<span class="sub">Step 2 of 2 — set an email + password. You can add more testers from the project page after.</span></h2>
+          \${dots(showChooser ? 2 : 1)}
+          <h2>Which GitHub repo?<span class="sub">Step \${showChooser ? 2 : 1} of \${totalSteps} — bugs from \${esc(detail.displayName)} will land in this repo's Issues tab, tagged <code>fc:bug</code>.</span></h2>
+          <div class="card">
+            <label for="ghQuery">Search your repos</label>
+            <input id="ghQuery" placeholder="messarat, owner/repo, or leave blank to list recent" autofocus>
+            <div class="row" style="justify-content:flex-end;margin-top:6px;gap:6px;">
+              <button class="ghost" id="ghSearch">Search</button>
+            </div>
+            <div id="ghResults" style="margin-top:10px;"></div>
+            <div class="err" id="err" style="margin-top:6px;"></div>
+            <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
+              \${showChooser ? '<button class="ghost" id="back">← Back</button>' : ''}
+            </div>
+          </div>
+        </main>\`;
+      if (showChooser) $('back').addEventListener('click', () => { step = 1; renderStep(); });
+      const runSearch = async () => {
+        $('ghResults').innerHTML = '<div class="sub-muted">Searching…</div>';
+        try {
+          const q = $('ghQuery').value.trim();
+          const repos = (await api('GET', '/frontend-conqueror/github/repos?q=' + encodeURIComponent(q))).repos || [];
+          if (repos.length === 0) { $('ghResults').innerHTML = '<div class="empty">No matching repos. Try a different search, or type the full owner/repo name directly:</div><div class="row" style="margin-top:6px;"><input id="ghDirect" placeholder="owner/repo"><button class="primary" id="ghPickDirect">Use this repo →</button></div>'; $('ghPickDirect').addEventListener('click', () => pickRepo($('ghDirect').value.trim())); return; }
+          $('ghResults').innerHTML = repos.map((r, i) => '<button class="palette-option" data-repo="' + esc(r.full_name) + '"><span class="name" style="font:600 12px/1.2 ui-monospace,Menlo,monospace;">' + esc(r.full_name) + '</span>' + (r.private ? ' <span class="kbd">private</span>' : '') + (r.description ? '<span class="desc" style="display:block;margin-top:4px;">' + esc(r.description) + '</span>' : '') + '</button>').join('');
+          $('ghResults').querySelectorAll('button.palette-option').forEach((btn) => {
+            btn.addEventListener('click', () => pickRepo(btn.getAttribute('data-repo')));
+          });
+        } catch (e) { $('ghResults').innerHTML = '<div class="err">' + esc(e.message) + '</div>'; }
+      };
+      const pickRepo = async (repo) => {
+        if (!repo || !repo.includes('/')) return ($('err').textContent = 'Repo must be in the form "owner/repo".');
+        try {
+          await api('PUT', '/frontend-conqueror/projects/' + detail.key + '/github-repo', { repo });
+          step = 3;
+          renderStep();
+        } catch (e) { $('err').textContent = e.message; }
+      };
+      $('ghSearch').addEventListener('click', runSearch);
+      $('ghQuery').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSearch(); } });
+      runSearch();  // initial load: show recent repos
+    } else if (step === 3) {
+      root().innerHTML = html\`
+        <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
+        <main>
+          <div class="crumbs"><a href="#/">← Projects</a></div>
+          \${dots(totalSteps)}
+          <h2>Add your first tester<span class="sub">Step \${totalSteps} of \${totalSteps} — set an email + password. You can add more testers from the project page after.</span></h2>
           <div class="card">
             <label for="firstEmail">Email</label>
             <input id="firstEmail" type="email" placeholder="alice@example.com" autofocus>
             <label for="firstPassword">Password (min 8 chars)</label>
             <input id="firstPassword" type="text" placeholder="password">
             <div class="err" id="err"></div>
-            <div class="row" style="justify-content:flex-end;margin-top:14px;">
-              <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
+            <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
+              <button class="ghost" onclick="(()=>{step=2;renderStep();})()">← Back</button>
               <button class="primary" id="finish">Activate project →</button>
             </div>
           </div>
