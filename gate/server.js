@@ -12,12 +12,50 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 const url = require('url');
 
 const PORT = Number(process.env.GATE_PORT || 54322);
 const HOST = process.env.GATE_HOST || '0.0.0.0';
-const DATA_FILE = process.env.GATE_DATA || path.join(__dirname, 'data.json');
+// v0.10.2: data file no longer defaults to node_modules. Resolution order:
+//   1. GATE_DATA env  (explicit — production deploys should always set this)
+//   2. ~/.frontend-conqueror/data.json  (new default — survives npm upgrades)
+//   3. <pkg-dir>/gate/data.json  (legacy node_modules path — auto-migrated to
+//      the new default on first boot if it exists and the new file doesn't)
+// Putting the file in node_modules was the original sin: `npm install` to
+// upgrade the plugin would silently wipe every tester credential, admin
+// password hash, Linear/GitHub token, and project record. ~/.frontend-conqueror
+// is the dotfile-pattern equivalent of what most node-based dev tools do
+// (vite, nuxt, npm itself).
+function resolveDataFile() {
+  if (process.env.GATE_DATA) return process.env.GATE_DATA;
+  const newDir = path.join(os.homedir(), '.frontend-conqueror');
+  const newPath = path.join(newDir, 'data.json');
+  const legacyPath = path.join(__dirname, 'data.json');
+  try { fs.mkdirSync(newDir, { recursive: true }); } catch {}
+  if (!fs.existsSync(newPath) && fs.existsSync(legacyPath)) {
+    try {
+      fs.copyFileSync(legacyPath, newPath);
+      process.stderr.write(
+        `[gate] migrated data file out of node_modules/ (which gets wiped on every npm upgrade).\n` +
+        `       old: ${legacyPath}\n` +
+        `       new: ${newPath}\n` +
+        `       The old file is left in place — delete it manually after verifying the new\n` +
+        `       location is being used (the [gate] startup log line shows the active path).\n`
+      );
+    } catch (e) {
+      process.stderr.write(
+        `[gate] WARN: could not auto-migrate data file from ${legacyPath} to ${newPath}: ${e.message}\n` +
+        `       Falling back to the legacy node_modules path. Your data will be lost on next\n` +
+        `       \`npm install\` unless you copy it manually or set GATE_DATA explicitly.\n`
+      );
+      return legacyPath;
+    }
+  }
+  return newPath;
+}
+const DATA_FILE = resolveDataFile();
 // The "default" password is shown on the login screen until the admin sets
 // a custom one (which is stored as a scrypt hash in data.json and from then on
 // overrides the default). Configurable via env so the developer can pick

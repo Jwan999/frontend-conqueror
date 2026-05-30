@@ -10,6 +10,18 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.10.2] — 2026-05-31
+
+### Fixed
+- **`data.json` is no longer wiped on `npm install`.** The gate's data file (admin password hash, tester credentials, Linear/GitHub tokens, all project records) used to default to `node_modules/frontend-conqueror/gate/data.json`. Every time you upgraded the plugin, npm replaced the package directory and silently erased all of it. New default: `~/.frontend-conqueror/data.json` — survives upgrades, follows the dotfile pattern most node tools use. **Existing deploys that set `GATE_DATA` explicitly are completely unaffected** — the env var always wins.
+
+### Migration (automatic)
+- On first boot of v0.10.2+, if `~/.frontend-conqueror/data.json` does not exist AND a legacy `node_modules/.../gate/data.json` does, the gate copies it to the new location and prints a loud stderr line: `[gate] migrated data file out of node_modules/...`. The old file is **left in place** for one boot cycle so the admin can verify the new location works before deleting. The startup log's `data:` line shows the active path either way.
+- If the copy fails (permissions, disk full, whatever), the gate falls back to the legacy path and prints a warning explaining what to do. Falling forward is never silent.
+
+### Compatibility
+- Resolution order: `GATE_DATA` env > new `~/.frontend-conqueror/data.json` > legacy `node_modules` path (auto-migrated). Existing CI / Docker / PM2 setups that pass `GATE_DATA=/var/data/...` continue to work byte-identically.
+
 ## [0.10.1] — 2026-05-31
 
 First of a series of usability fixes from real-world integrator feedback. Targets the worst foot-gun (no password-reset path) and the most leak-prone surface (default password being broadcast to anonymous callers in prod).
