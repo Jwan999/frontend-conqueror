@@ -10,6 +10,15 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.10.5] — 2026-05-31
+
+### Fixed
+- **`needsConfig` warning now respects the project's backend.** Previously it checked `linearProjectId` only, so a fully-set-up GitHub-backed project would forever show "Finish configuring this project — needs a Linear destination". Now: `hasDestination = backend === 'github' ? !!githubRepo : !!linearProjectId`.
+
+### Changed
+- **Friendlier empty Testers state** — "No testers yet — add the people who'll file feedback from this site." instead of bare "No testers yet."
+- **Inline explainer below the Add tester form** — reminds the admin to share the credentials out-of-band (DM, password manager) rather than in a shared chat.
+
 ## [0.10.4] — 2026-05-31
 
 ### Added

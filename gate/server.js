@@ -2235,7 +2235,11 @@ async function renderProjectDetail(key) {
   try { detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project; }
   catch (e) { return renderError(e); }
 
-  const needsConfig = detail.status === 'pending' || !detail.linearProjectId || detail.usersCount === 0;
+  // v0.10.5: needsConfig now respects the project's backend. Pre-v0.10.5 this
+  // checked detail.linearProjectId only, so a fully-set-up GitHub project
+  // still showed "needs configuring" forever.
+  const hasDestination = detail.backend === 'github' ? !!detail.githubRepo : !!detail.linearProjectId;
+  const needsConfig = detail.status === 'pending' || !hasDestination || detail.usersCount === 0;
   const overlayTag = '<' + 'script src="' + location.origin + '/' + detail.key + '/overlay.js" defer><' + '/script>';
   const pluginCfg = "gate: { url: '" + location.origin + "', project: '" + detail.key + "' }";
   // v0.9.8: pull the busiest origin so the auto-detect banner can name it.
@@ -2304,7 +2308,7 @@ async function renderProjectDetail(key) {
         <div class="sub-muted" style="margin-bottom:10px;">Each tester logs in with their email + the password you set here.</div>
         <div id="userList">
           \${detail.users.length === 0
-            ? '<div class="empty">No testers yet.</div>'
+            ? '<div class="empty">No testers yet — add the people who\\'ll file feedback from this site.</div>'
             : detail.users.map(u => {
                 const status = !u.hasPassword
                   ? '<span class="pill warn dot" style="background:rgba(245,158,11,.15);color:#fcd34d;">needs password</span>'
@@ -2323,6 +2327,7 @@ async function renderProjectDetail(key) {
           }
         </div>
         <label style="margin-top:14px;">Add tester</label>
+        <div class="sub-muted" style="font-size:11px;margin:-2px 0 6px;">Share the email + password with them out-of-band (DM, password manager — anywhere that isn't a shared chat).</div>
         <div class="row">
           <input id="newEmail" type="email" placeholder="alice@example.com">
           <input id="newPassword" type="text" placeholder="password (min 8 chars)" style="max-width:200px;">
