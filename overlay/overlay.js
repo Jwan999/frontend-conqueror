@@ -161,11 +161,27 @@
   }
   // Fire-and-forget: the rest of the overlay works fine with defaults if this
   // fails (no gate, offline, etc.). When it resolves, current colors update live.
+  // v0.10.4: on network failure during *dev* (localhost gate), show a one-time
+  // toast pointing at the CLI command. Pre-v0.10.4 the failure was silent and
+  // first-time integrators saw nothing in the UI — they had to open devtools
+  // to discover the gate wasn't running.
+  let fcGateUnreachableHinted = false;
+  function fcMaybeWarnGateUnreachable() {
+    if (fcGateUnreachableHinted) return;
+    fcGateUnreachableHinted = true;
+    const isLocal = /^(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|\[::1\])/i.test(GATE.url);
+    // Defer so toast() definition has executed and so the toast actually
+    // renders after the page has finished setting up.
+    setTimeout(() => {
+      if (isLocal) toast('Gate not running at ' + GATE.url + ' — run `npx frontend-conqueror gate`', 'error');
+      else toast("Can't reach gate at " + GATE.url, 'error');
+    }, 800);
+  }
   if (GATE && GATE.url) {
     fetch(GATE.url + '/api/mode-colors', { cache: 'no-store' })
       .then((r) => r.ok ? r.json() : null)
       .then((j) => { if (j) applyModeColorsFromGate(j.modeColors); })
-      .catch(() => {});
+      .catch(fcMaybeWarnGateUnreachable);
     // Heartbeat: announce ourselves on load, then every 5 minutes while the
     // page stays open. Lets the gate's admin see this project + page activity.
     gateHeartbeat();

@@ -10,6 +10,11 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.10.4] — 2026-05-31
+
+### Added
+- **"Gate not running" toast on the overlay.** When the overlay's initial `/api/mode-colors` fetch fails with a network error (most common cause: developer started `npm run dev` but didn't start the gate), a one-time toast surfaces the cause + the fix. For local gates (`localhost` / `127.0.0.1` URL): `Gate not running at <url> — run \`npx frontend-conqueror gate\``. For remote gates: `Can't reach gate at <url>`. Throttled to once per page session via a closure flag. Previously this failure was silent — first-time integrators had to open devtools and read a CORS / network error to figure out what was missing.
+
 ## [0.10.3] — 2026-05-31
 
 Two coordinated security tightenings.
