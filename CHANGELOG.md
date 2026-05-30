@@ -10,6 +10,21 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.10.3] — 2026-05-31
+
+Two coordinated security tightenings.
+
+### Changed
+- **Gate binds to `127.0.0.1` by default.** Previously `0.0.0.0`, which exposed every freshly-started gate to the local network — fine on a hardened dev laptop, dangerous on a cloud VM without a firewall rule or on hotel/conference wifi. Existing production deploys behind a reverse proxy already set `GATE_HOST=127.0.0.1` explicitly (because the proxy terminates TLS and forwards to localhost), so they're byte-identical. To get the old behaviour back: set `GATE_HOST=0.0.0.0`.
+
+### Fixed
+- **Default admin password can no longer be used indefinitely.** Previously, if you skipped changing the admin password after first login (via the existing `mustChangePassword: true` hint on the login response), the gate happily ran forever with the hardcoded default and any state-changing admin endpoint accepted writes. Now: as long as `adminPasswordHash` is null, every `POST`/`PUT`/`DELETE` admin endpoint returns `409 must-change-password` except `PUT /frontend-conqueror/password` itself (the rotation route) and `POST /frontend-conqueror/logout`. Reads (`/state`, project detail, `github/repos`, etc.) are still allowed so the UI can render the forced-rotate screen.
+- **Admin UI handles the 409 gracefully.** The shared `api()` helper detects `must-change-password` and routes to `renderForcedPasswordChange()` instead of toasting a raw error, so a user who somehow lands past the initial login screen with a default password lands back in the rotate flow.
+
+### Compatibility
+- All your existing v0.10.x deploys are already past this gate (admin password was set during v0.7 / v0.8 setup) — zero impact.
+- Fresh installs going forward: complete the password rotation before performing any other admin action.
+
 ## [0.10.2] — 2026-05-31
 
 ### Fixed

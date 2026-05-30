@@ -17,7 +17,15 @@ const crypto = require('crypto');
 const url = require('url');
 
 const PORT = Number(process.env.GATE_PORT || 54322);
-const HOST = process.env.GATE_HOST || '0.0.0.0';
+// v0.10.3: default to 127.0.0.1 (loopback only). Production deploys behind a
+// reverse proxy already set GATE_HOST=127.0.0.1 explicitly (because the proxy
+// terminates TLS and forwards to localhost). The old 0.0.0.0 default exposed
+// every freshly-started gate to the local network — fine on a developer
+// laptop, dangerous if the dev was on hotel/conference wifi or the gate
+// happened to boot on a cloud VM without a firewall rule. Explicit
+// GATE_HOST=0.0.0.0 still works for the rare case where you actually want
+// external reachability without a proxy.
+const HOST = process.env.GATE_HOST || '127.0.0.1';
 // v0.10.2: data file no longer defaults to node_modules. Resolution order:
 //   1. GATE_DATA env  (explicit — production deploys should always set this)
 //   2. ~/.frontend-conqueror/data.json  (new default — survives npm upgrades)
@@ -1337,6 +1345,23 @@ async function handle(req, res) {
 
   const isAdmin = requireAdmin(req);
 
+  // v0.10.3: force admin to rotate the default password before allowing any
+  // state-changing operation. Pre-v0.10.3 the gate happily ran forever with
+  // adminPasswordHash=null (and the default password 'frontend-conqueror'
+  // or whatever GATE_ADMIN_PASSWORD was set to). Reads still go through so
+  // the UI can render the forced-rotate screen; only the password-change
+  // route + logout are allowed writes until a real password is set.
+  if (isAdmin && (method === 'POST' || method === 'PUT' || method === 'DELETE')) {
+    const isPasswordRoute = method === 'PUT' && route === '/frontend-conqueror/password';
+    const isLogoutRoute = method === 'POST' && route === '/frontend-conqueror/logout';
+    if (!isPasswordRoute && !isLogoutRoute) {
+      const _d = loadData();
+      if (!_d.adminPasswordHash) {
+        return send(res, 409, { error: 'must-change-password', message: 'Change the admin password before performing this action.' });
+      }
+    }
+  }
+
   // ----- Admin: state + mode colors -----
 
   if (method === 'GET' && route === '/frontend-conqueror/state') {
@@ -1764,7 +1789,22 @@ async function api(method, route, body) {
   const text = await r.text();
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch {}
-  if (!r.ok) { const err = new Error((json && (json.message || json.error)) || r.statusText); err.payload = json; throw err; }
+  if (!r.ok) {
+    // v0.10.3: server enforces password rotation server-side. If the user
+    // somehow gets past the initial forced-rotate screen and tries to write,
+    // bounce them straight back to the rotate UI rather than surfacing a raw
+    // "must-change-password" error in a toast.
+    if (r.status === 409 && json && json.error === 'must-change-password') {
+      renderForcedPasswordChange();
+      const err = new Error('Change the admin password to continue.');
+      err.payload = json;
+      err.handled = true;
+      throw err;
+    }
+    const err = new Error((json && (json.message || json.error)) || r.statusText);
+    err.payload = json;
+    throw err;
+  }
   return json;
 }
 
