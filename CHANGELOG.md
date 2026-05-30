@@ -10,6 +10,22 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.10.1] — 2026-05-31
+
+First of a series of usability fixes from real-world integrator feedback. Targets the worst foot-gun (no password-reset path) and the most leak-prone surface (default password being broadcast to anonymous callers in prod).
+
+### Added
+- **`frontend-conqueror` CLI bin.** New top-level `bin/fc.js` dispatcher that routes subcommands the same way mature self-hosted tools do (vite, nuxt, jest pattern). Lets you run `npx frontend-conqueror gate` instead of `node node_modules/frontend-conqueror/gate/server.js`. Lays the groundwork for additional subcommands in later releases.
+- **`npx frontend-conqueror gate --reset-admin-password`** — operates on the gate's data file directly, clears `adminPasswordHash`, logs the default-password reminder + data-file path to stderr, exits. Mirrors the pattern used by Postgres / Discourse / Gitea / Nextcloud / Sentry for admin recovery: CLI-only, not an HTTP endpoint, so it requires shell access to the box rather than just a network connection. Closes the previously dead-end "I forgot the admin password" case where the only recovery was hand-editing `node_modules/frontend-conqueror/gate/data.json`.
+- **CLI `help` / `--help` / `-h`** output documenting subcommands and the environment variables that affect the gate.
+
+### Fixed
+- **Default admin password is no longer broadcast to anonymous callers in production.** `/frontend-conqueror/login-state` previously returned `defaultPassword: 'frontend-conqueror'` (or whatever `GATE_ADMIN_PASSWORD` was set to) to *anyone* hitting the URL — convenient in dev, dangerous if a prod gate was misconfigured to skip changing the password. Now gated on `NODE_ENV !== 'production'`. `usingDefault: true` is still returned in prod so the login UI can render an appropriate hint pointing at the CLI reset command rather than silently leaving the user stuck.
+- **Login-page hint adapted.** When `usingDefault` is true but `defaultPassword` is suppressed (prod), the hint reads: "Check the gate startup logs for the default password (or set `GATE_ADMIN_PASSWORD`). Locked out? Run `npx frontend-conqueror gate --reset-admin-password` on the server." When the password is visible (dev), the hint is unchanged from prior versions.
+
+### Internal
+- Top-level `package.json` gains `bin: { "frontend-conqueror": "./bin/fc.js" }` and `bin/` is added to `files` so the dispatcher actually ships in the published tarball.
+
 ## [0.10.0] — 2026-05-24
 
 **GitHub Issues backend.** The gate now writes bugs to GitHub Issues in addition to Linear. Per-project `backend` flag selects between them; mixed-backend gates work fine. The overlay, the plugin, and the entire `nuxt.config.js` consumer-side config are unchanged.

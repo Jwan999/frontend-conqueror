@@ -1258,11 +1258,17 @@ async function handle(req, res) {
 
   // Unauthenticated — tells the login page whether the default password is
   // still active so we can render the hint without leaking once it's changed.
+  // v0.10.1: only reveal the actual default value to anonymous callers in dev.
+  // A misconfigured prod gate previously broadcast 'frontend-conqueror' (or
+  // whatever GATE_ADMIN_PASSWORD was) to anyone hitting /frontend-conqueror.
+  // In prod we still set `usingDefault` so the login page can render an
+  // appropriate hint pointing at the CLI reset command.
   if (method === 'GET' && route === '/frontend-conqueror/login-state') {
     const data = loadData();
+    const isDev = process.env.NODE_ENV !== 'production';
     return send(res, 200, {
       usingDefault: !data.adminPasswordHash,
-      defaultPassword: !data.adminPasswordHash ? DEFAULT_ADMIN_PASSWORD : null,
+      defaultPassword: (isDev && !data.adminPasswordHash) ? DEFAULT_ADMIN_PASSWORD : null,
     });
   }
 
@@ -1787,11 +1793,21 @@ function renderError(e) {
 
 // ============================== LOGIN ==============================
 async function renderLogin(err) {
+  // v0.10.1: defaultPassword only travels over the wire in dev. usingDefault
+  // still travels everywhere so the prod hint can point at the CLI recovery
+  // command rather than silently leaving the user stuck.
   let hint = null;
+  let usingDefault = false;
   try {
     const s = await api('GET', '/frontend-conqueror/login-state');
-    if (s.usingDefault) hint = s.defaultPassword;
+    usingDefault = !!s.usingDefault;
+    if (s.defaultPassword) hint = s.defaultPassword;
   } catch {}
+  const hintHtml = hint
+    ? '<div class="sub-muted" style="margin-top:6px;">First time? Default password: <code>' + esc(hint) + '</code> — you\\'ll be asked to change it after sign-in.</div>'
+    : (usingDefault
+      ? '<div class="sub-muted" style="margin-top:6px;">First time? Check the gate startup logs for the default password (or set <code>GATE_ADMIN_PASSWORD</code>). Locked out? Run <code>npx frontend-conqueror gate --reset-admin-password</code> on the server.</div>'
+      : '');
   root().innerHTML = html\`
     <header><span class="brand">frontend-conqueror · gate</span></header>
     <main>
@@ -1800,7 +1816,7 @@ async function renderLogin(err) {
         <label for="pw">Password</label>
         <input id="pw" type="password" autofocus>
         <div class="err">\${err ? esc(err) : ''}</div>
-        \${hint ? '<div class="sub-muted" style="margin-top:6px;">First time? Default password: <code>' + esc(hint) + '</code> — you\\'ll be asked to change it after sign-in.</div>' : ''}
+        \${hintHtml}
         <div class="row" style="justify-content:flex-end;margin-top:14px;">
           <button class="primary" id="loginBtn">Sign in →</button>
         </div>
@@ -2624,13 +2640,33 @@ window.changePassword = async function() {
 };
 </script>
 </body></html>`;
+// v0.10.1: CLI subcommands. If any are present on argv, run them and exit
+// instead of starting the HTTP server. Mirrors the convention used by
+// psql/discourse/gitea/nextcloud/sentry — admin-recovery operations are CLI,
+// not endpoints, so they require shell access to the box rather than HTTP.
+function runCliIfRequested() {
+  if (process.argv.includes('--reset-admin-password')) {
+    const data = loadData();
+    data.adminPasswordHash = null;
+    saveData(data);
+    process.stderr.write(
+      `[gate] admin password reset.\n` +
+      `       Data file: ${DATA_FILE}\n` +
+      `       Log in with the default password ('${DEFAULT_ADMIN_PASSWORD}') next,\n` +
+      `       then change it from Settings.\n`
+    );
+    process.exit(0);
+  }
+}
+runCliIfRequested();
+
 http.createServer(handle).listen(PORT, HOST, () => {
   // Surface a clear "what's the default password right now" line so the
   // developer doesn't have to dig — useful in dev. Once data.adminPasswordHash
   // exists, this stops being printed and the env var is ignored.
   const initial = loadData();
   if (!initial.adminPasswordHash) {
-    console.log(`[gate] no admin password set yet — default is "${DEFAULT_ADMIN_PASSWORD}" (shown on login page)`);
+    console.log(`[gate] no admin password set yet — default is "${DEFAULT_ADMIN_PASSWORD}" (shown on login page in dev)`);
   } else {
     console.log('[gate] custom admin password in use');
   }

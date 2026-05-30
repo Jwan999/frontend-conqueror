@@ -1,6 +1,6 @@
 {
   "name": "frontend-conqueror",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "private": true,
   "description": "Edit text in your dev site. Drop TODOs from the browser. Let testers file Linear issues from production. Three modes, one overlay, no server lock-in.",
   "license": "MIT",
@@ -17,7 +17,11 @@
     "./overlay.js": "./overlay/overlay.js",
     "./package.json": "./package.json"
   },
+  "bin": {
+    "frontend-conqueror": "./bin/fc.js"
+  },
   "files": [
+    "bin",
     "plugin",
     "agent",
     "gate",
