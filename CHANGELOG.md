@@ -10,6 +10,14 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.12.3] — 2026-05-31
+
+### Fixed
+- **Adding a second GitHub account felt like it was replacing the first.** It wasn't — v0.12.1 already deduped by exact token so two different PATs coexist — but the success toast was identical for both "added new" and "re-pasted the same token", and the SPA didn't auto-navigate to show the new card list. Reasonable users assumed the second PAT had silently replaced the first. Now the server returns `existed: boolean` and `totalCount`, and the SPA shows distinct toasts: `Added @label. Total: N account(s) connected.` vs `Already connected as @label — no change. Total: N.` After every add the SPA jumps to `#/settings/github` so the user sees the cards immediately.
+
+### Added
+- **`[gate] github account added: gh-X (@user); total=N`** server-log line on successful add — makes "did my add actually persist?" answerable from `tail /tmp/gate.log` without poking the data.json directly.
+
 ## [0.12.2] — 2026-05-31
 
 **Split-repo projects.** One gate project key (e.g. `messarat`) can now route bugs to TWO repos based on which app they were filed from. The Nuxt frontend and the Laravel backend each declare `gate.side = 'frontend' | 'backend'` in their plugin config; the gate stores a `frontend repo + backend repo` pair on the project and routes reports + bubbles to the matching repo. Single-repo projects (TM-frontend, dawwama, makers-landing) are entirely unaffected — the feature is opt-in per project.

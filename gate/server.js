@@ -1943,14 +1943,21 @@ async function handle(req, res) {
       return send(res, 400, { error: 'token-invalid', message: 'GitHub rejected this token: ' + e.message });
     }
     const data = loadData();
-    // Exact-token match → no-op (idempotent re-paste).
+    // Exact-token match → no-op (idempotent re-paste). v0.12.3: return
+    // existed:true so the SPA can show a distinct toast ("already connected"
+    // vs "added"). Without it the user has no way to tell why the count
+    // didn't grow.
     const exactDup = data.github.accounts.find((a) => a.token === token);
     if (exactDup) {
       if (labelRaw && labelRaw !== exactDup.label) {
         exactDup.label = labelRaw;
         saveData(data);
       }
-      return send(res, 200, { account: { id: exactDup.id, username: exactDup.username, label: exactDup.label || exactDup.username } });
+      return send(res, 200, {
+        account: { id: exactDup.id, username: exactDup.username, label: exactDup.label || exactDup.username },
+        existed: true,
+        totalCount: data.github.accounts.length,
+      });
     }
     // New account. id = 'gh-' + (label or username), disambiguated if it
     // collides (same username + no label, or two accounts with the same
@@ -1967,7 +1974,12 @@ async function handle(req, res) {
     };
     data.github.accounts.push(acct);
     saveData(data);
-    return send(res, 200, { account: { id: acct.id, username: acct.username, label: acct.label } });
+    console.log(`[gate] github account added: ${acct.id} (@${acct.username}); total=${data.github.accounts.length}`);
+    return send(res, 200, {
+      account: { id: acct.id, username: acct.username, label: acct.label },
+      existed: false,
+      totalCount: data.github.accounts.length,
+    });
   }
 
   // GET /github/accounts — list connected accounts (no tokens).
@@ -3546,6 +3558,10 @@ window.removeApiKey = async function() {
 // v0.12.1: Add an account. Dedups by EXACT token (re-paste = no-op); allows
 // multiple accounts with the same GitHub username (e.g. fine-grained PATs
 // for different repo sets), distinguished by user-supplied labels.
+// v0.12.3: toast is now unambiguous — distinguishes "added" from "already
+// connected" using the server's existed flag, and reports the new total
+// account count. Also navigates to #/settings/github so the user SEES the
+// cards rather than just reading a toast.
 window.addGithubAccount = async function() {
   const token = prompt('Paste GitHub PAT — classic with "repo" scope (easiest, sees all repos) OR fine-grained with Issues: R/W + Metadata: R:');
   if (!token) return;
@@ -3553,7 +3569,14 @@ window.addGithubAccount = async function() {
   try {
     const r = await api('PUT', '/frontend-conqueror/github/accounts', { token, label });
     STATE = null;
-    toast('Connected as ' + (r.account ? (r.account.label || ('@' + r.account.username)) : '?') + '.');
+    const displayName = r.account ? (r.account.label || ('@' + r.account.username)) : '?';
+    if (r.existed) {
+      toast('Already connected as ' + displayName + ' — no change. Total: ' + (r.totalCount || '?') + ' account(s).');
+    } else {
+      toast('Added ' + displayName + '. Total: ' + (r.totalCount || '?') + ' account(s) connected.');
+    }
+    // Force the user to the GitHub tab so they can see the populated card list.
+    go('#/settings/github');
     navigate();
   } catch (e) { toast(e.message, 'err'); }
 };
