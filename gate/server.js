@@ -204,7 +204,30 @@ function loadData() {
   if (!data.modeColors) data.modeColors = { ...DEFAULT_MODE_COLORS };
   if (!data.projects) data.projects = {};
   if (data.linear === undefined) data.linear = null;
-  if (data.github === undefined) data.github = null;
+
+  // v0.12.0 migration: data.github went from a single PAT shape
+  //   { token, username }  →  { accounts: [{ id, token, username, addedAt }] }
+  // The gate now holds an arbitrary list of GitHub accounts so admins can
+  // route different projects through different orgs' PATs. Idempotent — the
+  // new-shape branch leaves accounts untouched.
+  if (!data.github) {
+    data.github = { accounts: [] };
+  } else if (!data.github.accounts) {
+    // Old single-PAT shape — convert.
+    if (data.github.token) {
+      const username = data.github.username || 'default';
+      data.github = {
+        accounts: [{
+          id: 'gh-' + username,
+          token: data.github.token,
+          username,
+          addedAt: Math.floor(Date.now() / 1000),
+        }],
+      };
+    } else {
+      data.github = { accounts: [] };
+    }
+  }
 
   // v0.8.0 migration: convert per-project emails[] to users{} (with no
   // password — admin must set one). Idempotent — leaves existing users{} alone.
@@ -234,7 +257,24 @@ function loadData() {
       proj.backend = 'github';
     }
     if (proj.githubRepo === undefined) proj.githubRepo = '';
-    if (proj.githubToken === undefined) proj.githubToken = null;
+    // v0.12.0: per-project routing — which account in data.github.accounts
+    // files this project's bug reports. Null until the project picks one.
+    if (proj.githubAccountId === undefined) proj.githubAccountId = null;
+    // v0.12.0: migrate any legacy proj.githubToken into a new account on the
+    // gate. None of the current projects on local or prod gates use this
+    // override, but the data shape change shouldn't silently drop a real
+    // override if a stray one exists somewhere.
+    if (proj.githubToken) {
+      const id = 'gh-proj-' + proj.key;
+      data.github.accounts.push({
+        id,
+        token: proj.githubToken,
+        username: '',
+        addedAt: Math.floor(Date.now() / 1000),
+      });
+      proj.githubAccountId = id;
+    }
+    delete proj.githubToken;
   }
   return data;
 }
@@ -275,11 +315,26 @@ function projectLinear(data, proj) {
     projectName: proj.linearProjectName || '',
   };
 }
-// v0.10.0+: resolve GitHub credentials for a project. Per-project token wins;
-// falls back to the gate-wide token. Repo is project-scoped only.
+// v0.12.0: resolve GitHub credentials for a project. data.github now holds an
+// array of accounts (each its own PAT) — projects pick which one routes their
+// reports via proj.githubAccountId. When unset, falls back to the first
+// account so legacy single-account gates keep working without migration.
 function projectGithub(data, proj) {
-  const token = proj.githubToken || (data.github && data.github.token) || null;
-  return { token, repo: proj.githubRepo || '' };
+  const accounts = (data.github && data.github.accounts) || [];
+  const picked = (proj.githubAccountId && accounts.find((a) => a.id === proj.githubAccountId))
+    || accounts[0]
+    || null;
+  return {
+    token: picked ? picked.token : null,
+    username: picked ? picked.username : '',
+    accountId: picked ? picked.id : null,
+    repo: proj.githubRepo || '',
+  };
+}
+// v0.12.0: look up a specific account by id (for explicit-account API calls).
+function getGithubAccount(data, accountId) {
+  const accounts = (data.github && data.github.accounts) || [];
+  return accounts.find((a) => a.id === accountId) || null;
 }
 // SHA-256 of an IP + the gate's daily salt. Daily salt rotates each UTC day,
 // so we can compute unique-IP counts without storing raw IPs.
@@ -906,10 +961,13 @@ function publicLinear(linear) {
     availableTeams: linear.availableTeams || null,
   };
 }
-// v0.10.0+: hide PAT, surface only the username that owns it.
+// v0.12.0: surface the list of connected accounts (id + username only — never
+// tokens). Replaces the v0.10.0 single-PAT shape { hasToken, username }.
 function publicGithub(github) {
-  if (!github) return null;
-  return { hasToken: !!github.token, username: github.username || '' };
+  if (!github || !github.accounts) return { accounts: [] };
+  return {
+    accounts: github.accounts.map((a) => ({ id: a.id, username: a.username || '' })),
+  };
 }
 // Per-project summary for the admin list (no allowlist values leaked here).
 function publicProjectSummary(p) {
@@ -927,7 +985,7 @@ function publicProjectSummary(p) {
     linearProjectName: p.linearProjectName || '',
     hasLinearOverride: !!(p.linearApiKey || p.linearTeamId),
     githubRepo: p.githubRepo || '',
-    hasGithubOverride: !!p.githubToken,
+    githubAccountId: p.githubAccountId || null,
     activity: {
       firstSeenAt: a.firstSeenAt,
       lastSeenAt: a.lastSeenAt,
@@ -1077,7 +1135,8 @@ async function handle(req, res) {
       proj.activity.reportsCount = (proj.activity.reportsCount || 0) + 1;
       saveData(data);
       bustIssuesCache(proj.key);
-      console.log(`[gate] issue ${created.identifier || created.id} for ${proj.key} (${proj.backend}) by ${payload.email}`);
+      const acctTag = proj.backend === 'github' ? ` @${projectGithub(data, proj).username || '?'}` : '';
+      console.log(`[gate] issue ${created.identifier || created.id} for ${proj.key} (${proj.backend}${acctTag}) by ${payload.email}`);
       return send(res, 200, { ok: true, issue: created });
     } catch (e) {
       // v0.11.3: report the actual backend that failed (was hardcoded
@@ -1575,19 +1634,30 @@ async function handle(req, res) {
     if (method === 'PUT' && sub === 'github-repo') {
       let body;
       try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
-      const gh = projectGithub(data, proj);
-      if (!gh.token) return send(res, 400, { error: 'no-token', message: 'No GitHub PAT set in Settings.' });
       const repoStr = typeof body.repo === 'string' ? body.repo.trim() : '';
       if (!repoStr) return send(res, 400, { error: 'missing-repo' });
       let parsed;
       try { parsed = parseGithubRepo(repoStr); }
       catch (e) { return send(res, 400, { error: 'bad-repo', message: e.message }); }
+      // v0.12.0: caller may pass accountId to lock the project to a specific
+      // account. If omitted, keep the current githubAccountId (or fall back
+      // to the first account).
+      let acct = null;
+      if (body.accountId) {
+        acct = getGithubAccount(data, body.accountId);
+        if (!acct) return send(res, 400, { error: 'no-such-account' });
+      } else {
+        acct = (proj.githubAccountId && getGithubAccount(data, proj.githubAccountId))
+          || (data.github.accounts[0] || null);
+      }
+      if (!acct || !acct.token) return send(res, 400, { error: 'no-token', message: 'No GitHub account connected. Add one in Settings → GitHub.' });
       try {
         // Confirm access + that issues are enabled.
-        const repoInfo = await githubREST(gh.token, 'GET', `/repos/${parsed.owner}/${parsed.repo}`);
+        const repoInfo = await githubREST(acct.token, 'GET', `/repos/${parsed.owner}/${parsed.repo}`);
         if (!repoInfo.has_issues) return send(res, 400, { error: 'issues-disabled', message: 'Issues are disabled on this repo. Enable them in GitHub repo settings first.' });
-        await ensureFcBugLabel(gh.token, parsed.owner, parsed.repo);
+        await ensureFcBugLabel(acct.token, parsed.owner, parsed.repo);
         proj.githubRepo = repoInfo.full_name;
+        proj.githubAccountId = acct.id;
         proj.backend = 'github';
         saveData(data);
         bustIssuesCache(proj.key);
@@ -1595,6 +1665,25 @@ async function handle(req, res) {
       } catch (e) {
         return send(res, 502, { error: 'github-unreachable', message: e.message });
       }
+    }
+    // v0.12.0: change the account routing this project's reports WITHOUT
+    // re-picking a repo. Validates the new account can still see the repo.
+    if (method === 'PUT' && sub === 'github-account') {
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+      const acct = body.accountId ? getGithubAccount(data, body.accountId) : null;
+      if (!acct) return send(res, 400, { error: 'no-such-account' });
+      if (!proj.githubRepo) return send(res, 400, { error: 'no-repo', message: 'Pick a repo first.' });
+      try {
+        const parsedR = parseGithubRepo(proj.githubRepo);
+        await githubREST(acct.token, 'GET', `/repos/${parsedR.owner}/${parsedR.repo}`);
+      } catch (e) {
+        return send(res, 400, { error: 'account-cannot-see-repo', message: 'This account can\'t see ' + proj.githubRepo + ': ' + e.message });
+      }
+      proj.githubAccountId = acct.id;
+      saveData(data);
+      bustIssuesCache(proj.key);
+      return send(res, 200, { project: publicProjectDetail(proj) });
     }
     return send(res, 404, { error: 'not-found' });
   }
@@ -1699,16 +1788,20 @@ async function handle(req, res) {
     return send(res, 200, { linear: null });
   }
 
-  // ----- Admin: GitHub (v0.10.0+) -----
-  // Mirrors the Linear admin shape: set/clear a gate-wide token, list
-  // accessible repos for the wizard's repo picker.
-  if (method === 'PUT' && route === '/frontend-conqueror/github/token') {
+  // ----- Admin: GitHub accounts (v0.12.0) -----
+  // The gate now holds an arbitrary list of GitHub accounts (each its own PAT)
+  // so admins can route different projects through different orgs. Each
+  // account is keyed by its GitHub username (id='gh-<username>') with collision
+  // disambiguation; the routing happens per-project via proj.githubAccountId.
+
+  // PUT /github/accounts — add or replace an account (by validated username).
+  // Body: { token }. Returns { account: {id, username} }.
+  if (method === 'PUT' && route === '/frontend-conqueror/github/accounts') {
     if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
     let body;
     try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
     const token = typeof body.token === 'string' ? body.token.trim() : '';
     if (!token) return send(res, 400, { error: 'missing-token' });
-    // Validate by hitting /user and see whose token this is.
     let username;
     try {
       const me = await githubREST(token, 'GET', '/user');
@@ -1718,76 +1811,180 @@ async function handle(req, res) {
       return send(res, 400, { error: 'token-invalid', message: 'GitHub rejected this token: ' + e.message });
     }
     const data = loadData();
-    const prevToken = data.github && data.github.token;
-    if (prevToken && prevToken !== token) _ghRepoCache.delete(prevToken);
-    data.github = { token, username };
+    // Re-adding an existing username replaces that account's token (the
+    // intended UX for "rotate the PAT for the org I already have connected").
+    let existing = data.github.accounts.find((a) => a.username === username);
+    if (existing) {
+      if (existing.token !== token) _ghRepoCache.delete(existing.token);
+      existing.token = token;
+    } else {
+      let id = 'gh-' + username;
+      let n = 2;
+      while (data.github.accounts.find((a) => a.id === id)) id = 'gh-' + username + '-' + n++;
+      existing = { id, token, username, addedAt: Math.floor(Date.now() / 1000) };
+      data.github.accounts.push(existing);
+    }
+    saveData(data);
+    return send(res, 200, { account: { id: existing.id, username: existing.username } });
+  }
+
+  // GET /github/accounts — list connected accounts (no tokens).
+  if (method === 'GET' && route === '/frontend-conqueror/github/accounts') {
+    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
+    const data = loadData();
+    return send(res, 200, { accounts: data.github.accounts.map((a) => ({ id: a.id, username: a.username })) });
+  }
+
+  // GET /github/accounts/:id/token — reveal a single account's PAT.
+  const ghAcctTokenMatch = route.match(/^\/frontend-conqueror\/github\/accounts\/([A-Za-z0-9_-]+)\/token$/);
+  if (method === 'GET' && ghAcctTokenMatch) {
+    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
+    const data = loadData();
+    const acct = data.github.accounts.find((a) => a.id === ghAcctTokenMatch[1]);
+    if (!acct) return send(res, 404, { error: 'no-such-account' });
+    return send(res, 200, { token: acct.token });
+  }
+
+  // DELETE /github/accounts/:id — remove an account. Any project that was
+  // routing through it has its githubAccountId nulled so the next admin sees
+  // "pick an account" prompts instead of silent broken routing.
+  const ghAcctDeleteMatch = route.match(/^\/frontend-conqueror\/github\/accounts\/([A-Za-z0-9_-]+)$/);
+  if (method === 'DELETE' && ghAcctDeleteMatch) {
+    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
+    const data = loadData();
+    const idx = data.github.accounts.findIndex((a) => a.id === ghAcctDeleteMatch[1]);
+    if (idx < 0) return send(res, 404, { error: 'no-such-account' });
+    const acct = data.github.accounts[idx];
+    _ghRepoCache.delete(acct.token);
+    data.github.accounts.splice(idx, 1);
+    for (const proj of Object.values(data.projects)) {
+      if (proj.githubAccountId === acct.id) proj.githubAccountId = null;
+    }
+    saveData(data);
+    return send(res, 200, { ok: true });
+  }
+
+  // ----- Deprecated v0.10–v0.11 shims (route to the new endpoints) -----
+  // These keep prod gates that haven't bumped to v0.12.0 working when they
+  // POST to /github/token from an older consumer-project deploy script, etc.
+
+  if (method === 'PUT' && route === '/frontend-conqueror/github/token') {
+    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+    const token = typeof body.token === 'string' ? body.token.trim() : '';
+    if (!token) return send(res, 400, { error: 'missing-token' });
+    let username;
+    try {
+      const me = await githubREST(token, 'GET', '/user');
+      username = me && me.login;
+      if (!username) throw new Error('unexpected /user response');
+    } catch (e) {
+      return send(res, 400, { error: 'token-invalid', message: 'GitHub rejected this token: ' + e.message });
+    }
+    const data = loadData();
+    let existing = data.github.accounts.find((a) => a.username === username);
+    if (existing) {
+      if (existing.token !== token) _ghRepoCache.delete(existing.token);
+      existing.token = token;
+    } else {
+      let id = 'gh-' + username;
+      let n = 2;
+      while (data.github.accounts.find((a) => a.id === id)) id = 'gh-' + username + '-' + n++;
+      existing = { id, token, username, addedAt: Math.floor(Date.now() / 1000) };
+      data.github.accounts.push(existing);
+    }
     saveData(data);
     return send(res, 200, { github: publicGithub(data.github) });
   }
   if (method === 'DELETE' && route === '/frontend-conqueror/github') {
     if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
     const data = loadData();
-    data.github = null;
-    // v0.11.2: blow the cached /user/repos for the now-removed token so a
-    // re-paste doesn't see stale data.
-    _ghRepoCache.clear();
+    for (const a of data.github.accounts) _ghRepoCache.delete(a.token);
+    data.github = { accounts: [] };
+    for (const proj of Object.values(data.projects)) proj.githubAccountId = null;
     saveData(data);
-    return send(res, 200, { github: null });
+    return send(res, 200, { github: publicGithub(data.github) });
   }
-  // v0.11.2: admin-only token reveal so the user can copy the stored PAT and
-  // paste it into another gate (or a password manager) without leaving the
-  // admin UI. Only returns the token over the wire when the session is
-  // authenticated as admin — same trust level as the rest of /frontend-conqueror.
   if (method === 'GET' && route === '/frontend-conqueror/github/token') {
     if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
     const data = loadData();
-    const token = data.github && data.github.token;
-    if (!token) return send(res, 404, { error: 'no-token' });
-    return send(res, 200, { token });
+    const acct = data.github.accounts[0];
+    if (!acct) return send(res, 404, { error: 'no-token' });
+    return send(res, 200, { token: acct.token });
   }
-  // Repo search for the wizard picker. v0.11.1: always uses /user/repos and
-  // filters locally, so PRIVATE repos surface (GitHub's /search/repositories
-  // endpoint biases against private repos when the query has no user:/org:
-  // prefix). Per-token 30 s memory cache so the live combobox doesn't hammer
-  // GitHub on every keystroke.
+
+  // Repo search merges /user/repos across every connected account, tags each
+  // result with which account surfaced it, dedups by full_name (first account
+  // wins on dup), and adds direct-lookup fallback for owner/repo queries that
+  // no account's /user/repos surfaces. Optional ?accountId= constrains the
+  // search to a single account.
   if (method === 'GET' && route === '/frontend-conqueror/github/repos') {
     if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
     const data = loadData();
-    const token = data.github && data.github.token;
-    if (!token) return send(res, 400, { error: 'no-token' });
+    const requestedAcctId = (parsed.query && parsed.query.accountId) || null;
+    const accounts = requestedAcctId
+      ? data.github.accounts.filter((a) => a.id === requestedAcctId)
+      : data.github.accounts;
+    if (accounts.length === 0) return send(res, 400, { error: 'no-accounts' });
     const qRaw = String((parsed.query && parsed.query.q) || '').trim();
     const q = qRaw.toLowerCase();
     try {
-      const all = await getCachedUserRepos(token);
-      const filtered = !q ? all : all.filter((r) =>
-        (r.full_name || '').toLowerCase().includes(q) ||
-        (r.description || '').toLowerCase().includes(q)
-      );
-      let repos = filtered.slice(0, 30).map((r) => ({
-        full_name: r.full_name,
-        description: r.description || '',
-        private: !!r.private,
+      // Fetch each account's /user/repos in parallel; tag results with the
+      // accountId that returned them. Failures on one account don't kill the
+      // whole search (a revoked PAT shouldn't black-hole the other accounts).
+      const perAccountLists = await Promise.all(accounts.map(async (acct) => {
+        try {
+          const repos = await getCachedUserRepos(acct.token);
+          return { acct, repos };
+        } catch {
+          return { acct, repos: [] };
+        }
+      }));
+      // Filter + dedup. Iterate in account order so the FIRST account that
+      // surfaces a repo wins for that repo's accountId tag.
+      const seen = new Map(); // full_name → { acct, repo }
+      for (const { acct, repos } of perAccountLists) {
+        for (const r of repos) {
+          if (seen.has(r.full_name)) continue;
+          const matches = !q
+            ? true
+            : (r.full_name || '').toLowerCase().includes(q)
+              || (r.description || '').toLowerCase().includes(q);
+          if (!matches) continue;
+          seen.set(r.full_name, { acct, repo: r });
+        }
+      }
+      let repos = Array.from(seen.values()).slice(0, 30).map(({ acct, repo }) => ({
+        full_name: repo.full_name,
+        description: repo.description || '',
+        private: !!repo.private,
+        accountId: acct.id,
+        accountUsername: acct.username,
       }));
       let hint = null;
-      // v0.11.2+: if the query looks like "owner/name" and /user/repos didn't
-      // surface it, probe /repos/:o/:r directly. Per GitHub's docs, that
-      // endpoint returns 200 when the PAT has access (most common path:
-      // fine-grained PAT scoped to that one repo with Metadata:R, Issues:R/W).
-      // 404 means either (a) the PAT isn't approved for that org yet, or
-      // (b) the PAT's Resource Owner is the user instead of the org, or
-      // (c) the repo doesn't exist / has been renamed. We surface a hint so
-      // the SPA can show the org-approval workflow inline.
+      // Direct-lookup fallback when the query is owner/repo-shaped. Try every
+      // account; the first one that can reach the repo wins.
       if (qRaw.includes('/') && repos.length === 0) {
-        const direct = await tryDirectRepoLookup(token, qRaw);
-        if (direct) repos = [direct];
-        else hint = 'direct-lookup-404';
+        for (const acct of accounts) {
+          const direct = await tryDirectRepoLookup(acct.token, qRaw);
+          if (direct) {
+            repos = [{ ...direct, accountId: acct.id, accountUsername: acct.username }];
+            break;
+          }
+        }
+        if (repos.length === 0) hint = 'direct-lookup-404';
       }
-      // v0.11.2+: also accept a bare repo name (no "/") and try the connected
-      // user's owner-prefix as a fallback — covers the common case where the
-      // user types "my-repo" and forgets the owner.
-      if (!qRaw.includes('/') && qRaw && repos.length === 0 && data.github.username) {
-        const direct = await tryDirectRepoLookup(token, data.github.username + '/' + qRaw);
-        if (direct) repos = [direct];
+      // Bare-name fallback: try <username>/<name> for each account's owner.
+      if (!qRaw.includes('/') && qRaw && repos.length === 0) {
+        for (const acct of accounts) {
+          if (!acct.username) continue;
+          const direct = await tryDirectRepoLookup(acct.token, acct.username + '/' + qRaw);
+          if (direct) {
+            repos = [{ ...direct, accountId: acct.id, accountUsername: acct.username }];
+            break;
+          }
+        }
       }
       return send(res, 200, { repos, hint });
     } catch (e) {
@@ -2047,15 +2244,20 @@ function renderRepoCombobox(host, opts) {
       activeIdx = -1;
       return;
     }
+    // v0.12.0: surface which connected account surfaced each repo. The badge
+    // matters when multiple accounts are connected — clarifies routing before
+    // the user commits to a repo pick. With one account, the badge still
+    // renders but is informational.
     resultsEl.innerHTML = current.map((r, i) => (
-      '<button class="palette-option" data-repo="' + esc(r.full_name) + '" data-idx="' + i + '"' + (i === activeIdx ? ' aria-selected="true"' : '') + '>' +
+      '<button class="palette-option" data-repo="' + esc(r.full_name) + '" data-account="' + esc(r.accountId || '') + '" data-idx="' + i + '"' + (i === activeIdx ? ' aria-selected="true"' : '') + '>' +
         '<span class="name" style="font:600 12px/1.2 ui-monospace,Menlo,monospace;">' + esc(r.full_name) + '</span>' +
         (r.private ? ' <span class="kbd">private</span>' : '') +
+        (r.accountUsername ? ' <span class="kbd" style="opacity:0.75;">@' + esc(r.accountUsername) + '</span>' : '') +
         (r.description ? '<span class="desc" style="display:block;margin-top:4px;">' + esc(r.description) + '</span>' : '') +
       '</button>'
     )).join('');
     resultsEl.querySelectorAll('button.palette-option').forEach((btn) => {
-      btn.addEventListener('click', () => opts.onPick && opts.onPick(btn.getAttribute('data-repo')));
+      btn.addEventListener('click', () => opts.onPick && opts.onPick(btn.getAttribute('data-repo'), btn.getAttribute('data-account') || null));
     });
   };
 
@@ -2090,7 +2292,7 @@ function renderRepoCombobox(host, opts) {
       if (current.length) { activeIdx = (activeIdx - 1 + current.length) % current.length; renderRows(); resultsEl.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' }); }
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      if (activeIdx >= 0 && current[activeIdx]) opts.onPick && opts.onPick(current[activeIdx].full_name);
+      if (activeIdx >= 0 && current[activeIdx]) opts.onPick && opts.onPick(current[activeIdx].full_name, current[activeIdx].accountId || null);
     } else if (e.key === 'Escape') {
       input.value = '';
       search('');
@@ -2192,7 +2394,8 @@ async function navigate() {
     const totalProjects = STATE.projects.length;
     // v0.11.2: first-run check uses GitHub now (setup wizard is GitHub-only).
     // Legacy gates with only Linear configured fall through to renderList.
-    const hasGithub = STATE.github && STATE.github.hasToken;
+    // v0.12.0: first-run check looks for at least one connected GitHub account.
+    const hasGithub = STATE.github && (STATE.github.accounts || []).length > 0;
     if (!hasGithub && totalProjects === 0) return renderSetup();
     return renderList();
   }
@@ -2395,10 +2598,10 @@ async function renderSetup() {
             <button class="ghost" onclick="(()=>{step=2;renderStep();})()">← Back</button>
           </div>
         </div>\`);
-      const pickRepo = async (repo) => {
+      const pickRepo = async (repo, accountId) => {
         if (!repo || !repo.includes('/')) return ($('err').textContent = 'Repo must be in the form "owner/repo".');
         try {
-          await api('PUT', '/frontend-conqueror/projects/' + ctx.projectKey + '/github-repo', { repo });
+          await api('PUT', '/frontend-conqueror/projects/' + ctx.projectKey + '/github-repo', { repo, accountId });
           step = 4;
           renderStep();
         } catch (e) { $('err').textContent = e.message; }
@@ -2656,11 +2859,23 @@ async function renderProjectDetail(key) {
         </div>
       \` : html\`
         \${detail.githubRepo ? html\`
-          <div class="body">Reports go to: <strong><a href="https://github.com/\${esc(detail.githubRepo)}/issues" target="_blank" rel="noreferrer">\${esc(detail.githubRepo)}</a></strong> (GitHub Issues)</div>
-          <div class="meta">Token: @\${esc(STATE.github ? STATE.github.username : '?')}\${detail.hasGithubOverride ? ' (per-project override)' : ''}</div>
-          <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
-            <button class="ghost" onclick="changeGithubRepo('\${esc(detail.key)}')">Change repo</button>
-          </div>
+          \${(() => {
+            // v0.12.0: show which account routes this project, with a
+            // change-account action when more than one is connected.
+            const accounts = (STATE.github && STATE.github.accounts) || [];
+            const acct = accounts.find((a) => a.id === detail.githubAccountId);
+            const acctLabel = acct ? '@' + acct.username
+              : (detail.githubAccountId ? 'Account removed — pick a new one' : (accounts.length > 0 ? 'Default account' : 'No account connected'));
+            const showChangeAccount = accounts.length > 1 && detail.githubRepo;
+            return html\`
+              <div class="body">Reports go to: <strong><a href="https://github.com/\${esc(detail.githubRepo)}/issues" target="_blank" rel="noreferrer">\${esc(detail.githubRepo)}</a></strong> (GitHub Issues)</div>
+              <div class="meta">Routed via <strong>\${esc(acctLabel)}</strong></div>
+              <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
+                \${showChangeAccount ? '<button class="ghost" onclick="changeGithubAccount(\\'' + esc(detail.key) + '\\')">Change account</button>' : ''}
+                <button class="ghost" onclick="changeGithubRepo('\${esc(detail.key)}')">Change repo</button>
+              </div>
+            \`;
+          })()}
         \` : html\`
           <div class="empty">No destination set. Bug reports will be rejected until one is picked.</div>
           <div class="row" style="margin-top:10px;justify-content:flex-end;">
@@ -2776,25 +2991,55 @@ window.changeLinearProject = async function(key) {
     navigate();
   } catch (e) { toast(e.message, 'err'); }
 };
-// v0.11.1: was a two-prompt() flow; now uses openModal() + renderRepoCombobox
-// for live search with kbd nav, private-repo visibility, and a real UI.
+// v0.11.1: was a two-prompt() flow; now uses openModal() + renderRepoCombobox.
+// v0.12.0: passes the surfaced accountId so the project remembers which
+// connected account routes its reports.
 window.changeGithubRepo = async function(key) {
-  if (!STATE.github || !STATE.github.hasToken) {
-    if (confirm('No GitHub PAT set yet. Go to Settings to add one?')) go('#/settings');
+  const accounts = (STATE.github && STATE.github.accounts) || [];
+  if (accounts.length === 0) {
+    if (confirm('No GitHub account connected. Go to Settings to add one?')) go('#/settings/github');
     return;
   }
   const body = openModal('Pick a GitHub repo');
   body.innerHTML = '<div id="ghModalCombo"></div>';
-  const onPick = async (repo) => {
+  const onPick = async (repo, accountId) => {
     if (!repo || !repo.includes('/')) return toast('Repo must be in the form "owner/repo".', 'err');
     try {
-      await api('PUT', '/frontend-conqueror/projects/' + key + '/github-repo', { repo });
+      await api('PUT', '/frontend-conqueror/projects/' + key + '/github-repo', { repo, accountId });
       body._close();
       toast('GitHub destination set to ' + repo + '.');
       navigate();
     } catch (e) { toast(e.message, 'err'); }
   };
   renderRepoCombobox(body.querySelector('#ghModalCombo'), { onPick });
+};
+// v0.12.0: change the account routing a project's reports without re-picking
+// a repo. Shows the connected accounts in a modal; clicking one validates
+// access (server side) then updates proj.githubAccountId.
+window.changeGithubAccount = async function(key) {
+  const accounts = (STATE.github && STATE.github.accounts) || [];
+  if (accounts.length === 0) {
+    if (confirm('No accounts connected. Add one in Settings?')) go('#/settings/github');
+    return;
+  }
+  const body = openModal('Route this project through which account?');
+  body.innerHTML = accounts.map((a) => (
+    '<button class="palette-option" data-account="' + esc(a.id) + '" style="margin-bottom:8px;">' +
+      '<span class="name">@' + esc(a.username || a.id) + '</span>' +
+      '<span class="desc" style="display:block;margin-top:4px;font-family:ui-monospace,Menlo,monospace;font-size:11px;">' + esc(a.id) + '</span>' +
+    '</button>'
+  )).join('');
+  body.querySelectorAll('button.palette-option').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const accountId = btn.getAttribute('data-account');
+      try {
+        await api('PUT', '/frontend-conqueror/projects/' + key + '/github-account', { accountId });
+        body._close();
+        toast('Account changed.');
+        navigate();
+      } catch (e) { toast(e.message, 'err'); }
+    });
+  });
 };
 window.switchToGithub = async function(key) {
   if (!confirm('Migrate this project to GitHub? Pick a repo next. Any bugs already filed in Linear stay there (run the migration tool to copy them over); new bugs go to GitHub.')) return;
@@ -2887,10 +3132,10 @@ async function renderProjectWizard(key) {
             <div class="err" id="err" style="margin-top:6px;"></div>
           </div>
         </main>\`;
-      const pickRepo = async (repo) => {
+      const pickRepo = async (repo, accountId) => {
         if (!repo || !repo.includes('/')) return ($('err').textContent = 'Repo must be in the form "owner/repo".');
         try {
-          await api('PUT', '/frontend-conqueror/projects/' + detail.key + '/github-repo', { repo });
+          await api('PUT', '/frontend-conqueror/projects/' + detail.key + '/github-repo', { repo, accountId });
           step = 2;
           renderStep();
         } catch (e) { $('err').textContent = e.message; }
@@ -2942,11 +3187,11 @@ async function renderSettings() {
   const validTabs = ['github', 'appearance', 'security'];
   const activeTab = (ROUTE.tab && validTabs.includes(ROUTE.tab)) ? ROUTE.tab : 'github';
 
-  // Surface a warning dot on GitHub when no token is connected — it's the
-  // most-actionable state.
-  const ghWarn = (!s.github || !s.github.hasToken) ? '<span class="dot-warn"></span>' : '';
+  // v0.12.0: state.github is now { accounts: [...] }. Warn when zero accounts.
+  const ghAccounts = (s.github && s.github.accounts) || [];
+  const ghWarn = ghAccounts.length === 0 ? '<span class="dot-warn"></span>' : '';
   const tabs = [
-    { key: 'github', label: 'GitHub', extra: ghWarn },
+    { key: 'github', label: 'GitHub', extra: ghAccounts.length > 0 ? '<span class="count">' + ghAccounts.length + '</span>' : ghWarn },
     { key: 'appearance', label: 'Appearance' },
     { key: 'security', label: 'Security' },
   ];
@@ -2958,31 +3203,44 @@ async function renderSettings() {
     )).join('') +
     '</nav>';
 
+  // v0.12.0: GitHub tab renders one card per connected account, plus an
+  // "Add account" button. Zero-state preserves the existing onboarding copy.
   const renderGithubTab = () => html\`
-    <div class="card">
-      <h3>GitHub access token</h3>
-      \${s.github && s.github.hasToken ? html\`
-        <div class="body">Connected as <strong>@\${esc(s.github.username || '?')}</strong>.</div>
-        <div class="meta">Every project on this gate routes bugs to GitHub Issues using this token.</div>
-        <div class="sub-muted" style="margin-top:6px;font-size:11px;">The same token (classic or fine-grained) can be pasted into local and production gates — both treat it identically.</div>
-        <div id="ghTokenReveal" style="margin-top:10px;"></div>
-        <div class="row" style="justify-content:flex-end;margin-top:10px;gap:6px;">
-          <button class="ghost" onclick="showGithubToken()">Show &amp; copy</button>
-          <button class="ghost" onclick="replaceGithubToken()">Replace</button>
-          <button class="danger" onclick="removeGithubToken()">Disconnect</button>
+    \${ghAccounts.length > 0 ? html\`
+      <div class="sub-muted" style="margin-bottom:10px;font-size:12px;">Each project routes through one of these accounts. Add another to reach repos a single PAT can't see (e.g. across orgs).</div>
+      \${ghAccounts.map((acct) => html\`
+        <div class="card">
+          <div class="row spaced">
+            <div>
+              <div class="body">Connected as <strong>@\${esc(acct.username || '?')}</strong></div>
+              <div class="meta">Account id: <code>\${esc(acct.id)}</code></div>
+            </div>
+          </div>
+          <div id="ghTokenReveal-\${esc(acct.id)}" style="margin-top:10px;"></div>
+          <div class="row" style="justify-content:flex-end;margin-top:10px;gap:6px;">
+            <button class="ghost" onclick="showGithubToken('\${esc(acct.id)}')">Show &amp; copy</button>
+            <button class="ghost" onclick="replaceGithubToken()">Replace</button>
+            <button class="danger" onclick="removeGithubToken('\${esc(acct.id)}', '\${esc(acct.username)}')">Disconnect</button>
+          </div>
         </div>
-      \` : html\`
-        <div class="empty">No GitHub PAT set.</div>
+      \`).join('')}
+      <div class="row" style="justify-content:flex-end;margin-top:6px;">
+        <button class="primary" onclick="replaceGithubToken()">+ Add account</button>
+      </div>
+    \` : html\`
+      <div class="card">
+        <h3>Connect GitHub</h3>
+        <div class="empty">No GitHub accounts connected yet.</div>
         <div class="sub-muted" style="margin:8px 0 0;line-height:1.55;">
           <strong>Easiest:</strong> a <a href="https://github.com/settings/tokens/new?scopes=repo&description=frontend-conqueror" target="_blank" rel="noreferrer">classic PAT with <code>repo</code> scope</a> — sees every repo you can see, no org-approval dance.<br>
           <strong>More secure:</strong> a <a href="https://github.com/settings/tokens?type=beta" target="_blank" rel="noreferrer">fine-grained PAT</a> with <strong>Issues: R/W</strong> + <strong>Metadata: R</strong>. For org repos: pick the org as <em>Resource Owner</em> and have an admin approve it.<br>
-          The same token works on every gate — paste it here and in production.
+          Same token works on every gate. You can connect multiple accounts here if you need to reach repos across separate orgs.
         </div>
         <div class="row" style="justify-content:flex-end;margin-top:8px;">
           <button class="primary" onclick="replaceGithubToken()">Connect GitHub</button>
         </div>
-      \`}
-    </div>
+      </div>
+    \`}
   \`;
 
   const renderAppearanceTab = () => html\`
@@ -3064,49 +3322,54 @@ window.removeApiKey = async function() {
     navigate();
   } catch (e) { toast(e.message, 'err'); }
 };
-// v0.10.0+: GitHub PAT management. Same UX shape as Linear, paste-driven.
+// v0.12.0: GitHub account management. "Replace" is now "Add or replace" — the
+// server dedups by username so re-pasting an existing account's PAT rotates it.
 window.replaceGithubToken = async function() {
   const token = prompt('Paste GitHub PAT — classic with "repo" scope (easiest, sees all repos) OR fine-grained with Issues: R/W + Metadata: R:');
   if (!token) return;
   try {
-    await api('PUT', '/frontend-conqueror/github/token', { token });
+    const r = await api('PUT', '/frontend-conqueror/github/accounts', { token });
     STATE = null;
-    toast('GitHub connected.');
+    toast('Connected as @' + (r.account ? r.account.username : '?') + '.');
     navigate();
   } catch (e) { toast(e.message, 'err'); }
 };
-window.removeGithubToken = async function() {
-  if (!confirm('Disconnect GitHub? All projects with backend = github will stop accepting reports until a new token is set.')) return;
+// v0.12.0: per-account disconnect. Projects that route through the removed
+// account get their githubAccountId nulled server-side.
+window.removeGithubToken = async function(accountId, username) {
+  if (!accountId) return;
+  if (!confirm('Disconnect @' + (username || accountId) + '? Projects routing through this account will need a new account picked before they can file reports.')) return;
   try {
-    await api('DELETE', '/frontend-conqueror/github');
+    await api('DELETE', '/frontend-conqueror/github/accounts/' + encodeURIComponent(accountId));
     STATE = null;
-    toast('GitHub disconnected.');
+    toast('Disconnected.');
     navigate();
   } catch (e) { toast(e.message, 'err'); }
 };
 // v0.11.2: reveal the stored PAT inline + copy to clipboard. Admin-only path.
-// The token renders into the #ghTokenReveal placeholder (rendered by the
-// Settings card) with a Copy button and auto-hides after 20 s so it doesn't
-// linger on screen.
-window.showGithubToken = async function() {
-  const host = $('ghTokenReveal');
+// v0.12.0: takes an accountId to target the right account's reveal host.
+window.showGithubToken = async function(accountId) {
+  const host = $('ghTokenReveal-' + accountId);
   if (!host) return;
   try {
-    const r = await api('GET', '/frontend-conqueror/github/token');
+    const r = await api('GET', '/frontend-conqueror/github/accounts/' + encodeURIComponent(accountId) + '/token');
     if (!r || !r.token) return toast('No token stored.', 'err');
+    const inputId = 'ghTokenInput-' + accountId;
+    const copyId = 'ghTokenCopy-' + accountId;
+    const hideId = 'ghTokenHide-' + accountId;
     host.innerHTML =
       '<div class="card" style="margin:0;padding:10px 12px;background:var(--card2);">' +
         '<div class="sub-muted" style="font-size:11px;margin-bottom:4px;">Stored PAT — copy and paste into your password manager or another gate.</div>' +
         '<div class="row" style="gap:6px;">' +
-          '<input id="ghTokenInput" type="text" value="' + esc(r.token) + '" readonly style="font:12px/1.2 ui-monospace,Menlo,monospace;">' +
-          '<button class="primary" id="ghTokenCopy">Copy</button>' +
-          '<button class="ghost" id="ghTokenHide">Hide</button>' +
+          '<input id="' + inputId + '" type="text" value="' + esc(r.token) + '" readonly style="font:12px/1.2 ui-monospace,Menlo,monospace;">' +
+          '<button class="primary" id="' + copyId + '">Copy</button>' +
+          '<button class="ghost" id="' + hideId + '">Hide</button>' +
         '</div>' +
       '</div>';
-    const inp = $('ghTokenInput');
+    const inp = $(inputId);
     inp.focus();
     inp.select();
-    $('ghTokenCopy').addEventListener('click', async () => {
+    $(copyId).addEventListener('click', async () => {
       try {
         await navigator.clipboard.writeText(r.token);
         toast('Token copied to clipboard.');
@@ -3118,7 +3381,7 @@ window.showGithubToken = async function() {
       }
     });
     const hide = () => { host.innerHTML = ''; };
-    $('ghTokenHide').addEventListener('click', hide);
+    $('ghTokenHide-' + accountId).addEventListener('click', hide);
     setTimeout(hide, 20000);
   } catch (e) { toast(e.message, 'err'); }
 };

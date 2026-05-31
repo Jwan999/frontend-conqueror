@@ -16,11 +16,16 @@
 //   node tools/migrate-linear-to-github.js \
 //     --project messarat \
 //     --repo Makers-of-Baghdad/messarat-frontend-nuxt \
+//     [--account-id gh-Jwan999] \
 //     [--dry-run]
 //
 // Run on the same machine the gate runs on — it edits the gate's data.json
 // in place when it flips the backend. Restart the gate after the script
 // completes so the new backend setting picks up.
+//
+// v0.12.0: --account-id sets the project's runtime-routing account. If
+// omitted, the tool auto-detects by matching the GITHUB_TOKEN env var
+// against data.github.accounts. Falls back to null (gate uses accounts[0]).
 
 const fs = require('fs');
 const path = require('path');
@@ -36,6 +41,7 @@ const DATA_FILE = process.env.GATE_DATA || path.resolve(process.cwd(), 'gate/dat
 const PROJECT_KEY = flag('project');
 const TARGET_REPO = flag('repo');
 const DRY_RUN = !!flag('dry-run');
+const EXPLICIT_ACCOUNT_ID = typeof flag('account-id') === 'string' ? flag('account-id') : null;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
 if (!PROJECT_KEY || !TARGET_REPO || !GITHUB_TOKEN) {
@@ -165,6 +171,24 @@ async function github(method, p, body) {
   // Flip the gate project to GitHub backend.
   proj.backend = 'github';
   proj.githubRepo = `${owner}/${repo}`;
+  // v0.12.0: set the routing account so future bug ingestion uses the same
+  // PAT this migration used. Auto-detect by token match; --account-id wins.
+  const accounts = (data.github && data.github.accounts) || [];
+  let routedAccountId = EXPLICIT_ACCOUNT_ID;
+  if (!routedAccountId) {
+    const match = accounts.find((a) => a.token === GITHUB_TOKEN);
+    if (match) routedAccountId = match.id;
+  }
+  if (routedAccountId) {
+    proj.githubAccountId = routedAccountId;
+    console.log(`[migrate] proj.githubAccountId = ${routedAccountId}`);
+  } else if (accounts.length === 0) {
+    console.log('[migrate] WARNING: no accounts on the gate yet. Bug ingestion will fail until an account is added in admin Settings → GitHub.');
+  } else {
+    console.log(`[migrate] note: GITHUB_TOKEN didn't match any gate account; ingestion will fall back to accounts[0] (@${accounts[0].username}).`);
+  }
+  // Strip the legacy proj.githubToken if present (v0.12.0 schema removes it).
+  delete proj.githubToken;
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2) + '\n', 'utf8');
   console.log(`[migrate] gate project "${PROJECT_KEY}" backend = github, repo = ${owner}/${repo}.`);
   console.log('[migrate] RESTART THE GATE for the new backend to take effect.');

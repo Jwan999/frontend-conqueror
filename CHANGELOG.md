@@ -10,6 +10,38 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.12.0] — 2026-05-31
+
+**Multi-account GitHub support.** The gate now holds an arbitrary list of GitHub accounts (each its own PAT) so admins can route different projects through different orgs' tokens. Lands the use case "I have a personal PAT for my repos AND a separate PAT for my company's org repos that needed org-approval — let the gate use both, route each project through the right one."
+
+### Added
+- **`data.github.accounts` array** replaces the single-PAT shape. Each entry: `{ id, token, username, addedAt }`. ID is `gh-<username>` (collision-disambiguated).
+- **Per-project routing** via `proj.githubAccountId`. Set when a project picks (or migrates to) a repo from a specific account. Falls back to the first account when null — keeps legacy single-account gates working unchanged.
+- **Account picker in Settings → GitHub** — one card per connected account, each with Show & copy / Replace / Disconnect. New `+ Add account` button below.
+- **Repo combobox shows the source account** per result (`@username` badge alongside the `private` badge). Click-pick captures the account ID alongside the repo and stores both on the project.
+- **Change-account modal** on the project's Destination card (visible when >1 account connected). Switches the routing account without re-picking the repo. Validates the new account can still see the repo before saving.
+- **CLI: `--account-id` flag** on `tools/migrate-linear-to-github.js`. Auto-detects from `GITHUB_TOKEN` env match when omitted.
+
+### Routes (admin section)
+- `PUT /frontend-conqueror/github/accounts` — add or replace an account (server dedups by username so re-pasting an existing account's PAT rotates it).
+- `GET /frontend-conqueror/github/accounts` — list connected accounts (id + username, never tokens).
+- `GET /frontend-conqueror/github/accounts/:id/token` — admin-only reveal for one account's stored PAT.
+- `DELETE /frontend-conqueror/github/accounts/:id` — remove an account; any project routing through it has its `githubAccountId` nulled (Destination card surfaces a "pick an account" prompt).
+- `GET /frontend-conqueror/github/repos` now queries every connected account in parallel, dedups by `full_name` (first account wins), tags each result with `accountId`. Direct-lookup fallback tries every account. Optional `?accountId=` constrains to one.
+- `PUT /frontend-conqueror/projects/:key/github-account` — change a project's routing account without re-picking a repo.
+
+### Deprecated shims (kept for back-compat)
+- `PUT /github/token`, `DELETE /github`, `GET /github/token` route to the new endpoints. Lets prod gates on v0.11.x keep working when consumer-project deploy scripts call the old endpoints. Will be removed in v0.13.0.
+
+### Migration (auto, on first boot under v0.12.0)
+- `data.github = { token, username }` → `data.github = { accounts: [{ id: 'gh-<username>', token, username, addedAt }] }`. Idempotent.
+- `proj.githubToken` (per-project override, unused by every project on every current gate) is migrated into a new `gh-proj-<key>` account and `proj.githubAccountId` set to it. Field is then deleted from the project schema.
+- Existing `tm` project on local gate, plus messarat/makers/dawwama on prod, all keep filing reports through the same token they used before — only the resolution path changed.
+
+### Removed
+- `proj.githubToken` (per-project token override). Replaced by multi-account.
+- `STATE.github.hasToken` and `STATE.github.username`. Replaced by `STATE.github.accounts: [{ id, username }]`.
+
 ## [0.11.3] — 2026-05-31
 
 **PAT/repo onboarding overhaul + tabbed project detail + button-bug regression fix.** Three things in this release: tab-based navigation on the project detail page so it isn't one endless scroll; a research-backed rewrite of the PAT setup flow that surfaces the org-approval gotcha behind "private repo not found"; and a fix for the broken "Configure now →" button.
