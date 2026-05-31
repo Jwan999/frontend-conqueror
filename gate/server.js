@@ -124,8 +124,16 @@ function emptyProject(key, displayName) {
     linearApiKey: null,                  // per-project override
     linearTeamId: null,
     // GitHub-specific (used when backend === 'github')
-    githubRepo: '',                      // 'owner/repo'
+    githubRepo: '',                      // 'owner/repo' — single-mode source of truth
     githubToken: null,                   // per-project override; otherwise inherits global
+    // v0.12.2: split-repo projects route bugs to TWO repos based on which app
+    // the report came from. repoMode='split' switches the resolver from
+    // githubRepo to the frontend/backend pair below.
+    repoMode: 'single',                  // 'single' | 'split'
+    githubRepoFrontend: '',              // 'owner/repo' — used when repoMode='split'
+    githubAccountIdFrontend: null,
+    githubRepoBackend: '',
+    githubAccountIdBackend: null,
     activity: emptyActivity(),
     createdAt: Math.floor(Date.now() / 1000),
   };
@@ -266,6 +274,12 @@ function loadData() {
     // v0.12.0: per-project routing — which account in data.github.accounts
     // files this project's bug reports. Null until the project picks one.
     if (proj.githubAccountId === undefined) proj.githubAccountId = null;
+    // v0.12.2: split-repo backfill. Existing projects stay single-mode.
+    if (proj.repoMode === undefined) proj.repoMode = 'single';
+    if (proj.githubRepoFrontend === undefined) proj.githubRepoFrontend = '';
+    if (proj.githubAccountIdFrontend === undefined) proj.githubAccountIdFrontend = null;
+    if (proj.githubRepoBackend === undefined) proj.githubRepoBackend = '';
+    if (proj.githubAccountIdBackend === undefined) proj.githubAccountIdBackend = null;
     // v0.12.0: migrate any legacy proj.githubToken into a new account on the
     // gate. None of the current projects on local or prod gates use this
     // override, but the data shape change shouldn't silently drop a real
@@ -325,22 +339,48 @@ function projectLinear(data, proj) {
 // array of accounts (each its own PAT) — projects pick which one routes their
 // reports via proj.githubAccountId. When unset, falls back to the first
 // account so legacy single-account gates keep working without migration.
-function projectGithub(data, proj) {
+// v0.12.2: optional `side` parameter routes split-repo projects to the
+// right repo + account pair. Single-mode projects ignore side. Unspecified
+// side on a split-mode project defaults to 'frontend' (the most common
+// origin for testers filing bug reports).
+function projectGithub(data, proj, side) {
   const accounts = (data.github && data.github.accounts) || [];
-  const picked = (proj.githubAccountId && accounts.find((a) => a.id === proj.githubAccountId))
+  let repo, accountId, resolvedSide = null;
+  if (proj.repoMode === 'split') {
+    resolvedSide = side === 'backend' ? 'backend' : 'frontend';
+    const isBackend = resolvedSide === 'backend';
+    repo      = isBackend ? proj.githubRepoBackend      : proj.githubRepoFrontend;
+    accountId = isBackend ? proj.githubAccountIdBackend : proj.githubAccountIdFrontend;
+  } else {
+    repo      = proj.githubRepo;
+    accountId = proj.githubAccountId;
+  }
+  const picked = (accountId && accounts.find((a) => a.id === accountId))
     || accounts[0]
     || null;
   return {
     token: picked ? picked.token : null,
     username: picked ? picked.username : '',
+    label: picked ? (picked.label || picked.username) : '',
     accountId: picked ? picked.id : null,
-    repo: proj.githubRepo || '',
+    repo: repo || '',
+    side: resolvedSide,
   };
 }
 // v0.12.0: look up a specific account by id (for explicit-account API calls).
 function getGithubAccount(data, accountId) {
   const accounts = (data.github && data.github.accounts) || [];
   return accounts.find((a) => a.id === accountId) || null;
+}
+// v0.12.2: split-repo projects encode (repo, number) in their issue ids; for
+// PUT/DELETE the gate decodes the repo and needs to know which side it
+// belongs to so the right account's token is used. Returns null when the
+// repo doesn't match either slot (or when the project isn't split-mode).
+function inferSideFromRepo(proj, repo) {
+  if (proj.repoMode !== 'split' || !repo) return null;
+  if (repo === proj.githubRepoFrontend) return 'frontend';
+  if (repo === proj.githubRepoBackend) return 'backend';
+  return null;
 }
 // SHA-256 of an IP + the gate's daily salt. Daily salt rotates each UTC day,
 // so we can compute unique-IP counts without storing raw IPs.
@@ -924,27 +964,50 @@ async function fetchOpenIssuesCached(projKey, linCreds) {
   issuesCache.set(projKey, { fetchedAt: now, issues });
   return issues;
 }
-function bustIssuesCache(projKey) { issuesCache.delete(projKey); }
+// v0.12.2: cache key is "<projKey>:<side|'all'>" — clear every variant for
+// a project on any write.
+function bustIssuesCache(projKey) {
+  for (const k of issuesCache.keys()) {
+    if (k === projKey || k.startsWith(projKey + ':')) issuesCache.delete(k);
+  }
+}
 // v0.10.0: backend-aware fetch wrapper. Reads from the cache (30s TTL keyed by
 // project key) and dispatches to the right backend on miss. The cache key is
 // project-scoped, so changing a project's backend automatically segregates
 // its cached results from the previous backend's.
-async function fetchOpenIssuesForProject(data, proj) {
-  const cached = issuesCache.get(proj.key);
+// v0.12.2: side-aware fetch. Split-mode projects fetch from one or both
+// repos. Cache key includes the side so frontend/backend don't collide.
+async function fetchOpenIssuesForProject(data, proj, side) {
+  const cacheKey = proj.key + ':' + (side || 'all');
+  const cached = issuesCache.get(cacheKey);
   const now = Date.now();
   if (cached && now - cached.fetchedAt < ISSUES_CACHE_TTL_MS) return cached.issues;
   let issues = [];
   if (proj.backend === 'github') {
-    const gh = projectGithub(data, proj);
-    if (!gh.token || !gh.repo) return [];
-    const raw = await fetchGithubOpenIssues(gh.token, gh.repo);
-    issues = raw.map((iss) => normalizeGithubIssue(iss, gh.repo));
+    if (proj.repoMode === 'split') {
+      // No side specified → fetch BOTH repos so an overlay without
+      // gate.side still gets all its bubbles (gracefully degrades —
+      // anchor-based render in the overlay naturally filters per-page).
+      const sides = side ? [side] : ['frontend', 'backend'];
+      const lists = await Promise.all(sides.map(async (s) => {
+        const gh = projectGithub(data, proj, s);
+        if (!gh.token || !gh.repo) return [];
+        const raw = await fetchGithubOpenIssues(gh.token, gh.repo);
+        return raw.map((iss) => normalizeGithubIssue(iss, gh.repo));
+      }));
+      issues = lists.flat();
+    } else {
+      const gh = projectGithub(data, proj);
+      if (!gh.token || !gh.repo) return [];
+      const raw = await fetchGithubOpenIssues(gh.token, gh.repo);
+      issues = raw.map((iss) => normalizeGithubIssue(iss, gh.repo));
+    }
   } else {
     const lin = projectLinear(data, proj);
     if (!lin.apiKey || !lin.projectId) return [];
     issues = await fetchLinearOpenIssues(lin);
   }
-  issuesCache.set(proj.key, { fetchedAt: now, issues });
+  issuesCache.set(cacheKey, { fetchedAt: now, issues });
   return issues;
 }
 
@@ -1000,6 +1063,12 @@ function publicProjectSummary(p) {
     hasLinearOverride: !!(p.linearApiKey || p.linearTeamId),
     githubRepo: p.githubRepo || '',
     githubAccountId: p.githubAccountId || null,
+    // v0.12.2: split-repo fields.
+    repoMode: p.repoMode || 'single',
+    githubRepoFrontend: p.githubRepoFrontend || '',
+    githubAccountIdFrontend: p.githubAccountIdFrontend || null,
+    githubRepoBackend: p.githubRepoBackend || '',
+    githubAccountIdBackend: p.githubAccountIdBackend || null,
     activity: {
       firstSeenAt: a.firstSeenAt,
       lastSeenAt: a.lastSeenAt,
@@ -1131,12 +1200,17 @@ async function handle(req, res) {
       text: meta.text,
       userAgent: meta.userAgent,
     });
+    // v0.12.2: split-repo projects route by meta.side. Single-mode ignores it.
+    const reportSide = (meta.side === 'backend' || meta.side === 'frontend') ? meta.side : null;
     try {
       let created;
       if (proj.backend === 'github') {
-        const gh = projectGithub(data, proj);
+        const gh = projectGithub(data, proj, reportSide);
         if (!gh.token) return send(res, 503, { error: 'github-not-configured', message: 'No GitHub PAT set — add one in admin Settings.' });
-        if (!gh.repo) return send(res, 503, { error: 'github-repo-not-set', message: 'No GitHub repo set for this project.' });
+        if (!gh.repo) {
+          const sideHint = proj.repoMode === 'split' ? ` (side=${gh.side})` : '';
+          return send(res, 503, { error: 'github-repo-not-set', message: 'No GitHub repo set for this project' + sideHint + '.' });
+        }
         const raw = await createGithubIssue(gh.token, gh.repo, { title, body: description });
         created = normalizeGithubIssue(raw, gh.repo);
       } else {
@@ -1149,8 +1223,10 @@ async function handle(req, res) {
       proj.activity.reportsCount = (proj.activity.reportsCount || 0) + 1;
       saveData(data);
       bustIssuesCache(proj.key);
-      const acctTag = proj.backend === 'github' ? ` @${projectGithub(data, proj).username || '?'}` : '';
-      console.log(`[gate] issue ${created.identifier || created.id} for ${proj.key} (${proj.backend}${acctTag}) by ${payload.email}`);
+      const ghLog = proj.backend === 'github' ? projectGithub(data, proj, reportSide) : null;
+      const sideTag = ghLog && ghLog.side ? ` side=${ghLog.side}` : '';
+      const acctTag = ghLog ? ` @${ghLog.username || '?'}` : '';
+      console.log(`[gate] issue ${created.identifier || created.id} for ${proj.key} (${proj.backend}${sideTag}${acctTag}) by ${payload.email}`);
       return send(res, 200, { ok: true, issue: created });
     } catch (e) {
       // v0.11.3: report the actual backend that failed (was hardcoded
@@ -1183,8 +1259,9 @@ async function handle(req, res) {
     if (!proj || proj.status !== 'active') return send(res, 401, { error: 'project-gone' });
     if (!(proj.users || {})[payload.email]) return send(res, 401, { error: 'revoked' });
     const reqPage = String((parsed.query && parsed.query.page) || '').slice(0, 500);
+    const reqSide = (parsed.query && (parsed.query.side === 'frontend' || parsed.query.side === 'backend')) ? parsed.query.side : null;
     try {
-      const all = await fetchOpenIssuesForProject(data, proj);
+      const all = await fetchOpenIssuesForProject(data, proj, reqSide);
       const issues = all
         .map((iss) => {
           // Linear returns iss.description; GitHub returns iss.body. Treat
@@ -1236,12 +1313,15 @@ async function handle(req, res) {
     if (!(proj.users || {})[payload.email]) return send(res, 401, { error: 'revoked' });
     const issueId = issueEditMatch[1];
     const ghRef = ghDecodeIssueId(issueId);
+    // v0.12.2: for split-mode projects, the decoded repo tells us which side
+    // (frontend/backend) owns this issue → use that side's account token.
+    const ghSide = ghRef ? inferSideFromRepo(proj, ghRef.repo) : null;
     try {
       // Fetch current state — branch on backend (encoded in the ID for GitHub,
       // determined by proj.backend for Linear).
       let current, currentDesc;
       if (ghRef) {
-        const gh = projectGithub(data, proj);
+        const gh = projectGithub(data, proj, ghSide);
         if (!gh.token) return send(res, 503, { error: 'github-not-configured' });
         current = await fetchGithubIssue(gh.token, ghRef.repo, ghRef.number);
         if (!current) return send(res, 404, { error: 'no-such-issue' });
@@ -1274,7 +1354,7 @@ async function handle(req, res) {
       });
       let outIssue;
       if (ghRef) {
-        const gh = projectGithub(data, proj);
+        const gh = projectGithub(data, proj, ghSide);
         const updated = await updateGithubIssue(gh.token, ghRef.repo, ghRef.number, { title: newTitle, body: newDescription });
         outIssue = normalizeGithubIssue(updated, ghRef.repo);
       } else {
@@ -1319,10 +1399,12 @@ async function handle(req, res) {
     if (!(proj.users || {})[payload.email]) return send(res, 401, { error: 'revoked' });
     const issueId = issueEditMatch[1];
     const ghRef = ghDecodeIssueId(issueId);
+    // v0.12.2: infer split-mode side from the decoded repo (see PUT comment).
+    const ghSide = ghRef ? inferSideFromRepo(proj, ghRef.repo) : null;
     try {
       let current, currentDesc;
       if (ghRef) {
-        const gh = projectGithub(data, proj);
+        const gh = projectGithub(data, proj, ghSide);
         if (!gh.token) return send(res, 503, { error: 'github-not-configured' });
         current = await fetchGithubIssue(gh.token, ghRef.repo, ghRef.number);
         if (!current) return send(res, 404, { error: 'no-such-issue' });
@@ -1338,7 +1420,7 @@ async function handle(req, res) {
       if (!fc || fc.v !== 1) return send(res, 409, { error: 'no-fc-meta', message: 'This issue was filed before v0.9.0 and can’t be deleted from the overlay.' });
       if (fc.filer !== payload.email) return send(res, 403, { error: 'not-owner' });
       if (ghRef) {
-        const gh = projectGithub(data, proj);
+        const gh = projectGithub(data, proj, ghSide);
         await deleteGithubIssue(gh.token, ghRef.repo, ghRef.number);
       } else {
         const linCreds = projectLinear(data, proj);
@@ -1645,6 +1727,8 @@ async function handle(req, res) {
       }
     }
     // v0.10.0+: set the GitHub repo destination. Flips backend to 'github'.
+    // v0.12.2: in split mode, body.side ('frontend'|'backend') routes the
+    // write to the right slot. Single mode ignores side; behavior unchanged.
     if (method === 'PUT' && sub === 'github-repo') {
       let body;
       try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
@@ -1653,6 +1737,7 @@ async function handle(req, res) {
       let parsed;
       try { parsed = parseGithubRepo(repoStr); }
       catch (e) { return send(res, 400, { error: 'bad-repo', message: e.message }); }
+      const writeSide = (proj.repoMode === 'split' && (body.side === 'frontend' || body.side === 'backend')) ? body.side : null;
       // v0.12.0: caller may pass accountId to lock the project to a specific
       // account. If omitted, keep the current githubAccountId (or fall back
       // to the first account).
@@ -1661,7 +1746,10 @@ async function handle(req, res) {
         acct = getGithubAccount(data, body.accountId);
         if (!acct) return send(res, 400, { error: 'no-such-account' });
       } else {
-        acct = (proj.githubAccountId && getGithubAccount(data, proj.githubAccountId))
+        const currentAccountId = writeSide === 'backend' ? proj.githubAccountIdBackend
+          : writeSide === 'frontend' ? proj.githubAccountIdFrontend
+          : proj.githubAccountId;
+        acct = (currentAccountId && getGithubAccount(data, currentAccountId))
           || (data.github.accounts[0] || null);
       }
       if (!acct || !acct.token) return send(res, 400, { error: 'no-token', message: 'No GitHub account connected. Add one in Settings → GitHub.' });
@@ -1670,8 +1758,16 @@ async function handle(req, res) {
         const repoInfo = await githubREST(acct.token, 'GET', `/repos/${parsed.owner}/${parsed.repo}`);
         if (!repoInfo.has_issues) return send(res, 400, { error: 'issues-disabled', message: 'Issues are disabled on this repo. Enable them in GitHub repo settings first.' });
         await ensureFcBugLabel(acct.token, parsed.owner, parsed.repo);
-        proj.githubRepo = repoInfo.full_name;
-        proj.githubAccountId = acct.id;
+        if (writeSide === 'frontend') {
+          proj.githubRepoFrontend = repoInfo.full_name;
+          proj.githubAccountIdFrontend = acct.id;
+        } else if (writeSide === 'backend') {
+          proj.githubRepoBackend = repoInfo.full_name;
+          proj.githubAccountIdBackend = acct.id;
+        } else {
+          proj.githubRepo = repoInfo.full_name;
+          proj.githubAccountId = acct.id;
+        }
         proj.backend = 'github';
         saveData(data);
         bustIssuesCache(proj.key);
@@ -1681,20 +1777,36 @@ async function handle(req, res) {
       }
     }
     // v0.12.0: change the account routing this project's reports WITHOUT
-    // re-picking a repo. Validates the new account can still see the repo.
+    // re-picking a repo. v0.12.2: body.side routes the write in split mode.
     if (method === 'PUT' && sub === 'github-account') {
       let body;
       try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
       const acct = body.accountId ? getGithubAccount(data, body.accountId) : null;
       if (!acct) return send(res, 400, { error: 'no-such-account' });
-      if (!proj.githubRepo) return send(res, 400, { error: 'no-repo', message: 'Pick a repo first.' });
+      const writeSide = (proj.repoMode === 'split' && (body.side === 'frontend' || body.side === 'backend')) ? body.side : null;
+      const targetRepo = writeSide === 'frontend' ? proj.githubRepoFrontend
+        : writeSide === 'backend' ? proj.githubRepoBackend
+        : proj.githubRepo;
+      if (!targetRepo) return send(res, 400, { error: 'no-repo', message: 'Pick a repo first.' });
       try {
-        const parsedR = parseGithubRepo(proj.githubRepo);
+        const parsedR = parseGithubRepo(targetRepo);
         await githubREST(acct.token, 'GET', `/repos/${parsedR.owner}/${parsedR.repo}`);
       } catch (e) {
-        return send(res, 400, { error: 'account-cannot-see-repo', message: 'This account can\'t see ' + proj.githubRepo + ': ' + e.message });
+        return send(res, 400, { error: 'account-cannot-see-repo', message: 'This account can\'t see ' + targetRepo + ': ' + e.message });
       }
-      proj.githubAccountId = acct.id;
+      if (writeSide === 'frontend') proj.githubAccountIdFrontend = acct.id;
+      else if (writeSide === 'backend') proj.githubAccountIdBackend = acct.id;
+      else proj.githubAccountId = acct.id;
+      saveData(data);
+      bustIssuesCache(proj.key);
+      return send(res, 200, { project: publicProjectDetail(proj) });
+    }
+    // v0.12.2: flip a project between single-repo and split (frontend+backend).
+    if (method === 'PUT' && sub === 'repo-mode') {
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+      const mode = body.mode === 'split' ? 'split' : 'single';
+      proj.repoMode = mode;
       saveData(data);
       bustIssuesCache(proj.key);
       return send(res, 200, { project: publicProjectDetail(proj) });
@@ -2741,7 +2853,9 @@ function projectCard(p) {
   // surface their Linear destination name with a "(legacy)" tag.
   const dest = p.backend === 'linear'
     ? (p.linearProjectName ? p.linearProjectName + ' (legacy Linear)' : '(legacy Linear — needs migration)')
-    : (p.githubRepo || (p.status === 'pending' ? '(needs configuring)' : '(not set)'));
+    : (p.repoMode === 'split'
+        ? ((p.githubRepoFrontend || '?') + ' + ' + (p.githubRepoBackend || '?') + ' (split)')
+        : (p.githubRepo || (p.status === 'pending' ? '(needs configuring)' : '(not set)')));
   // v0.9.8: surface the Configure action directly on pending cards so the
   // pending → active flow is one click from the list view (used to require
   // clicking into the detail page first).
@@ -2894,42 +3008,89 @@ async function renderProjectDetail(key) {
     </div>
   \`;
 
-  const renderDestinationTab = () => html\`
-    <div class="card">
+  const renderDestinationTab = () => {
+    // v0.12.2: helpers shared between single + split renderers.
+    const accounts = (STATE.github && STATE.github.accounts) || [];
+    const acctLabelOf = (accountId) => {
+      const a = accounts.find((x) => x.id === accountId);
+      if (a) return a.label || ('@' + a.username);
+      if (accountId) return 'Account removed — pick a new one';
+      return accounts.length > 0 ? (accounts[0].label || ('@' + accounts[0].username)) + ' (default)' : 'No account connected';
+    };
+    const renderSideCard = (sideKey, sideLabel, repo, accountId) => {
+      const showChangeAccount = accounts.length > 1 && repo;
+      return html\`
+        <div class="card" style="background:var(--card2);">
+          <h3 style="margin-bottom:8px;text-transform:none;letter-spacing:0;font-size:14px;color:var(--text);">\${esc(sideLabel)}</h3>
+          \${repo ? html\`
+            <div class="body">Reports go to: <strong><a href="https://github.com/\${esc(repo)}/issues" target="_blank" rel="noreferrer">\${esc(repo)}</a></strong></div>
+            <div class="meta">Routed via <strong>\${esc(acctLabelOf(accountId))}</strong></div>
+            <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
+              \${showChangeAccount ? '<button class="ghost" onclick="changeGithubAccount(\\'' + esc(detail.key) + '\\', \\'' + esc(sideKey) + '\\')">Change account</button>' : ''}
+              <button class="ghost" onclick="changeGithubRepo('\${esc(detail.key)}', '\${esc(sideKey)}')">Change repo</button>
+            </div>
+          \` : html\`
+            <div class="empty">No \${esc(sideLabel.toLowerCase())} repo set.</div>
+            <div class="row" style="margin-top:8px;justify-content:flex-end;">
+              <button class="primary" onclick="changeGithubRepo('\${esc(detail.key)}', '\${esc(sideKey)}')">Pick \${esc(sideLabel.toLowerCase())} repo</button>
+            </div>
+          \`}
+        </div>
+      \`;
+    };
+    return html\`
       \${detail.backend === 'linear' ? html\`
-        <div class="body">Reports go to: <strong>\${esc(detail.linearProjectName || 'Linear (legacy)')}</strong></div>
-        <div class="sub-muted" style="margin-top:6px;font-size:12px;line-height:1.55;">This project uses the legacy Linear backend. Run <code>node tools/migrate-linear-to-github.js --project \${esc(detail.key)} --repo OWNER/NAME</code> to migrate existing Issues to GitHub, then switch the destination here.</div>
-        <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
-          <button class="primary" onclick="switchToGithub('\${esc(detail.key)}')">Switch to GitHub →</button>
+        <div class="card">
+          <div class="body">Reports go to: <strong>\${esc(detail.linearProjectName || 'Linear (legacy)')}</strong></div>
+          <div class="sub-muted" style="margin-top:6px;font-size:12px;line-height:1.55;">This project uses the legacy Linear backend. Run <code>node tools/migrate-linear-to-github.js --project \${esc(detail.key)} --repo OWNER/NAME</code> to migrate existing Issues to GitHub, then switch the destination here.</div>
+          <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
+            <button class="primary" onclick="switchToGithub('\${esc(detail.key)}')">Switch to GitHub →</button>
+          </div>
         </div>
       \` : html\`
-        \${detail.githubRepo ? html\`
-          \${(() => {
-            // v0.12.0: show which account routes this project, with a
-            // change-account action when more than one is connected.
-            const accounts = (STATE.github && STATE.github.accounts) || [];
-            const acct = accounts.find((a) => a.id === detail.githubAccountId);
-            const acctLabel = acct ? (acct.label || ('@' + acct.username))
-              : (detail.githubAccountId ? 'Account removed — pick a new one' : (accounts.length > 0 ? (accounts[0].label || ('@' + accounts[0].username)) + ' (default)' : 'No account connected'));
-            const showChangeAccount = accounts.length > 1 && detail.githubRepo;
-            return html\`
-              <div class="body">Reports go to: <strong><a href="https://github.com/\${esc(detail.githubRepo)}/issues" target="_blank" rel="noreferrer">\${esc(detail.githubRepo)}</a></strong> (GitHub Issues)</div>
-              <div class="meta">Routed via <strong>\${esc(acctLabel)}</strong></div>
-              <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
-                \${showChangeAccount ? '<button class="ghost" onclick="changeGithubAccount(\\'' + esc(detail.key) + '\\')">Change account</button>' : ''}
-                <button class="ghost" onclick="changeGithubRepo('\${esc(detail.key)}')">Change repo</button>
-              </div>
-            \`;
-          })()}
+        <div class="card" style="margin-bottom:14px;">
+          <div class="row spaced" style="align-items:center;">
+            <div>
+              <div class="body" style="font-weight:600;">Mode</div>
+              <div class="meta">\${detail.repoMode === 'split' ? 'Split — bugs route by side (frontend / backend).' : 'Single repo — all bugs land in one place.'}</div>
+            </div>
+            <button class="ghost" onclick="changeGithubRepoMode('\${esc(detail.key)}', '\${detail.repoMode === 'split' ? 'single' : 'split'}')">\${detail.repoMode === 'split' ? 'Switch to single repo' : 'Switch to split (frontend + backend)'}</button>
+          </div>
+        </div>
+        \${detail.repoMode === 'split' ? html\`
+          \${renderSideCard('frontend', 'Frontend', detail.githubRepoFrontend, detail.githubAccountIdFrontend)}
+          \${renderSideCard('backend', 'Backend', detail.githubRepoBackend, detail.githubAccountIdBackend)}
+          <div class="sub-muted" style="font-size:11px;margin-top:6px;line-height:1.55;">
+            In your plugin config, set <code>gate.side = 'frontend'</code> on the frontend app and <code>gate.side = 'backend'</code> on the backend app. Reports + bubbles route to the matching repo automatically.
+          </div>
         \` : html\`
-          <div class="empty">No destination set. Bug reports will be rejected until one is picked.</div>
-          <div class="row" style="margin-top:10px;justify-content:flex-end;">
-            <button class="primary" onclick="changeGithubRepo('\${esc(detail.key)}')">Pick a GitHub repo</button>
+          <div class="card">
+            \${detail.githubRepo ? html\`
+              \${(() => {
+                const acct = accounts.find((a) => a.id === detail.githubAccountId);
+                const acctLabel = acct ? (acct.label || ('@' + acct.username))
+                  : (detail.githubAccountId ? 'Account removed — pick a new one' : (accounts.length > 0 ? (accounts[0].label || ('@' + accounts[0].username)) + ' (default)' : 'No account connected'));
+                const showChangeAccount = accounts.length > 1 && detail.githubRepo;
+                return html\`
+                  <div class="body">Reports go to: <strong><a href="https://github.com/\${esc(detail.githubRepo)}/issues" target="_blank" rel="noreferrer">\${esc(detail.githubRepo)}</a></strong> (GitHub Issues)</div>
+                  <div class="meta">Routed via <strong>\${esc(acctLabel)}</strong></div>
+                  <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
+                    \${showChangeAccount ? '<button class="ghost" onclick="changeGithubAccount(\\'' + esc(detail.key) + '\\')">Change account</button>' : ''}
+                    <button class="ghost" onclick="changeGithubRepo('\${esc(detail.key)}')">Change repo</button>
+                  </div>
+                \`;
+              })()}
+            \` : html\`
+              <div class="empty">No destination set. Bug reports will be rejected until one is picked.</div>
+              <div class="row" style="margin-top:10px;justify-content:flex-end;">
+                <button class="primary" onclick="changeGithubRepo('\${esc(detail.key)}')">Pick a GitHub repo</button>
+              </div>
+            \`}
           </div>
         \`}
       \`}
-    </div>
-  \`;
+    \`;
+  };
 
   const renderIntegrationTab = () => html\`
     <div class="card">
@@ -3039,35 +3200,38 @@ window.changeLinearProject = async function(key) {
 // v0.11.1: was a two-prompt() flow; now uses openModal() + renderRepoCombobox.
 // v0.12.0: passes the surfaced accountId so the project remembers which
 // connected account routes its reports.
-window.changeGithubRepo = async function(key) {
+// v0.12.2: optional side argument picks which split-mode slot to write
+// ('frontend' | 'backend'); omit for single-mode projects.
+window.changeGithubRepo = async function(key, side) {
   const accounts = (STATE.github && STATE.github.accounts) || [];
   if (accounts.length === 0) {
     if (confirm('No GitHub account connected. Go to Settings to add one?')) go('#/settings/github');
     return;
   }
-  const body = openModal('Pick a GitHub repo');
+  const sideTag = side ? ' (' + side + ')' : '';
+  const body = openModal('Pick a GitHub repo' + sideTag);
   body.innerHTML = '<div id="ghModalCombo"></div>';
   const onPick = async (repo, accountId) => {
     if (!repo || !repo.includes('/')) return toast('Repo must be in the form "owner/repo".', 'err');
     try {
-      await api('PUT', '/frontend-conqueror/projects/' + key + '/github-repo', { repo, accountId });
+      await api('PUT', '/frontend-conqueror/projects/' + key + '/github-repo', { repo, accountId, side });
       body._close();
-      toast('GitHub destination set to ' + repo + '.');
+      toast('GitHub destination' + sideTag + ' set to ' + repo + '.');
       navigate();
     } catch (e) { toast(e.message, 'err'); }
   };
   renderRepoCombobox(body.querySelector('#ghModalCombo'), { onPick });
 };
 // v0.12.0: change the account routing a project's reports without re-picking
-// a repo. Shows the connected accounts in a modal; clicking one validates
-// access (server side) then updates proj.githubAccountId.
-window.changeGithubAccount = async function(key) {
+// a repo. v0.12.2: optional side targets one slot in split mode.
+window.changeGithubAccount = async function(key, side) {
   const accounts = (STATE.github && STATE.github.accounts) || [];
   if (accounts.length === 0) {
     if (confirm('No accounts connected. Add one in Settings?')) go('#/settings/github');
     return;
   }
-  const body = openModal('Route this project through which account?');
+  const sideTag = side ? ' (' + side + ')' : '';
+  const body = openModal('Route this project' + sideTag + ' through which account?');
   body.innerHTML = accounts.map((a) => (
     '<button class="palette-option" data-account="' + esc(a.id) + '" style="margin-bottom:8px;">' +
       '<span class="name">' + esc(a.label || a.username || a.id) + '</span>' +
@@ -3078,13 +3242,25 @@ window.changeGithubAccount = async function(key) {
     btn.addEventListener('click', async () => {
       const accountId = btn.getAttribute('data-account');
       try {
-        await api('PUT', '/frontend-conqueror/projects/' + key + '/github-account', { accountId });
+        await api('PUT', '/frontend-conqueror/projects/' + key + '/github-account', { accountId, side });
         body._close();
         toast('Account changed.');
         navigate();
       } catch (e) { toast(e.message, 'err'); }
     });
   });
+};
+// v0.12.2: flip a project between single-repo and split (frontend+backend) modes.
+window.changeGithubRepoMode = async function(key, newMode) {
+  const msg = newMode === 'split'
+    ? 'Switch this project to split mode? You\\'ll pick a frontend repo and a backend repo separately. Your current single-repo setting is preserved on disk but stops routing new reports — bugs route by side instead.'
+    : 'Switch this project to single mode? All new bug reports will route through one repo again. The frontend/backend slots stay on disk but stop being used.';
+  if (!confirm(msg)) return;
+  try {
+    await api('PUT', '/frontend-conqueror/projects/' + key + '/repo-mode', { mode: newMode });
+    toast(newMode === 'split' ? 'Switched to split mode. Pick the two repos.' : 'Switched to single mode.');
+    navigate();
+  } catch (e) { toast(e.message, 'err'); }
 };
 window.switchToGithub = async function(key) {
   if (!confirm('Migrate this project to GitHub? Pick a repo next. Any bugs already filed in Linear stay there (run the migration tool to copy them over); new bugs go to GitHub.')) return;

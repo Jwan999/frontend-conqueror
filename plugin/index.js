@@ -901,10 +901,16 @@ module.exports = function frontendConquerorPlugin(options = {}) {
     // old behavior (useful if you want to run the agent under a debugger).
     autoStartAgent: options.autoStartAgent !== false,
     agentPath: options.agentPath || path.join(__dirname, '..', 'agent', 'server.js'),
-    // Test mode wiring. Pass `{ url, project }`:
+    // Test mode wiring. Pass `{ url, project, side? }`:
     //   url:     base URL of the gate service (dev: http://localhost:54322)
     //   project: project key registered in the gate (v0.5.0+; omit for
     //            single-project gates falling back to the default project).
+    //   side:    v0.12.2+. 'frontend' | 'backend'. Omit for single-repo
+    //            projects (default). Set when the same gate project covers
+    //            two repos (e.g. messarat has a Nuxt frontend + Laravel
+    //            backend) and bugs filed from each app should land in their
+    //            respective repo. Forwarded as-is to the overlay; gate routes
+    //            POST /api/report-issue and GET /api/issues by this value.
     // Without `gate`, Test mode shows a "configure gate" toast.
     gate: options.gate || null,
   };

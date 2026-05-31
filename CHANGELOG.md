@@ -10,6 +10,38 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.12.2] — 2026-05-31
+
+**Split-repo projects.** One gate project key (e.g. `messarat`) can now route bugs to TWO repos based on which app they were filed from. The Nuxt frontend and the Laravel backend each declare `gate.side = 'frontend' | 'backend'` in their plugin config; the gate stores a `frontend repo + backend repo` pair on the project and routes reports + bubbles to the matching repo. Single-repo projects (TM-frontend, dawwama, makers-landing) are entirely unaffected — the feature is opt-in per project.
+
+### Added
+- **Project field `repoMode: 'single' | 'split'`** — default `'single'`; existing projects auto-backfill on first boot under v0.12.2.
+- **Project fields `githubRepoFrontend`, `githubAccountIdFrontend`, `githubRepoBackend`, `githubAccountIdBackend`** — only consulted when `repoMode='split'`. The legacy `proj.githubRepo` / `proj.githubAccountId` are preserved untouched, so flipping back to single mode just restores the old routing.
+- **Plugin config option `gate.side: 'frontend' | 'backend'`** — optional. Plugin forwards through `window.__frontendConquerorConfig.gate.side` to the overlay verbatim. Without it, behavior is identical to v0.12.1.
+- **Overlay propagates side**: report submissions include `issue.meta.side`; bubble fetches append `&side=` to `/api/issues`. Both are no-ops when `GATE.side` is unset.
+- **New route `PUT /frontend-conqueror/projects/:key/repo-mode`** (body: `{ mode }`) toggles a project between modes.
+- **`PUT /projects/:key/github-repo` + `/github-account`** accept `body.side: 'frontend' | 'backend'` — writes to the split-mode slot instead of the single field.
+- **`GET /api/issues?side=...`** filters bubble fetches to one side's repo. Without a side param on a split project, the gate fetches BOTH sides and merges (anchor lookup in the overlay then naturally filters per-page).
+- **Project detail Destination tab** gets a Mode toggle. In split mode: shows two cards ("Frontend" and "Backend"), each with its own Change repo + Change account buttons backed by the same combobox + modal components used in single mode.
+- **Project list card** shows split destination string (`owner/front + owner/back (split)`) when in split mode.
+- **Helper `inferSideFromRepo(proj, repo)`** lets PUT/DELETE on existing issues auto-route to the right side's account token by decoding the repo from the issue ID — no schema change to the GitHub issue ID format.
+
+### Changed
+- **`projectGithub(data, proj, side?)`** — adds optional `side` parameter. Single-mode projects ignore it; split-mode default for unspecified side is `'frontend'` (most common origin for tester reports).
+- **`fetchOpenIssuesForProject(data, proj, side?)`** — same. Caches per `(projectKey, side)` so frontend/backend don't collide.
+- **Issue-create log line** now stamps `[gate] issue #N for tm (github side=frontend @acct) by …` when a side is in play.
+
+### Backward compatibility
+- Existing projects boot in single mode and behave EXACTLY as v0.12.1.
+- Existing GitHub issue IDs (`gh-<base64(repo#number)>`) are unchanged — edit/delete auto-route via `inferSideFromRepo`.
+- Plugin without `gate.side`: overlay-side behavior unchanged; gate routes via single-mode path even for split projects (with a graceful default to `'frontend'`).
+- All v0.12.0 / v0.12.1 endpoints, including the legacy `PUT /github/token` shim, remain in place.
+
+### Out of scope (deliberate)
+- N-way splits (3+ repos per project) — covered by `repos: { sideName: {repo, accountId} }` if needed later.
+- Cross-side bug migration tool — adding/removing bugs already filed in one side's repo is a manual operation today.
+- Heartbeat awareness of side — heartbeats stay project-agnostic.
+
 ## [0.12.1] — 2026-05-31
 
 ### Fixed

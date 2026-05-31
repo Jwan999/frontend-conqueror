@@ -84,7 +84,10 @@
   // overlay can render bubbles. Bearer auth — keeps the report-issue body
   // shape unchanged (which still uses body-token for back-compat).
   async function gateListIssues(token, page) {
-    const r = await fetch(`${GATE.url}/api/issues?page=${encodeURIComponent(page)}`, {
+    // v0.12.2: when this app declares gate.side (split-repo project), pass
+    // it through so the gate fetches bubbles from the right side's repo.
+    const sideQ = GATE.side ? '&side=' + encodeURIComponent(GATE.side) : '';
+    const r = await fetch(`${GATE.url}/api/issues?page=${encodeURIComponent(page)}${sideQ}`, {
       headers: { 'Authorization': 'Bearer ' + token },
     });
     if (!r.ok) return { ok: false, status: r.status, issues: [] };
@@ -2788,6 +2791,10 @@
           } : null,
           where: src ? `${src.file}:${src.offset}` : null,
           page: location.pathname + location.search,
+          // v0.12.2: stamp the report with which side of a split-repo project
+          // this app is. Single-repo projects leave this undefined; the gate
+          // ignores it.
+          side: GATE.side || undefined,
           locale: getActiveLocale(),
           text: text || null,
           userAgent: navigator.userAgent,
