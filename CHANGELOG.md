@@ -10,6 +10,15 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.12.4] — 2026-05-31
+
+### Fixed
+- **Split-repo routing didn't actually take effect in production builds.** The plugin's `transformIndexHtml` hook injects `window.__frontendConquerorConfig` (including `gate.side`) at build time — but in prod most consumer apps load the overlay from `gate.example.com/<project>/overlay.js`, and that endpoint hard-coded the injected config to just `{ gate: { url, project } }`. So even when an app set `gate.side='backend'` in its plugin config, the overlay running in the browser saw `GATE.side === undefined`, and the gate's report-issue handler fell back to the `'frontend'` default for split projects. Now `?side=frontend|backend` on the overlay URL is honoured by the gate and propagated into the prelude.
+- **Integration tab's `<script>` snippet for split-mode projects** now shows the `?side=...` query string with a comment reminding the user to pick one per app.
+
+### Migration (consumer apps with split mode)
+- Append `&side=frontend` or `&side=backend` to the `gate/overlay.js` script tag in your prod HTML head (`nuxt.config.js`'s `app.head.script` for Nuxt, `admin.blade.php` for Laravel). Single-mode projects: no change.
+
 ## [0.12.3] — 2026-05-31
 
 ### Fixed

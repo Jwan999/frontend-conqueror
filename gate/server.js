@@ -1517,8 +1517,13 @@ async function handle(req, res) {
       } else if (parsed.query && typeof parsed.query.project === 'string') {
         project = normalizeProjectKey(parsed.query.project);
       }
+      // v0.12.4: ?side=frontend|backend is accepted on the prod overlay URL so
+      // split-repo projects can communicate which side this app belongs to
+      // without any client-side injection. Consumer-app deploy configs append
+      // it to the overlay.js src.
+      const sideQ = (parsed.query && (parsed.query.side === 'frontend' || parsed.query.side === 'backend')) ? parsed.query.side : null;
       const cfg = {
-        gate: { url: PUBLIC_URL, project: project || null },
+        gate: { url: PUBLIC_URL, project: project || null, side: sideQ || undefined },
         enabledModes: ['test'],
         mapUrl: null,
         wsUrl: null,
@@ -2919,7 +2924,11 @@ async function renderProjectDetail(key) {
 
   const hasDestination = detail.backend === 'github' ? !!detail.githubRepo : !!detail.linearProjectId;
   const needsConfig = detail.status === 'pending' || !hasDestination || detail.usersCount === 0;
-  const overlayTag = '<' + 'script src="' + location.origin + '/' + detail.key + '/overlay.js" defer><' + '/script>';
+  // v0.12.4: split-mode projects need ?side= on the overlay tag so the gate
+  // injects the right side into window.__frontendConquerorConfig at request
+  // time. Single-mode tag is unchanged.
+  const overlayTagSrc = location.origin + '/' + detail.key + '/overlay.js' + (detail.repoMode === 'split' ? '?side=frontend  // OR backend — pick one per app' : '');
+  const overlayTag = '<' + 'script src="' + overlayTagSrc + '" defer><' + '/script>';
   const pluginCfg = "gate: { url: '" + location.origin + "', project: '" + detail.key + "' }";
   const _origins = (detail.activity && detail.activity.origins) || {};
   const _topOriginEntry = Object.entries(_origins).sort((a, b) => b[1] - a[1])[0];
