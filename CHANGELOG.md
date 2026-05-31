@@ -10,6 +10,85 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.11.3] — 2026-05-31
+
+**PAT/repo onboarding overhaul + tabbed project detail + button-bug regression fix.** Three things in this release: tab-based navigation on the project detail page so it isn't one endless scroll; a research-backed rewrite of the PAT setup flow that surfaces the org-approval gotcha behind "private repo not found"; and a fix for the broken "Configure now →" button.
+
+### Project detail page redesigned with tabs
+- **Five tabs**: Activity (default for configured projects), Testers (with count badge + warning dot when migrations need passwords), Destination (with warning dot when unset, default tab for pending projects), Integration (plugin config + overlay tag), Settings (disable + delete).
+- **Deep-linkable**: every tab has a URL like `#/p/:key/:tab`. Refresh, share, back-button all just work.
+- **Pending banner stays above the tabs** when the project still needs configuring — can't be tab-clicked away.
+- Each tab renders only its own content. No more 6-card scroll where the destination card is buried under the testers list.
+
+### Global Settings page redesigned with tabs
+- **Three tabs**: GitHub (with warning dot when no PAT is set), Appearance (mode colors), Security (admin password change).
+- **Deep-linkable**: `#/settings/github`, `#/settings/appearance`, `#/settings/security`.
+- Default tab is GitHub.
+
+### Reporting / overlay UX
+- **Submission errors now show the human-readable message instead of an error code.** Before: a tester filing a bug against a GitHub-backed project hit `Resource not accessible by personal access token` and saw the toast read `linear-failed` (both wrong: the message was hidden, and the backend label was hardcoded). Now: gate returns `error: 'github-failed'` (or `'linear-failed'` for legacy backends) plus a `message` field that the overlay displays preferentially. For the specific case of a fine-grained PAT lacking `Issues: Read & Write`, the message is rewritten to a direct instruction: "Re-issue the PAT with 'Issues: Read & Write' permission (fine-grained) or 'repo' scope (classic), then paste it again in admin Settings → GitHub."
+- **Overlay copy de-Linearized.** "Send to Linear" button → "Send report". "X was closed in Linear" toast → "X was closed". TODO-mode "Linear ticket (optional)" label → "Existing issue ID (optional)" with placeholder `#123 or MES-456`. Delete-confirm dialog now explains both Linear (soft trash) and GitHub (close) deletion semantics.
+
+### Fixed
+- **"Configure now →" button on the project detail page did nothing.** Regression from v0.11.2: the onclick attribute used `JSON.stringify(detail.key)` inside a double-quoted HTML attribute, which injected unescaped `"` characters that prematurely terminated the attribute. Switched to the project's standard `'\${esc(detail.key)}'` pattern. Pending-project cards now navigate to the configure wizard on click.
+
+### Added
+- **Classic PAT support, called out as the easiest path.** Settings card + setup wizard PAT step now recommend a classic PAT with `repo` scope as the easiest option (sees every repo you can see, no org-approval dance) with the fine-grained PAT as the more-secure-but-more-work alternative. Direct GitHub UI links pre-fill the scopes (`/settings/tokens/new?scopes=repo&description=frontend-conqueror`).
+- **Bare-repo-name fallback in search.** Typing `my-repo` (no owner) now triggers a direct lookup at `<connected-username>/my-repo` if the local filter returns nothing — catches the common "forgot the owner prefix" case.
+- **Server returns a `hint` field in `/github/repos`** when an `owner/name`-shaped query couldn't be resolved (`hint: 'direct-lookup-404'`). The SPA uses this to render an inline explainer when a direct lookup 404s.
+
+### Changed
+- **Repo combobox empty-state is now diagnostic.** Three distinct messages:
+  - Bare-name query with results = ""? → "PAT can't see any of your repos. Re-issue with All repositories or use classic with `repo` scope."
+  - Generic miss → "No matches for X. Try the owner/repo field below."
+  - Direct-lookup 404 on `owner/repo` query → an explainer about org Resource Owner + the org-approval URL at `github.com/organizations/<org>/settings/personal-access-tokens-pending`, plus the classic-PAT alternative.
+
+## [0.11.2] — 2026-05-31
+
+**Gate is GitHub-only UI-wise.** Linear remains as a server-side ingestion path for legacy projects so production gates with `backend: 'linear'` projects continue receiving bugs uninterrupted, but every wizard, settings card, and project-detail surface now assumes GitHub. New projects default to `backend: 'github'`. Legacy Linear-backed projects in the project list get a "(legacy)" tag and a one-click "Switch to GitHub" path that triggers `tools/migrate-linear-to-github.js`.
+
+### Added
+- **Reveal + copy stored GitHub PAT.** Settings → GitHub card has a "Show & copy" button next to Replace/Disconnect. Clicking it reveals the token in a read-only field with a Copy button (uses `navigator.clipboard` with an `execCommand` fallback for non-secure contexts), auto-hides after 20 s. Admin-only endpoint `GET /frontend-conqueror/github/token` backs it.
+- **Direct-lookup fallback in repo search.** When the search query looks like `owner/repo` and `/user/repos` returns no match, the gate also tries `GET /repos/:owner/:repo` directly. Surfaces org repos that fine-grained PATs can reach via the per-repo endpoint but aren't listed in `/user/repos` (common when an org hasn't approved fine-grained PATs at the org level).
+
+### Changed
+- **Setup wizard collapsed to 4 GitHub steps**: PAT → project name → repo picker → first tester. The Linear branch (3 extra steps including team picker) is gone. Existing gates that already completed setup never re-enter it; this only affects fresh-gate first-runs.
+- **Per-project configure wizard collapsed to 2 GitHub steps**: repo picker → first tester. Backend chooser removed entirely. Legacy projects with `backend='linear'` and an actual Linear destination set skip straight to the tester step.
+- **Project detail Destination card is GitHub-first.** For `backend='github'` projects: shows the repo + Change-repo button. For `backend='linear'` projects: shows a legacy notice with the exact `node tools/migrate-linear-to-github.js …` command and a "Switch to GitHub →" button that triggers the migration wizard.
+- **Project list cards** show the GitHub repo name (or "(legacy Linear)" for `backend='linear'` projects) in the destination meta line, not the Linear project name.
+- **Global Settings Linear card removed.** Only the GitHub access token card remains.
+- **First-run detection switched to GitHub.** `navigate()` triggers the setup wizard when there are zero projects AND no GitHub token. The pre-v0.11.2 check (no Linear API key) is gone.
+- **`/user/repos` paginated to 3 pages (300 repos).** Single-page fetches missed accounts with >100 repos when the desired one was older than the top 100. Pages are fetched in parallel; cache TTL unchanged at 30 s.
+- **New project default backend flipped to `'github'`.** Project schema at L118 and `loadData()` migration default. Existing projects with backend already set are untouched.
+
+### Migration
+- **Auto-cleanup on boot**: projects with `backend='linear'` but no `linearProjectId` AND no `linearApiKey` (a defaulted-but-never-configured artifact from v0.10.0–v0.11.1) are silently flipped to `backend='github'` so the new GitHub-only wizard can pick them up. Real Linear-backed projects with a destination set are untouched.
+
+### Compatibility
+- Linear backend ingestion path (`/api/report-issue` → `linearGraphQL`) is **untouched server-side**. Production gates with active Linear-backed projects keep working as-is — only the admin UI for managing them has changed.
+- All Linear admin routes (`PUT /linear/api-key`, `/linear/team`, `GET /linear/projects`, `DELETE /linear`) are kept callable from ops scripts; only the SPA no longer surfaces them.
+- `window.changeLinearProject` and `window.switchToLinear` remain on the window object as callable ops escape hatches.
+
+## [0.11.1] — 2026-05-31
+
+**Gate UX bundle — six pieces of feedback from the first v0.11.0 testing sitting.** Nothing structural changes; the gate just gets noticeably nicer to live with.
+
+### Added
+- **Eye toggle on every password input.** Login, forced-rotate (new + confirm), Linear API key, GitHub PAT, Settings → change admin password — every `<input type="password">` now has a show/hide button inside it. One MutationObserver wires new inputs on every render, so future password fields are covered automatically (idempotent via `data-pw-wired`).
+- **Live searchable repo picker** (combobox) for GitHub repo selection. Replaces the previous "type → click Search → render results" flow in the setup wizard and the per-project configure wizard, AND replaces the `prompt()`-driven repo picker on the project detail page (now a modal hosting the same combobox). Features: debounced live search (220 ms), ↑/↓ keyboard navigation, Enter to pick, Esc to clear, private repos surface with a "private" pill, owner/repo direct-entry fallback. New helpers: `renderRepoCombobox()`, `openModal()`.
+- **Same-PAT-everywhere copy.** Settings → GitHub card has a one-liner clarifying that the same fine-grained PAT can be pasted into local and production gates — both treat it identically. README's Production section grew a "GitHub backend" subsection spelling out the workflow (no env-var sharing, no cross-gate sync — paste it into each gate).
+
+### Changed
+- **Repo search now uses `/user/repos` + local filter** instead of `/search/repositories`. The Search Repositories endpoint biases against private repos when the query lacks an explicit `user:owner`/`org:owner` prefix; `/user/repos?affiliation=owner,collaborator,organization_member` returns every repo the PAT has access to, including private ones, and the gate filters locally by `full_name` and `description`. Combined with a 30 s per-token in-memory cache (`_ghRepoCache`), the live combobox doesn't hammer the GitHub API on every keystroke.
+
+### Fixed
+- **`saveData()` no longer crashes the gate on first write when the data file's parent directory is missing.** Defensive `fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true })` before the `writeFileSync`. The auto-mkdir at `resolveDataFile()` only fires when `GATE_DATA` is unset; with an explicit `GATE_DATA` pointing at a never-created parent (common on fresh machines), the first password-rotate write would ENOENT and kill the process. Now idempotent and safe.
+- **Backend chooser HTML rendered as blank dark navy on the per-project configure wizard.** `gate/server.js:2650` had `` `gh` `` (literal backticks for inline-code styling) inside the SPA's `html\`…\`` template literal — the inner backticks closed the template literal early and Firefox threw `SyntaxError: unexpected identifier 'gh'`. Switched to `<code>gh</code>` matching the convention used elsewhere in the file.
+
+### Compatibility
+- All existing projects, tokens, and data files keep working — no schema changes, no new env vars, no breaking API changes.
+- Linear backend untouched. Removing Linear is reserved for a future Phase B once all consumer projects are migrated to GitHub.
+
 ## [0.11.0] — 2026-05-31
 
 **Backend chooser lands in both wizards.** v0.10.0 introduced GitHub Issues as a peer backend to Linear in the data model and admin API, but the wizards still hardcoded Linear. v0.11.0 closes the gap — a fresh `/setup` flow lets you pick the tracker at step 1, and every per-project configure wizard does the same.

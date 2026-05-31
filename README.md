@@ -75,6 +75,16 @@ In production, only Test mode is reachable — Edit and Dev TODO are config-trim
 
 The gate is the auth boundary. No host-app auth integration needed.
 
+### GitHub backend (v0.10.0+) — one PAT, every gate
+
+Bugs filed in Test mode can land as GitHub Issues instead of Linear. Configure once per gate:
+
+1. Generate a fine-grained PAT at [github.com/settings/tokens?type=beta](https://github.com/settings/tokens?type=beta). Scope: pick the repos you'll route bugs to (or "All repositories"), permissions: **Issues: Read & Write**.
+2. Open the gate admin → Settings → "GitHub access token" card → **Connect GitHub** → paste the PAT.
+3. Per project: Project detail → Destination → **Switch to GitHub** → pick the repo from the live searchable picker.
+
+**The same PAT works on every gate.** You don't issue a separate token for local and production — generate it once, paste it into each gate's Settings card. To rotate, issue a new PAT and paste it into each gate (Replace button). The PAT is stored in each gate's `data.json` independently — there is no cross-gate sync (intentional: no shared-secret leak surface).
+
 ---
 
 ## Read more

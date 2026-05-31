@@ -115,7 +115,9 @@ function emptyProject(key, displayName) {
     status: 'pending',                   // pending | active | disabled
     users: {},                           // { [email]: { passwordHash, createdAt, lastLoginAt, lockedUntil } }
     // v0.10.0+: which tracker this project writes to.
-    backend: 'linear',                   // 'linear' | 'github'
+    // v0.11.2: default flipped to 'github' — Linear remains a server-side
+    // code path for legacy projects but new projects always start GitHub.
+    backend: 'github',                   // 'linear' (legacy) | 'github'
     // Linear-specific (used when backend === 'linear')
     linearProjectId: '',
     linearProjectName: '',
@@ -219,13 +221,28 @@ function loadData() {
       }
       delete proj.emails;
     }
-    if (!proj.backend) proj.backend = 'linear';
+    // v0.11.2: any project without a backend that has Linear data set is a
+    // pre-v0.10.0 project — keep it on 'linear' so ingestion doesn't break.
+    // Everything else defaults to 'github' (the new default).
+    if (!proj.backend) proj.backend = (proj.linearProjectId || proj.linearApiKey) ? 'linear' : 'github';
+    // v0.11.2: one-time clean-up. Projects that defaulted to 'linear' under
+    // v0.10.0–v0.11.1 but never actually got a Linear destination configured
+    // are silently flipped to 'github' so the new GitHub-only wizard can
+    // pick them up. Real Linear-backed projects (with linearProjectId set)
+    // are untouched and continue routing to Linear server-side.
+    if (proj.backend === 'linear' && !proj.linearProjectId && !proj.linearApiKey) {
+      proj.backend = 'github';
+    }
     if (proj.githubRepo === undefined) proj.githubRepo = '';
     if (proj.githubToken === undefined) proj.githubToken = null;
   }
   return data;
 }
 function saveData(data) {
+  // Defensive mkdir -p so explicit GATE_DATA paths (which skip the auto-mkdir
+  // at resolveDataFile() line 44) don't ENOENT on the first write and kill the
+  // process. Idempotent — no-op when the dir already exists.
+  try { fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true }); } catch {}
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
@@ -580,6 +597,53 @@ async function githubREST(token, method, pathAndQuery, body) {
   }
   return data;
 }
+// v0.11.1: 30 s per-token in-memory cache of /user/repos. Lets the live
+// combobox filter locally without re-hitting GitHub on every keystroke. Keyed
+// by token so a token rotation invalidates implicitly. Cleared on gate restart.
+// v0.11.2: paginates up to 3 pages (300 repos) so accounts with lots of repos
+// still cover the recent ones — and so org-owned repos at higher offsets
+// aren't dropped before the local filter runs.
+const _ghRepoCache = new Map(); // token -> { fetchedAt, repos }
+const GH_REPO_CACHE_TTL_MS = 30_000;
+const GH_REPO_PAGES = 3;
+async function getCachedUserRepos(token) {
+  const hit = _ghRepoCache.get(token);
+  if (hit && Date.now() - hit.fetchedAt < GH_REPO_CACHE_TTL_MS) return hit.repos;
+  // per_page=100 is GitHub's max for /user/repos. Fetch up to GH_REPO_PAGES
+  // pages in parallel and concat. affiliation covers everything the PAT can
+  // see — owner-only repos, repos shared as collaborator, repos in orgs the
+  // PAT has been approved for. Fine-grained PATs allow-listed to specific
+  // repos return only those repos here.
+  const pageReqs = [];
+  for (let p = 1; p <= GH_REPO_PAGES; p++) {
+    pageReqs.push(
+      githubREST(token, 'GET',
+        '/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member&page=' + p)
+        .catch(() => []) // a failing page (e.g. 404 past end) shouldn't kill the whole search
+    );
+  }
+  const pages = await Promise.all(pageReqs);
+  const repos = pages.flat().filter((r) => r && r.full_name);
+  _ghRepoCache.set(token, { fetchedAt: Date.now(), repos });
+  return repos;
+}
+// v0.11.2: direct-lookup fallback for org repos that /user/repos may not
+// surface even when the PAT has explicit access (common for fine-grained PATs
+// scoped to a single repo in an org that hasn't approved fine-grained at the
+// org level — the PAT works for /repos/:owner/:repo calls but is invisible to
+// /user/repos). Returns the repo metadata if reachable, null otherwise.
+async function tryDirectRepoLookup(token, ownerRepo) {
+  const m = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/.exec(ownerRepo);
+  if (!m) return null;
+  try {
+    const r = await githubREST(token, 'GET', '/repos/' + m[1] + '/' + m[2]);
+    if (!r || !r.full_name) return null;
+    return { full_name: r.full_name, description: r.description || '', private: !!r.private };
+  } catch {
+    return null;
+  }
+}
+
 // Parse "owner/repo" → { owner, repo }. Throws on malformed input.
 function parseGithubRepo(s) {
   const m = String(s || '').match(/^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/);
@@ -859,7 +923,7 @@ function publicProjectSummary(p) {
     status: p.status,
     usersCount: userCount,
     usersNeedingPassword: usersWithoutPassword,
-    backend: p.backend || 'linear',
+    backend: p.backend || 'github', // v0.11.2: default flipped (was 'linear').
     linearProjectName: p.linearProjectName || '',
     hasLinearOverride: !!(p.linearApiKey || p.linearTeamId),
     githubRepo: p.githubRepo || '',
@@ -1016,8 +1080,20 @@ async function handle(req, res) {
       console.log(`[gate] issue ${created.identifier || created.id} for ${proj.key} (${proj.backend}) by ${payload.email}`);
       return send(res, 200, { ok: true, issue: created });
     } catch (e) {
+      // v0.11.3: report the actual backend that failed (was hardcoded
+      // 'linear-failed' which was misleading once we added GitHub). Also,
+      // detect the specific "PAT missing Issues:W" 403 case and surface an
+      // actionable message instead of GitHub's generic "Resource not
+      // accessible by personal access token".
       console.error('[gate] backend error:', e.message);
-      return send(res, 502, { error: 'linear-failed', message: e.message });
+      const errCode = proj.backend === 'github' ? 'github-failed' : 'linear-failed';
+      let message = e.message;
+      if (proj.backend === 'github' && /Resource not accessible by personal access token/i.test(e.message)) {
+        message = "Your GitHub PAT can see the repo but can't create Issues. " +
+          'Re-issue the PAT with "Issues: Read & Write" permission ' +
+          '(fine-grained) or "repo" scope (classic), then paste it again in admin Settings → GitHub.';
+      }
+      return send(res, 502, { error: errCode, message });
     }
   }
 
@@ -1642,6 +1718,8 @@ async function handle(req, res) {
       return send(res, 400, { error: 'token-invalid', message: 'GitHub rejected this token: ' + e.message });
     }
     const data = loadData();
+    const prevToken = data.github && data.github.token;
+    if (prevToken && prevToken !== token) _ghRepoCache.delete(prevToken);
     data.github = { token, username };
     saveData(data);
     return send(res, 200, { github: publicGithub(data.github) });
@@ -1650,34 +1728,68 @@ async function handle(req, res) {
     if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
     const data = loadData();
     data.github = null;
+    // v0.11.2: blow the cached /user/repos for the now-removed token so a
+    // re-paste doesn't see stale data.
+    _ghRepoCache.clear();
     saveData(data);
     return send(res, 200, { github: null });
   }
-  // Repo search for the wizard picker. `q` is matched against name+owner.
-  // Returns the user's own repos + repos in their orgs they can read.
+  // v0.11.2: admin-only token reveal so the user can copy the stored PAT and
+  // paste it into another gate (or a password manager) without leaving the
+  // admin UI. Only returns the token over the wire when the session is
+  // authenticated as admin — same trust level as the rest of /frontend-conqueror.
+  if (method === 'GET' && route === '/frontend-conqueror/github/token') {
+    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
+    const data = loadData();
+    const token = data.github && data.github.token;
+    if (!token) return send(res, 404, { error: 'no-token' });
+    return send(res, 200, { token });
+  }
+  // Repo search for the wizard picker. v0.11.1: always uses /user/repos and
+  // filters locally, so PRIVATE repos surface (GitHub's /search/repositories
+  // endpoint biases against private repos when the query has no user:/org:
+  // prefix). Per-token 30 s memory cache so the live combobox doesn't hammer
+  // GitHub on every keystroke.
   if (method === 'GET' && route === '/frontend-conqueror/github/repos') {
     if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
     const data = loadData();
     const token = data.github && data.github.token;
     if (!token) return send(res, 400, { error: 'no-token' });
-    const q = String((parsed.query && parsed.query.q) || '').trim();
+    const qRaw = String((parsed.query && parsed.query.q) || '').trim();
+    const q = qRaw.toLowerCase();
     try {
-      // GitHub Search API needs a user prefix or org prefix; without `q` we
-      // list the user's own repos (cheapest call).
-      let items = [];
-      if (q) {
-        const search = await githubREST(token, 'GET',
-          `/search/repositories?q=${encodeURIComponent(q + ' fork:true')}&per_page=20&sort=updated`);
-        items = (search && search.items) || [];
-      } else {
-        items = await githubREST(token, 'GET', '/user/repos?per_page=30&sort=updated&affiliation=owner,collaborator,organization_member');
-      }
-      const repos = (items || []).map((r) => ({
+      const all = await getCachedUserRepos(token);
+      const filtered = !q ? all : all.filter((r) =>
+        (r.full_name || '').toLowerCase().includes(q) ||
+        (r.description || '').toLowerCase().includes(q)
+      );
+      let repos = filtered.slice(0, 30).map((r) => ({
         full_name: r.full_name,
         description: r.description || '',
         private: !!r.private,
       }));
-      return send(res, 200, { repos });
+      let hint = null;
+      // v0.11.2+: if the query looks like "owner/name" and /user/repos didn't
+      // surface it, probe /repos/:o/:r directly. Per GitHub's docs, that
+      // endpoint returns 200 when the PAT has access (most common path:
+      // fine-grained PAT scoped to that one repo with Metadata:R, Issues:R/W).
+      // 404 means either (a) the PAT isn't approved for that org yet, or
+      // (b) the PAT's Resource Owner is the user instead of the org, or
+      // (c) the repo doesn't exist / has been renamed. We surface a hint so
+      // the SPA can show the org-approval workflow inline.
+      if (qRaw.includes('/') && repos.length === 0) {
+        const direct = await tryDirectRepoLookup(token, qRaw);
+        if (direct) repos = [direct];
+        else hint = 'direct-lookup-404';
+      }
+      // v0.11.2+: also accept a bare repo name (no "/") and try the connected
+      // user's owner-prefix as a fallback — covers the common case where the
+      // user types "my-repo" and forgets the owner.
+      if (!qRaw.includes('/') && qRaw && repos.length === 0 && data.github.username) {
+        const direct = await tryDirectRepoLookup(token, data.github.username + '/' + qRaw);
+        if (direct) repos = [direct];
+      }
+      return send(res, 200, { repos, hint });
     } catch (e) {
       return send(res, 502, { error: 'github-unreachable', message: e.message });
     }
@@ -1766,6 +1878,40 @@ const ADMIN_HTML = `<!doctype html>
   .origin-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; font-size: 12px; color: var(--muted); }
   .origin-list .o { display: flex; justify-content: space-between; }
   .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: var(--card); border: 1px solid var(--border2); color: var(--text); padding: 10px 16px; border-radius: 8px; font-size: 13px; z-index: 9; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }
+  /* v0.11.1: password show/hide toggle. The wrapper sits in place of the
+     <input> in the DOM; wirePasswordToggles() re-parents the input into it
+     and appends the .pw-toggle button. Width: 100% so it visually replaces
+     the input one-for-one in the existing layout. */
+  .pw-wrap { position: relative; width: 100%; }
+  .pw-wrap input { padding-right: 36px; }
+  .pw-toggle { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); background: transparent; border: 0; color: var(--muted); cursor: pointer; padding: 4px 6px; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; }
+  .pw-toggle:hover { background: var(--card2); color: var(--text); }
+  .pw-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .pw-toggle svg { width: 16px; height: 16px; display: block; }
+  /* v0.11.1: live repo combobox (replaces input + button + results list). */
+  .combo { position: relative; }
+  .combo-input { width: 100%; }
+  .combo-results { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; max-height: 360px; overflow-y: auto; }
+  .combo-results .palette-option[aria-selected="true"] { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .combo-empty { color: var(--muted); font-size: 12px; padding: 14px 4px; text-align: center; }
+  .combo-loading { color: var(--muted); font-size: 12px; padding: 14px 4px; text-align: center; font-style: italic; }
+  .combo-hint { color: var(--muted); font-size: 11px; margin-top: 6px; }
+  /* v0.11.3: project-detail tab bar. Horizontal pills with an underline for
+     active. Deep-linkable via #/p/:key/:tab so the URL is the source of truth
+     for which tab is rendered (and reload preserves it). */
+  .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin: 18px 0 18px; flex-wrap: wrap; }
+  .tab { background: transparent; border: 0; color: var(--muted); padding: 9px 14px; cursor: pointer; font: inherit; font-size: 13px; border-bottom: 2px solid transparent; margin-bottom: -1px; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+  .tab:hover { color: var(--text); text-decoration: none; }
+  .tab.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 500; }
+  .tab .count { display: inline-flex; align-items: center; padding: 0 7px; height: 17px; background: var(--card2); color: var(--muted); border-radius: 999px; font-size: 11px; font-weight: 400; }
+  .tab.active .count { background: rgba(37,99,235,0.18); color: #93c5fd; }
+  .tab .dot-warn { width: 6px; height: 6px; border-radius: 50%; background: var(--warn); display: inline-block; }
+  /* v0.11.1: lightweight modal helper (used by changeGithubRepo() etc.). */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 50; display: flex; align-items: flex-start; justify-content: center; padding-top: 90px; }
+  .modal-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; width: min(560px, calc(100vw - 32px)); box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
+  .modal-card h3 { margin: 0 0 12px; }
+  .modal-close { float: right; background: transparent; border: 0; color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1; padding: 0 4px; }
+  .modal-close:hover { color: var(--text); }
 </style></head>
 <body>
 <div id="root"></div>
@@ -1815,6 +1961,181 @@ async function api(method, route, body) {
   return json;
 }
 
+// ============================== UI HELPERS (v0.11.1) ==============================
+// SVG eye + eye-off, both 16x16. Inlined so there's no extra HTTP fetch.
+const EYE_OPEN_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a21.77 21.77 0 0 1 5.06-5.94M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 8 11 8a21.83 21.83 0 0 1-3.17 4.19M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+// Wrap every <input type="password"> in rootEl with an inline show/hide eye
+// toggle. Idempotent via data-pw-wired so re-renders don't double-wrap. Call
+// at the END of each renderer that paints a password input.
+function wirePasswordToggles(rootEl) {
+  if (!rootEl) return;
+  const inputs = rootEl.querySelectorAll('input[type="password"]:not([data-pw-wired])');
+  inputs.forEach((input) => {
+    input.setAttribute('data-pw-wired', '1');
+    const wrap = document.createElement('span');
+    wrap.className = 'pw-wrap';
+    input.parentNode.insertBefore(wrap, input);
+    wrap.appendChild(input);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'pw-toggle';
+    btn.tabIndex = -1; // skip in tab order — most users prefer to type-then-click
+    btn.setAttribute('aria-label', 'Show password');
+    btn.innerHTML = EYE_OPEN_SVG;
+    btn.addEventListener('click', () => {
+      const showing = input.type === 'text';
+      input.type = showing ? 'password' : 'text';
+      btn.innerHTML = showing ? EYE_OPEN_SVG : EYE_OFF_SVG;
+      btn.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+      // Keep focus in the input so the user can keep typing without re-clicking.
+      input.focus();
+    });
+    wrap.appendChild(btn);
+  });
+}
+
+// Live repo combobox. Host element gets an input + a debounced results panel.
+// opts = { onPick(fullName), initialQuery (default ''), placeholder, hint }.
+// Returns nothing — the caller already owns the host element.
+function renderRepoCombobox(host, opts) {
+  opts = opts || {};
+  const placeholder = opts.placeholder || 'Search your repos — type to filter';
+  const hint = opts.hint != null ? opts.hint : 'Tip: type owner/repo to look up a specific repo (works for private + org repos your PAT can reach).';
+  host.classList.add('combo');
+  host.innerHTML =
+    '<input class="combo-input" type="text" placeholder="' + esc(placeholder) + '" autocomplete="off" autofocus>' +
+    '<div class="combo-results"><div class="combo-loading">Loading your repos…</div></div>' +
+    (hint ? '<div class="combo-hint">' + esc(hint) + '</div>' : '') +
+    '<div class="row" style="margin-top:8px;gap:6px;">' +
+      '<input class="combo-direct" type="text" placeholder="…or paste owner/repo directly" autocomplete="off" style="flex:1;">' +
+      '<button class="ghost combo-direct-btn">Use this</button>' +
+    '</div>';
+  const input = host.querySelector('.combo-input');
+  const resultsEl = host.querySelector('.combo-results');
+  const directInput = host.querySelector('.combo-direct');
+  const directBtn = host.querySelector('.combo-direct-btn');
+  let current = [];
+  let activeIdx = -1;
+  let reqSeq = 0;
+  let lastQuery = '';
+  let lastHint = null;
+
+  const renderRows = () => {
+    if (current.length === 0) {
+      // v0.11.3: tailor the empty-state message to the actual cause. The
+      // server returns hint='direct-lookup-404' when an owner/repo-shaped
+      // query couldn't be reached at all — usually the org-approval case.
+      let msg;
+      if (lastHint === 'direct-lookup-404') {
+        msg =
+          '<div class="combo-empty" style="text-align:left;line-height:1.5;">' +
+            '<strong style="color:#fca5a5;">Can\\'t reach <code>' + esc(lastQuery) + '</code> with this PAT.</strong><br><br>' +
+            'Most likely cause: this is a private <strong>org repo</strong> and your fine-grained PAT either:' +
+            '<ul style="margin:6px 0;padding-left:18px;">' +
+              '<li>has the user (not the org) as <em>Resource Owner</em>, or</li>' +
+              '<li>hasn\\'t been approved by the org yet (see <code>github.com/organizations/&lt;org&gt;/settings/personal-access-tokens-pending</code>).</li>' +
+            '</ul>' +
+            '<strong>Quickest fix:</strong> re-create the PAT and pick the <strong>organization</strong> as Resource Owner, then ask an org admin to approve it. Or use a <strong>classic PAT</strong> with the <code>repo</code> scope — sees every repo you can see, no org-approval dance.' +
+          '</div>';
+      } else if (lastQuery) {
+        msg = '<div class="combo-empty">No matches for <code>' + esc(lastQuery) + '</code>. Try the <code>owner/repo</code> field below if the repo is private or in an org.</div>';
+      } else {
+        msg = '<div class="combo-empty"><strong>This PAT can\\'t see any of your repos.</strong><br>Re-issue with <strong>"All repositories"</strong> (fine-grained) or use a <strong>classic PAT</strong> with <code>repo</code> scope. Both work.</div>';
+      }
+      resultsEl.innerHTML = msg;
+      activeIdx = -1;
+      return;
+    }
+    resultsEl.innerHTML = current.map((r, i) => (
+      '<button class="palette-option" data-repo="' + esc(r.full_name) + '" data-idx="' + i + '"' + (i === activeIdx ? ' aria-selected="true"' : '') + '>' +
+        '<span class="name" style="font:600 12px/1.2 ui-monospace,Menlo,monospace;">' + esc(r.full_name) + '</span>' +
+        (r.private ? ' <span class="kbd">private</span>' : '') +
+        (r.description ? '<span class="desc" style="display:block;margin-top:4px;">' + esc(r.description) + '</span>' : '') +
+      '</button>'
+    )).join('');
+    resultsEl.querySelectorAll('button.palette-option').forEach((btn) => {
+      btn.addEventListener('click', () => opts.onPick && opts.onPick(btn.getAttribute('data-repo')));
+    });
+  };
+
+  const search = async (q) => {
+    const mySeq = ++reqSeq;
+    lastQuery = q;
+    if (mySeq === 1) resultsEl.innerHTML = '<div class="combo-loading">Loading your repos…</div>';
+    try {
+      const r = await api('GET', '/frontend-conqueror/github/repos?q=' + encodeURIComponent(q));
+      if (mySeq !== reqSeq) return; // a newer keystroke superseded this fetch
+      current = r.repos || [];
+      lastHint = r.hint || null;
+      activeIdx = current.length ? 0 : -1;
+      renderRows();
+    } catch (e) {
+      if (mySeq !== reqSeq) return;
+      resultsEl.innerHTML = '<div class="err">' + esc(e.message) + '</div>';
+    }
+  };
+
+  let debounceT = null;
+  input.addEventListener('input', () => {
+    clearTimeout(debounceT);
+    debounceT = setTimeout(() => search(input.value.trim()), 220);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (current.length) { activeIdx = (activeIdx + 1) % current.length; renderRows(); resultsEl.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' }); }
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (current.length) { activeIdx = (activeIdx - 1 + current.length) % current.length; renderRows(); resultsEl.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' }); }
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (activeIdx >= 0 && current[activeIdx]) opts.onPick && opts.onPick(current[activeIdx].full_name);
+    } else if (e.key === 'Escape') {
+      input.value = '';
+      search('');
+    }
+  });
+
+  const submitDirect = () => {
+    const v = directInput.value.trim();
+    if (!v) return;
+    opts.onPick && opts.onPick(v);
+  };
+  directBtn.addEventListener('click', submitDirect);
+  directInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitDirect(); } });
+
+  if (opts.initialQuery) input.value = opts.initialQuery;
+  search(opts.initialQuery || '');
+}
+
+// Lightweight modal. Returns the inner content host element for the caller
+// to paint into. Closes on backdrop click, Esc, or modal._close().
+function openModal(title) {
+  const back = document.createElement('div');
+  back.className = 'modal-backdrop';
+  back.innerHTML =
+    '<div class="modal-card" role="dialog" aria-modal="true">' +
+      '<button class="modal-close" aria-label="Close">✕</button>' +
+      (title ? '<h3>' + esc(title) + '</h3>' : '') +
+      '<div class="modal-body"></div>' +
+    '</div>';
+  document.body.appendChild(back);
+  const card = back.querySelector('.modal-card');
+  const body = back.querySelector('.modal-body');
+  const close = () => {
+    if (!back.parentNode) return;
+    back.parentNode.removeChild(back);
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  back.addEventListener('click', (e) => { if (e.target === back) close(); });
+  back.querySelector('.modal-close').addEventListener('click', close);
+  document.addEventListener('keydown', onKey);
+  body._close = close;
+  return body;
+}
+
 // ============================== ROUTING ==============================
 // Simple hash router. Routes:
 //   #/login                       (handled outside the router; only when 401)
@@ -1828,17 +2149,31 @@ let STATE = null;          // last fetched state
 let ROUTE = null;          // current route object
 
 window.addEventListener('hashchange', () => navigate());
-window.addEventListener('load', () => navigate());
+window.addEventListener('load', () => {
+  // v0.11.1: one MutationObserver on document.body catches every renderX()
+  // output (root.innerHTML = ...) AND modal mounts (openModal appends to body)
+  // and wires password show/hide toggles on any new <input type="password">
+  // nodes. Idempotent (data-pw-wired marker) — re-renders are harmless. One
+  // observer = covers every current and future renderer + modal.
+  new MutationObserver(() => wirePasswordToggles(document.body))
+    .observe(document.body, { childList: true, subtree: true });
+  navigate();
+});
 
 function parseHash() {
   const h = (window.location.hash || '#/').slice(1);
   const parts = h.split('/').filter(Boolean);
   if (parts.length === 0) return { name: 'list' };
-  if (parts[0] === 'settings') return { name: 'settings' };
+  // v0.11.3: settings tabs are deep-linkable too — #/settings, #/settings/github,
+  // #/settings/appearance, #/settings/security.
+  if (parts[0] === 'settings') return { name: 'settings', tab: parts[1] || null };
   if (parts[0] === 'setup') return { name: 'setup' };
   if (parts[0] === 'p' && parts[1]) {
     if (parts[2] === 'configure') return { name: 'project-wizard', key: parts[1] };
-    return { name: 'project-detail', key: parts[1] };
+    // v0.11.3: tabs are deep-linkable. #/p/:key, #/p/:key/activity,
+    // #/p/:key/testers, #/p/:key/destination, #/p/:key/integration,
+    // #/p/:key/settings. Unknown tab falls back to the default.
+    return { name: 'project-detail', key: parts[1], tab: parts[2] || null };
   }
   return { name: 'list' };
 }
@@ -1855,8 +2190,10 @@ async function navigate() {
   }
   if (ROUTE.name === 'list') {
     const totalProjects = STATE.projects.length;
-    const hasLinear = STATE.linear && STATE.linear.hasApiKey;
-    if (!hasLinear && totalProjects === 0) return renderSetup();
+    // v0.11.2: first-run check uses GitHub now (setup wizard is GitHub-only).
+    // Legacy gates with only Linear configured fall through to renderList.
+    const hasGithub = STATE.github && STATE.github.hasToken;
+    if (!hasGithub && totalProjects === 0) return renderSetup();
     return renderList();
   }
   if (ROUTE.name === 'settings') return renderSettings();
@@ -1949,21 +2286,14 @@ function renderForcedPasswordChange() {
 
 // ============================== FIRST-TIME SETUP WIZARD ==============================
 async function renderSetup() {
-  // v0.11.0: setup wizard is backend-aware. New step 1 is a backend chooser;
-  // existing 5 steps renumbered to 2-6. The Linear flow's auto-skip from step
-  // 2 (was step 1, multi-team detection) is preserved. GitHub flow skips
-  // directly from credential paste to project naming — no team concept.
+  // v0.11.2: GitHub-only setup wizard. Previously there was a backend chooser
+  // (Linear vs GitHub) at step 1 with two divergent branches. Now we go
+  // straight to GitHub: PAT → project → repo → tester.
   let step = 1;
   const ctx = {
-    backend: null,
-    apiKey: '',
     githubToken: '',
-    teamId: null,
-    teamName: null,
-    teams: [],
     projectKey: '',
     projectDisplayName: '',
-    linearProjectId: null,
     githubRepo: '',
   };
   function nav(html_) {
@@ -1976,79 +2306,26 @@ async function renderSetup() {
       </header>
       <main>\${html_}</main>\`;
   }
-  // Total step count varies: Linear with multi-team = 6, Linear single-team
-  // or GitHub = 5. The dots widget reflects the worst case (6) to keep
-  // pixel layout stable across renders; the visible label tells the truth.
+  const TOTAL = 4;
   const dots = (n) => '<div class="step-dots">' +
-    [1,2,3,4,5,6].map(i => '<div class="d ' + (i < n ? 'done' : i === n ? 'on' : '') + '"></div>').join('') +
+    [1,2,3,4].map(i => '<div class="d ' + (i < n ? 'done' : i === n ? 'on' : '') + '"></div>').join('') +
     '</div>';
-  const totalSteps = () => (ctx.backend === 'github' ? 5 : (ctx.teams.length > 1 ? 6 : 5));
 
   function renderStep() {
     if (step === 1) {
-      // Backend chooser (NEW in v0.11.0). Setup used to assume Linear; this
-      // is the first decision now.
+      // GitHub PAT.
       nav(html\`
         \${dots(1)}
-        <h2>Where will bugs land?<span class="sub">Step 1 of \${totalSteps()} — pick the issue tracker the gate will write to. You can add more backends per-project later.</span></h2>
+        <h2>GitHub access token<span class="sub">Step 1 of \${TOTAL} — paste a PAT. Used by every project on this gate to file Issues.</span></h2>
         <div class="card">
-          <button class="palette-option" id="pickLinear" style="margin-bottom:8px;">
-            <span class="dot" style="background:#5e6ad2;"></span>
-            <span class="name">Linear</span>
-            <span class="desc">Bugs land as Linear issues. Best if your team triages in Linear today.</span>
-          </button>
-          <button class="palette-option" id="pickGithub">
-            <span class="dot" style="background:#24292e;"></span>
-            <span class="name">GitHub Issues</span>
-            <span class="desc">Bugs land as GitHub Issues in a repo, tagged <code>fc:bug</code>. Best if devs triage from <code>gh</code> CLI or the repo's Issues tab.</span>
-          </button>
-        </div>\`);
-      $('pickLinear').addEventListener('click', () => { ctx.backend = 'linear'; step = 2; renderStep(); });
-      $('pickGithub').addEventListener('click', () => { ctx.backend = 'github'; step = 2; renderStep(); });
-    } else if (step === 2 && ctx.backend === 'linear') {
-      nav(html\`
-        \${dots(2)}
-        <h2>Linear API key<span class="sub">Step 2 of \${totalSteps()} — shared across all Linear-backed projects on this gate (you can override per-project later).</span></h2>
-        <div class="card">
-          <label for="apiKey">Linear API key</label>
-          <input id="apiKey" type="password" placeholder="lin_api_..." autofocus value="\${esc(ctx.apiKey)}">
-          <div class="sub-muted" style="margin-top:6px;">Get one from <a href="https://linear.app/settings/api" target="_blank" rel="noreferrer">Linear → Settings → API</a>. Personal API keys work fine.</div>
-          <div class="err" id="err"></div>
-          <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
-            <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
-            <button class="primary" id="next">Continue →</button>
+          <label for="ghToken">Personal access token (classic or fine-grained)</label>
+          <input id="ghToken" type="password" placeholder="github_pat_... or ghp_..." autofocus value="\${esc(ctx.githubToken)}">
+          <div class="sub-muted" style="margin-top:6px;line-height:1.55;">
+            <strong>Easiest:</strong> a <a href="https://github.com/settings/tokens/new?scopes=repo&description=frontend-conqueror" target="_blank" rel="noreferrer">classic PAT with <code>repo</code> scope</a>. Sees every repo you can see (public + private, personal + org). No org-approval needed.<br>
+            <strong>More secure:</strong> a <a href="https://github.com/settings/tokens?type=beta" target="_blank" rel="noreferrer">fine-grained PAT</a> with <strong>Issues: Read &amp; Write</strong> + <strong>Metadata: Read</strong>. For org repos, set <em>Resource Owner</em> to the organization and have an admin approve it.
           </div>
-        </div>\`);
-      $('next').addEventListener('click', async () => {
-        ctx.apiKey = $('apiKey').value.trim();
-        if (!ctx.apiKey) return ($('err').textContent = 'Paste your Linear API key.');
-        $('next').disabled = true;
-        try {
-          const res = await api('PUT', '/frontend-conqueror/linear/api-key', { apiKey: ctx.apiKey });
-          if (res.resolution === 'no-teams') return ($('err').textContent = 'Linear returned no teams for this key.');
-          if (res.resolution === 'auto-team') {
-            ctx.teamId = res.linear.teamId;
-            ctx.teamName = res.linear.teamName;
-            step = 4;  // skip team picker
-          } else {
-            ctx.teams = res.linear.availableTeams || [];
-            step = 3;
-          }
-          renderStep();
-        } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
-      });
-    } else if (step === 2 && ctx.backend === 'github') {
-      // v0.11.0: GitHub equivalent of the Linear API key paste step.
-      nav(html\`
-        \${dots(2)}
-        <h2>GitHub access token<span class="sub">Step 2 of \${totalSteps()} — shared across all GitHub-backed projects on this gate.</span></h2>
-        <div class="card">
-          <label for="ghToken">Personal access token</label>
-          <input id="ghToken" type="password" placeholder="github_pat_..." autofocus value="\${esc(ctx.githubToken)}">
-          <div class="sub-muted" style="margin-top:6px;">Create a fine-grained PAT at <a href="https://github.com/settings/tokens?type=beta" target="_blank" rel="noreferrer">github.com/settings/tokens</a> with <strong>Issues: Read &amp; Write</strong> on the repos you'll route bugs to.</div>
           <div class="err" id="err"></div>
           <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
-            <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
             <button class="primary" id="next">Continue →</button>
           </div>
         </div>\`);
@@ -2058,39 +2335,15 @@ async function renderSetup() {
         $('next').disabled = true;
         try {
           await api('PUT', '/frontend-conqueror/github/token', { token: ctx.githubToken });
-          step = 4;  // GitHub has no team concept; jump straight to project naming
+          step = 2;
           renderStep();
         } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
       });
-    } else if (step === 3) {
-      // Pick Linear team (Linear multi-team only). v0.11.0: renumbered.
+    } else if (step === 2) {
+      // Project name + key.
       nav(html\`
-        \${dots(3)}
-        <h2>Pick your Linear team<span class="sub">Step 3 of \${totalSteps()} — your key has access to multiple teams. Bugs will land in this one.</span></h2>
-        <div class="card">
-          <label for="team">Team</label>
-          <select id="team">\${ctx.teams.map(t => '<option value="' + esc(t.id) + '">' + esc(t.name) + ' (' + esc(t.key) + ')</option>').join('')}</select>
-          <div class="err" id="err"></div>
-          <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
-            <button class="ghost" onclick="(()=>{step=2;renderStep();})()">← Back</button>
-            <button class="primary" id="next">Continue →</button>
-          </div>
-        </div>\`);
-      $('next').addEventListener('click', async () => {
-        const teamId = $('team').value;
-        try {
-          const res = await api('PUT', '/frontend-conqueror/linear/team', { teamId });
-          ctx.teamId = res.linear.teamId;
-          ctx.teamName = res.linear.teamName;
-          step = 4;
-          renderStep();
-        } catch (e) { $('err').textContent = e.message; }
-      });
-    } else if (step === 4) {
-      // Project name + key (was step 3 pre-v0.11.0).
-      nav(html\`
-        \${dots(4)}
-        <h2>Name your first project<span class="sub">Step 4 of \${totalSteps()} — this is what you'll use in your plugin config (<code>gate.project = '...'</code>). Letters, numbers, dashes.</span></h2>
+        \${dots(2)}
+        <h2>Name your first project<span class="sub">Step 2 of \${TOTAL} — this is what you'll use in your plugin config (<code>gate.project = '...'</code>). Letters, numbers, dashes.</span></h2>
         <div class="card">
           <label for="displayName">Display name</label>
           <input id="displayName" placeholder="Messarat" autofocus value="\${esc(ctx.projectDisplayName)}">
@@ -2099,7 +2352,7 @@ async function renderSetup() {
           <div class="sub-muted" style="margin-top:4px;">Used in <code>gate.project</code> and the overlay URL.</div>
           <div class="err" id="err"></div>
           <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
-            <button class="ghost" onclick="(()=>{step=ctx.backend==='github'?2:(ctx.teams.length>1?3:2);renderStep();})()">← Back</button>
+            <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
             <button class="primary" id="next">Continue →</button>
           </div>
         </div>\`);
@@ -2119,106 +2372,43 @@ async function renderSetup() {
           await api('POST', '/frontend-conqueror/projects', { key, displayName });
           ctx.projectKey = key;
           ctx.projectDisplayName = displayName;
-          step = 5;
+          step = 3;
           renderStep();
         } catch (e) {
           if (e.payload && e.payload.error === 'already-exists') {
             ctx.projectKey = key;
             ctx.projectDisplayName = displayName;
-            step = 5;
+            step = 3;
             renderStep();
           } else $('err').textContent = e.message;
         }
       });
-    } else if (step === 5 && ctx.backend === 'linear') {
-      // Linear destination picker (was step 4 pre-v0.11.0).
+    } else if (step === 3) {
+      // Repo picker.
       nav(html\`
-        \${dots(5)}
-        <h2>Where should bugs land?<span class="sub">Step 5 of \${totalSteps()} — pick or create a Linear project. Bugs from \${esc(ctx.projectDisplayName)} will file there.</span></h2>
+        \${dots(3)}
+        <h2>Which GitHub repo?<span class="sub">Step 3 of \${TOTAL} — bugs from \${esc(ctx.projectDisplayName)} will land in this repo's Issues tab, tagged <code>fc:bug</code>.</span></h2>
         <div class="card">
-          <div id="projLoad" class="sub-muted">Loading Linear projects…</div>
-        </div>\`);
-      (async () => {
-        let projects = [];
-        try { projects = (await api('GET', '/frontend-conqueror/linear/projects')).projects || []; }
-        catch (e) { $('projLoad').textContent = e.message; return; }
-        nav(html\`
-          \${dots(5)}
-          <h2>Where should bugs land?<span class="sub">Step 5 of \${totalSteps()} — pick or create a Linear project. Bugs from \${esc(ctx.projectDisplayName)} will file there.</span></h2>
-          <div class="card">
-            <label for="existing">Existing Linear project</label>
-            <select id="existing">
-              <option value="">— pick one —</option>
-              \${projects.map(p => '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>').join('')}
-            </select>
-            <div style="text-align:center;color:var(--muted);margin:14px 0;font-size:12px;">— or —</div>
-            <label for="newName">Create a new Linear project</label>
-            <input id="newName" placeholder="\${esc(ctx.projectDisplayName)} Bugs">
-            <div class="err" id="err"></div>
-            <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
-              <button class="ghost" onclick="(()=>{step=4;renderStep();})()">← Back</button>
-              <button class="primary" id="next">Continue →</button>
-            </div>
-          </div>\`);
-        $('next').addEventListener('click', async () => {
-          const existingId = $('existing').value;
-          const newName = $('newName').value.trim();
-          if (!existingId && !newName) return ($('err').textContent = 'Pick one or type a name.');
-          $('next').disabled = true;
-          try {
-            const body = existingId ? { projectId: existingId } : { newName };
-            await api('PUT', '/frontend-conqueror/projects/' + ctx.projectKey + '/linear-project', body);
-            step = 6;
-            renderStep();
-          } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
-        });
-      })();
-    } else if (step === 5 && ctx.backend === 'github') {
-      // v0.11.0: GitHub repo picker for the setup wizard. Same shape as the
-      // per-project wizard's GitHub step.
-      nav(html\`
-        \${dots(5)}
-        <h2>Which GitHub repo?<span class="sub">Step 5 of \${totalSteps()} — bugs from \${esc(ctx.projectDisplayName)} will land in this repo's Issues tab, tagged <code>fc:bug</code>.</span></h2>
-        <div class="card">
-          <label for="ghQuery">Search your repos</label>
-          <input id="ghQuery" placeholder="messarat, owner/repo, or leave blank to list recent" autofocus>
-          <div class="row" style="justify-content:flex-end;margin-top:6px;gap:6px;">
-            <button class="ghost" id="ghSearch">Search</button>
-          </div>
-          <div id="ghResults" style="margin-top:10px;"></div>
+          <div id="ghCombo"></div>
           <div class="err" id="err" style="margin-top:6px;"></div>
           <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
-            <button class="ghost" onclick="(()=>{step=4;renderStep();})()">← Back</button>
+            <button class="ghost" onclick="(()=>{step=2;renderStep();})()">← Back</button>
           </div>
         </div>\`);
-      const runSearch = async () => {
-        $('ghResults').innerHTML = '<div class="sub-muted">Searching…</div>';
-        try {
-          const q = $('ghQuery').value.trim();
-          const repos = (await api('GET', '/frontend-conqueror/github/repos?q=' + encodeURIComponent(q))).repos || [];
-          if (repos.length === 0) { $('ghResults').innerHTML = '<div class="empty">No matching repos. Try a different search, or type the full owner/repo directly:</div><div class="row" style="margin-top:6px;"><input id="ghDirect" placeholder="owner/repo"><button class="primary" id="ghPickDirect">Use this repo →</button></div>'; $('ghPickDirect').addEventListener('click', () => pickRepo($('ghDirect').value.trim())); return; }
-          $('ghResults').innerHTML = repos.map((r) => '<button class="palette-option" data-repo="' + esc(r.full_name) + '"><span class="name" style="font:600 12px/1.2 ui-monospace,Menlo,monospace;">' + esc(r.full_name) + '</span>' + (r.private ? ' <span class="kbd">private</span>' : '') + (r.description ? '<span class="desc" style="display:block;margin-top:4px;">' + esc(r.description) + '</span>' : '') + '</button>').join('');
-          $('ghResults').querySelectorAll('button.palette-option').forEach((btn) => {
-            btn.addEventListener('click', () => pickRepo(btn.getAttribute('data-repo')));
-          });
-        } catch (e) { $('ghResults').innerHTML = '<div class="err">' + esc(e.message) + '</div>'; }
-      };
       const pickRepo = async (repo) => {
         if (!repo || !repo.includes('/')) return ($('err').textContent = 'Repo must be in the form "owner/repo".');
         try {
           await api('PUT', '/frontend-conqueror/projects/' + ctx.projectKey + '/github-repo', { repo });
-          step = 6;
+          step = 4;
           renderStep();
         } catch (e) { $('err').textContent = e.message; }
       };
-      $('ghSearch').addEventListener('click', runSearch);
-      $('ghQuery').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSearch(); } });
-      runSearch();
-    } else if (step === 6) {
-      // First tester (was step 5 pre-v0.11.0).
+      renderRepoCombobox($('ghCombo'), { onPick: pickRepo });
+    } else if (step === 4) {
+      // First tester.
       nav(html\`
-        \${dots(6)}
-        <h2>Add your first tester<span class="sub">Step 6 of \${totalSteps()} — only people whose email + password you set here will be able to file bugs from \${esc(ctx.projectDisplayName)}. You can add more later.</span></h2>
+        \${dots(4)}
+        <h2>Add your first tester<span class="sub">Step 4 of \${TOTAL} — only people whose email + password you set here will be able to file bugs from \${esc(ctx.projectDisplayName)}. You can add more later.</span></h2>
         <div class="card">
           <label for="firstEmail">First tester email</label>
           <input id="firstEmail" type="email" placeholder="alice@example.com" autofocus>
@@ -2227,7 +2417,7 @@ async function renderSetup() {
           <div class="sub-muted" style="margin-top:6px;">You can add more testers from the project page after setup.</div>
           <div class="err" id="err"></div>
           <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
-            <button class="ghost" onclick="(()=>{step=5;renderStep();})()">← Back</button>
+            <button class="ghost" onclick="(()=>{step=3;renderStep();})()">← Back</button>
             <button class="primary" id="finish">Finish setup →</button>
           </div>
         </div>\`);
@@ -2299,7 +2489,11 @@ function fcUsedByMap(excludeKey) {
 }
 function projectCard(p) {
   const lastSeen = p.activity.lastSeenAt ? relTime(p.activity.lastSeenAt) : 'never';
-  const linearDest = p.linearProjectName || (p.status === 'pending' ? '(needs configuring)' : '(not set)');
+  // v0.11.2: show GitHub destination by default; legacy Linear-backed projects
+  // surface their Linear destination name with a "(legacy)" tag.
+  const dest = p.backend === 'linear'
+    ? (p.linearProjectName ? p.linearProjectName + ' (legacy Linear)' : '(legacy Linear — needs migration)')
+    : (p.githubRepo || (p.status === 'pending' ? '(needs configuring)' : '(not set)'));
   // v0.9.8: surface the Configure action directly on pending cards so the
   // pending → active flow is one click from the list view (used to require
   // clicking into the detail page first).
@@ -2314,7 +2508,7 @@ function projectCard(p) {
       </div>
       <div class="meta">
         <span>📬 \${p.usersCount} \${p.usersCount === 1 ? 'tester' : 'testers'}\${p.usersNeedingPassword > 0 ? ' (' + p.usersNeedingPassword + ' need password)' : ''}</span>
-        <span>🎯 \${esc(linearDest)}</span>
+        <span>🎯 \${esc(dest)}</span>
         <span>⏱ last activity \${lastSeen}</span>
         \${p.activity.uniqueIpsToday > 0 ? '<span>👤 ' + p.activity.uniqueIpsToday + ' unique today</span>' : ''}
         \${p.activity.reportsCount > 0 ? '<span>🐞 ' + p.activity.reportsCount + ' reports</span>' : ''}
@@ -2338,23 +2532,195 @@ window.logout = async function() {
 };
 
 // ============================== PROJECT DETAIL ==============================
+// v0.11.3: redesigned as a tabbed layout. Five tabs:
+//   Activity · Testers · Destination · Integration · Settings
+// The pending warning, when applicable, sits ABOVE the tab bar as a banner so
+// it can't be tab-clicked away. Tabs are deep-linkable via #/p/:key/:tab so
+// reloads / shared links preserve the tab. Each tab renders only its own
+// content — no more endless scroll.
 async function renderProjectDetail(key) {
   let detail;
   try { detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project; }
   catch (e) { return renderError(e); }
 
-  // v0.10.5: needsConfig now respects the project's backend. Pre-v0.10.5 this
-  // checked detail.linearProjectId only, so a fully-set-up GitHub project
-  // still showed "needs configuring" forever.
   const hasDestination = detail.backend === 'github' ? !!detail.githubRepo : !!detail.linearProjectId;
   const needsConfig = detail.status === 'pending' || !hasDestination || detail.usersCount === 0;
   const overlayTag = '<' + 'script src="' + location.origin + '/' + detail.key + '/overlay.js" defer><' + '/script>';
   const pluginCfg = "gate: { url: '" + location.origin + "', project: '" + detail.key + "' }";
-  // v0.9.8: pull the busiest origin so the auto-detect banner can name it.
   const _origins = (detail.activity && detail.activity.origins) || {};
   const _topOriginEntry = Object.entries(_origins).sort((a, b) => b[1] - a[1])[0];
   const _topOrigin = _topOriginEntry ? _topOriginEntry[0] : null;
   const _topOriginHits = _topOriginEntry ? _topOriginEntry[1] : 0;
+
+  // Pick the active tab. Default to 'destination' when destination is unset
+  // (most-actionable next step), otherwise 'activity' (the most-checked view).
+  const validTabs = ['activity', 'testers', 'destination', 'integration', 'settings'];
+  const defaultTab = !hasDestination ? 'destination' : 'activity';
+  const activeTab = (ROUTE.tab && validTabs.includes(ROUTE.tab)) ? ROUTE.tab : defaultTab;
+
+  // Each tab definition: key, label, optional badge (number or warning dot).
+  const testerWarn = detail.usersNeedingPassword > 0 ? '<span class="dot-warn"></span>' : '';
+  const destWarn = !hasDestination ? '<span class="dot-warn"></span>' : '';
+  const tabs = [
+    { key: 'activity', label: 'Activity' },
+    { key: 'testers', label: 'Testers', extra: '<span class="count">' + detail.users.length + '</span>' + testerWarn },
+    { key: 'destination', label: 'Destination', extra: destWarn },
+    { key: 'integration', label: 'Integration' },
+    { key: 'settings', label: 'Settings' },
+  ];
+  const tabBar = '<nav class="tabs" aria-label="Project sections">' +
+    tabs.map((t) => (
+      '<a class="tab' + (t.key === activeTab ? ' active' : '') + '" href="#/p/' + esc(detail.key) + '/' + t.key + '">' +
+        esc(t.label) + (t.extra || '') +
+      '</a>'
+    )).join('') +
+    '</nav>';
+
+  // -------- Tab content renderers (HTML strings, plugged into the page below) --------
+
+  const renderActivityTab = () => html\`
+    <div class="card">
+      <div class="grid3">
+        <div class="stat"><span class="v">\${detail.activity.totalHeartbeats || 0}</span><span class="l">total heartbeats</span></div>
+        <div class="stat"><span class="v">\${detail.activity.uniqueIpsToday}</span><span class="l">unique today</span></div>
+        <div class="stat"><span class="v">\${detail.activity.reportsCount || 0}</span><span class="l">reports filed</span></div>
+      </div>
+      <div style="margin-top:14px;font-size:12px;color:var(--muted);">
+        First seen: \${detail.activity.firstSeenAt ? new Date(detail.activity.firstSeenAt * 1000).toISOString() : 'never'}<br>
+        Last heartbeat: \${detail.activity.lastSeenAt ? relTime(detail.activity.lastSeenAt) : 'never'}
+      </div>
+    </div>
+    \${Object.keys(_origins).length > 0 ? html\`
+      <div class="card">
+        <h3>Origins seen</h3>
+        <div class="origin-list">
+          \${Object.entries(_origins).sort((a,b) => b[1]-a[1]).slice(0,10).map(([o,c]) => '<div class="o"><span>' + esc(o) + '</span><span>' + c + ' hits</span></div>').join('')}
+        </div>
+      </div>
+    \` : ''}
+    \${detail.activity.pages.length > 0 ? html\`
+      <div class="card">
+        <h3>Pages seen (\${detail.activity.pages.length})</h3>
+        <div class="origin-list">
+          \${detail.activity.pages.slice(-10).reverse().map(p => '<div class="o" style="display:block;"><a href="' + esc(p) + '" target="_blank" rel="noreferrer">' + esc(p) + '</a></div>').join('')}
+        </div>
+      </div>
+    \` : ''}
+    \${Object.keys(_origins).length === 0 && detail.activity.pages.length === 0 && !detail.activity.firstSeenAt ? html\`
+      <div class="card"><div class="empty">No activity yet. Once the overlay loads this project's key, heartbeats start flowing here.</div></div>
+    \` : ''}
+  \`;
+
+  const renderTestersTab = () => html\`
+    <div class="card">
+      <div class="sub-muted" style="margin-bottom:10px;">Each tester logs in with their email + the password you set here.</div>
+      <div id="userList">
+        \${detail.users.length === 0
+          ? '<div class="empty">No testers yet — add the people who\\'ll file feedback from this site.</div>'
+          : detail.users.map(u => {
+              const status = !u.hasPassword
+                ? '<span class="pill warn dot" style="background:rgba(245,158,11,.15);color:#fcd34d;">needs password</span>'
+                : u.locked ? '<span class="pill warn dot">locked (5 failed attempts)</span>'
+                : '<span class="pill active dot">active</span>';
+              const lastLogin = u.lastLoginAt
+                ? '<span class="sub-muted" style="font-size:11px;">last login: ' + new Date(u.lastLoginAt * 1000).toISOString().slice(0,10) + '</span>'
+                : '<span class="sub-muted" style="font-size:11px;">never logged in</span>';
+              return '<div class="row spaced" style="padding:8px 0;border-bottom:1px solid var(--border);">'
+                + '<div><code style="background:transparent;font-size:12px;">' + esc(u.email) + '</code><br>' + status + ' &nbsp; ' + lastLogin + '</div>'
+                + '<div style="display:flex;gap:6px;">'
+                  + '<button class="ghost" style="padding:4px 10px;font-size:11px;" onclick="setUserPassword(\\'' + esc(detail.key) + '\\', \\'' + esc(u.email) + '\\')">set password</button>'
+                  + '<button class="danger" onclick="removeUser(\\'' + esc(detail.key) + '\\', \\'' + esc(u.email) + '\\')">remove</button>'
+                + '</div></div>';
+            }).join('')
+        }
+      </div>
+      <label style="margin-top:14px;">Add tester</label>
+      <div class="sub-muted" style="font-size:11px;margin:-2px 0 6px;">Share the email + password with them out-of-band (DM, password manager — anywhere that isn't a shared chat).</div>
+      <div class="row">
+        <input id="newEmail" type="email" placeholder="alice@example.com">
+        <input id="newPassword" type="text" placeholder="password (min 8 chars)" style="max-width:200px;">
+        <button class="primary" onclick="addUser('\${esc(detail.key)}')">Add</button>
+      </div>
+      <div class="err" id="userErr"></div>
+      \${detail.usersNeedingPassword > 0 ? '<div class="ok-line" style="color:#fcd34d;margin-top:8px;">⚠ ' + detail.usersNeedingPassword + ' tester(s) migrated from email-only mode and need a password set before they can log in.</div>' : ''}
+    </div>
+  \`;
+
+  const renderDestinationTab = () => html\`
+    <div class="card">
+      \${detail.backend === 'linear' ? html\`
+        <div class="body">Reports go to: <strong>\${esc(detail.linearProjectName || 'Linear (legacy)')}</strong></div>
+        <div class="sub-muted" style="margin-top:6px;font-size:12px;line-height:1.55;">This project uses the legacy Linear backend. Run <code>node tools/migrate-linear-to-github.js --project \${esc(detail.key)} --repo OWNER/NAME</code> to migrate existing Issues to GitHub, then switch the destination here.</div>
+        <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
+          <button class="primary" onclick="switchToGithub('\${esc(detail.key)}')">Switch to GitHub →</button>
+        </div>
+      \` : html\`
+        \${detail.githubRepo ? html\`
+          <div class="body">Reports go to: <strong><a href="https://github.com/\${esc(detail.githubRepo)}/issues" target="_blank" rel="noreferrer">\${esc(detail.githubRepo)}</a></strong> (GitHub Issues)</div>
+          <div class="meta">Token: @\${esc(STATE.github ? STATE.github.username : '?')}\${detail.hasGithubOverride ? ' (per-project override)' : ''}</div>
+          <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
+            <button class="ghost" onclick="changeGithubRepo('\${esc(detail.key)}')">Change repo</button>
+          </div>
+        \` : html\`
+          <div class="empty">No destination set. Bug reports will be rejected until one is picked.</div>
+          <div class="row" style="margin-top:10px;justify-content:flex-end;">
+            <button class="primary" onclick="changeGithubRepo('\${esc(detail.key)}')">Pick a GitHub repo</button>
+          </div>
+        \`}
+      \`}
+    </div>
+  \`;
+
+  const renderIntegrationTab = () => html\`
+    <div class="card">
+      <h3 style="margin-bottom:8px;">In your project's Vite/Nuxt plugin config</h3>
+      <div class="sub-muted" style="margin-bottom:8px;font-size:12px;">Add this to <code>frontendConqueror()</code> in your <code>vite.config.ts</code> / <code>nuxt.config.ts</code>:</div>
+      <div><code>\${esc(pluginCfg)}</code></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-bottom:8px;">In production HTML directly</h3>
+      <div class="sub-muted" style="margin-bottom:8px;font-size:12px;">Add to the <code>&lt;head&gt;</code> of every page where testers should file bugs:</div>
+      <div><code>\${esc(overlayTag)}</code></div>
+    </div>
+    <div class="card" style="background:transparent;border-style:dashed;">
+      <h3 style="margin-bottom:8px;">Key info</h3>
+      <div class="row spaced" style="font-size:12px;color:var(--muted);">
+        <span>Project key: <code style="color:var(--text);">\${esc(detail.key)}</code></span>
+        <span>Gate origin: <code style="color:var(--text);">\${esc(location.origin)}</code></span>
+      </div>
+    </div>
+  \`;
+
+  const renderSettingsTab = () => html\`
+    <div class="card">
+      <h3>Project status</h3>
+      <div class="row spaced">
+        <div>
+          <div>\${detail.status === 'disabled' ? 'Project disabled. Reports rejected.' : 'Disable to temporarily stop accepting reports.'}</div>
+          <div class="meta">Disabling keeps testers and destination intact — re-enable any time.</div>
+        </div>
+        <button class="ghost" onclick="toggleStatus('\${esc(detail.key)}', '\${detail.status === 'disabled' ? 'active' : 'disabled'}')">\${detail.status === 'disabled' ? 'Re-enable' : 'Disable'}</button>
+      </div>
+    </div>
+    <div class="card" style="border-left:3px solid var(--danger);">
+      <h3 style="color:#fca5a5;">Danger zone</h3>
+      <div class="row spaced">
+        <div>
+          <div><strong>Delete this project</strong></div>
+          <div class="meta">Removes the tester allowlist, destination link, and activity stats. Bug Issues already filed in GitHub or Linear are NOT touched.</div>
+        </div>
+        <button class="danger" onclick="deleteProject('\${esc(detail.key)}')">Delete</button>
+      </div>
+    </div>
+  \`;
+
+  const tabContent =
+    activeTab === 'activity' ? renderActivityTab() :
+    activeTab === 'testers' ? renderTestersTab() :
+    activeTab === 'destination' ? renderDestinationTab() :
+    activeTab === 'integration' ? renderIntegrationTab() :
+    activeTab === 'settings' ? renderSettingsTab() :
+    renderActivityTab();
 
   root().innerHTML = html\`
     <header>
@@ -2377,124 +2743,15 @@ async function renderProjectDetail(key) {
               \${_topOrigin ? '<br>Most-active origin: <code>' + esc(_topOrigin) + '</code> (' + _topOriginHits + ' ' + (_topOriginHits === 1 ? 'hit' : 'hits') + ').' : ''}
             </div>
           \` : ''}
-          <div class="body sub-muted">This project won't accept bug reports until it has a Linear destination and at least one tester.</div>
+          <div class="body sub-muted">This project won't accept bug reports until it has a GitHub repo destination and at least one tester.</div>
           <div class="row" style="justify-content:flex-end;margin-top:10px;">
-            <button class="primary" onclick="(()=>go('#/p/' + \${JSON.stringify(detail.key)} + '/configure'))()">Configure now →</button>
+            <button class="primary" onclick="go('#/p/\${esc(detail.key)}/configure')">Configure now →</button>
           </div>
         </div>
       \` : ''}
 
-      <div class="card">
-        <h3>Destination</h3>
-        \${detail.backend === 'github' ? html\`
-          \${detail.githubRepo ? html\`
-            <div class="body">Reports go to: <strong><a href="https://github.com/\${esc(detail.githubRepo)}/issues" target="_blank" rel="noreferrer">\${esc(detail.githubRepo)}</a></strong> (GitHub Issues)</div>
-            <div class="meta">Token: @\${esc(STATE.github ? STATE.github.username : '?')}\${detail.hasGithubOverride ? ' (per-project override)' : ''}</div>
-            <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
-              <button class="ghost" onclick="changeGithubRepo('\${esc(detail.key)}')">Change repo</button>
-              <button class="ghost" onclick="switchToLinear('\${esc(detail.key)}')">Switch to Linear</button>
-            </div>
-          \` : html\`
-            <div class="empty">Not set. <a href="#" onclick="changeGithubRepo('\${esc(detail.key)}');return false;">Pick a GitHub repo</a></div>
-          \`}
-        \` : html\`
-          \${detail.linearProjectName ? html\`
-            <div class="body">Reports go to: <strong>\${esc(detail.linearProjectName)}</strong> (Linear)</div>
-            <div class="meta">Team: \${esc(STATE.linear ? STATE.linear.teamName : '')}</div>
-            <div class="row" style="margin-top:10px;justify-content:flex-end;gap:6px;">
-              <button class="ghost" onclick="changeLinearProject('\${esc(detail.key)}')">Change project</button>
-              <button class="ghost" onclick="switchToGithub('\${esc(detail.key)}')">Switch to GitHub</button>
-            </div>
-          \` : html\`
-            <div class="empty">Not set. Pick a destination: <a href="#" onclick="changeLinearProject('\${esc(detail.key)}');return false;">Linear project</a> · <a href="#" onclick="changeGithubRepo('\${esc(detail.key)}');return false;">GitHub repo</a></div>
-          \`}
-        \`}
-      </div>
-
-      <div class="card">
-        <h3>Testers (\${detail.users.length})</h3>
-        <div class="sub-muted" style="margin-bottom:10px;">Each tester logs in with their email + the password you set here.</div>
-        <div id="userList">
-          \${detail.users.length === 0
-            ? '<div class="empty">No testers yet — add the people who\\'ll file feedback from this site.</div>'
-            : detail.users.map(u => {
-                const status = !u.hasPassword
-                  ? '<span class="pill warn dot" style="background:rgba(245,158,11,.15);color:#fcd34d;">needs password</span>'
-                  : u.locked ? '<span class="pill warn dot">locked (5 failed attempts)</span>'
-                  : '<span class="pill active dot">active</span>';
-                const lastLogin = u.lastLoginAt
-                  ? '<span class="sub-muted" style="font-size:11px;">last login: ' + new Date(u.lastLoginAt * 1000).toISOString().slice(0,10) + '</span>'
-                  : '<span class="sub-muted" style="font-size:11px;">never logged in</span>';
-                return '<div class="row spaced" style="padding:8px 0;border-bottom:1px solid #f0f0f0;">'
-                  + '<div><code style="background:transparent;font-size:12px;">' + esc(u.email) + '</code><br>' + status + ' &nbsp; ' + lastLogin + '</div>'
-                  + '<div style="display:flex;gap:6px;">'
-                    + '<button class="ghost" style="padding:4px 10px;font-size:11px;" onclick="setUserPassword(\\'' + esc(detail.key) + '\\', \\'' + esc(u.email) + '\\')">set password</button>'
-                    + '<button class="danger" onclick="removeUser(\\'' + esc(detail.key) + '\\', \\'' + esc(u.email) + '\\')">remove</button>'
-                  + '</div></div>';
-              }).join('')
-          }
-        </div>
-        <label style="margin-top:14px;">Add tester</label>
-        <div class="sub-muted" style="font-size:11px;margin:-2px 0 6px;">Share the email + password with them out-of-band (DM, password manager — anywhere that isn't a shared chat).</div>
-        <div class="row">
-          <input id="newEmail" type="email" placeholder="alice@example.com">
-          <input id="newPassword" type="text" placeholder="password (min 8 chars)" style="max-width:200px;">
-          <button class="primary" onclick="addUser('\${esc(detail.key)}')">Add</button>
-        </div>
-        <div class="err" id="userErr"></div>
-        \${detail.usersNeedingPassword > 0 ? '<div class="ok-line" style="color:#fcd34d;margin-top:8px;">⚠ ' + detail.usersNeedingPassword + ' tester(s) migrated from email-only mode and need a password set before they can log in.</div>' : ''}
-      </div>
-
-      <div class="card">
-        <h3>How to use this project</h3>
-        <div class="body sub-muted" style="margin-bottom:8px;">In your project's plugin config:</div>
-        <div><code>\${esc(pluginCfg)}</code></div>
-        <div class="body sub-muted" style="margin:10px 0 6px;">Or in production HTML directly:</div>
-        <div><code>\${esc(overlayTag)}</code></div>
-      </div>
-
-      <div class="card">
-        <h3>Activity</h3>
-        <div class="grid3">
-          <div class="stat"><span class="v">\${detail.activity.totalHeartbeats || 0}</span><span class="l">total heartbeats</span></div>
-          <div class="stat"><span class="v">\${detail.activity.uniqueIpsToday}</span><span class="l">unique today</span></div>
-          <div class="stat"><span class="v">\${detail.activity.reportsCount || 0}</span><span class="l">reports filed</span></div>
-        </div>
-        <div style="margin-top:14px;font-size:12px;color:var(--muted);">
-          First seen: \${detail.activity.firstSeenAt ? new Date(detail.activity.firstSeenAt * 1000).toISOString() : 'never'}<br>
-          Last heartbeat: \${detail.activity.lastSeenAt ? relTime(detail.activity.lastSeenAt) : 'never'}
-        </div>
-        \${Object.keys(detail.activity.origins).length > 0 ? html\`
-          <h3 style="margin-top:16px;">Origins seen</h3>
-          <div class="origin-list">
-            \${Object.entries(detail.activity.origins).sort((a,b) => b[1]-a[1]).slice(0,10).map(([o,c]) => '<div class="o"><span>' + esc(o) + '</span><span>' + c + ' hits</span></div>').join('')}
-          </div>
-        \` : ''}
-        \${detail.activity.pages.length > 0 ? html\`
-          <h3 style="margin-top:16px;">Pages seen (\${detail.activity.pages.length})</h3>
-          <div class="origin-list">
-            \${detail.activity.pages.slice(-10).reverse().map(p => '<div class="o" style="display:block;"><a href="' + esc(p) + '" target="_blank" rel="noreferrer">' + esc(p) + '</a></div>').join('')}
-          </div>
-        \` : ''}
-      </div>
-
-      <div class="card">
-        <h3>Danger zone</h3>
-        <div class="row spaced">
-          <div>
-            <div>\${detail.status === 'disabled' ? 'Project disabled. Reports rejected.' : 'Disable to temporarily stop accepting reports.'}</div>
-            <div class="meta">Disabling keeps testers and Linear destination intact.</div>
-          </div>
-          <button class="ghost" onclick="toggleStatus('\${esc(detail.key)}', '\${detail.status === 'disabled' ? 'active' : 'disabled'}')">\${detail.status === 'disabled' ? 'Re-enable' : 'Disable'}</button>
-        </div>
-        <div class="row spaced" style="margin-top:14px;">
-          <div>
-            <div>Delete this project</div>
-            <div class="meta">Removes the allowlist, Linear destination link, and activity stats. Bugs already filed in Linear are not touched.</div>
-          </div>
-          <button class="danger" onclick="deleteProject('\${esc(detail.key)}')">Delete</button>
-        </div>
-      </div>
+      \${tabBar}
+      \${tabContent}
     </main>\`;
 }
 window.changeLinearProject = async function(key) {
@@ -2519,37 +2776,34 @@ window.changeLinearProject = async function(key) {
     navigate();
   } catch (e) { toast(e.message, 'err'); }
 };
-// v0.10.0+: pick a GitHub repo destination. Uses the gate's GitHub search
-// route to autocomplete from your accessible repos. Switches the project's
-// backend to 'github'.
+// v0.11.1: was a two-prompt() flow; now uses openModal() + renderRepoCombobox
+// for live search with kbd nav, private-repo visibility, and a real UI.
 window.changeGithubRepo = async function(key) {
   if (!STATE.github || !STATE.github.hasToken) {
     if (confirm('No GitHub PAT set yet. Go to Settings to add one?')) go('#/settings');
     return;
   }
-  const q = prompt('Type repo name to search (e.g. "messarat" or "owner/repo"), or leave blank to see your recent repos:');
-  if (q === null) return;
-  let repos = [];
-  try { repos = (await api('GET', '/frontend-conqueror/github/repos?q=' + encodeURIComponent(q || ''))).repos || []; }
-  catch (e) { return toast(e.message, 'err'); }
-  if (repos.length === 0) return toast('No matching repos.', 'err');
-  const lines = repos.map((r, i) => (i + 1) + ') ' + r.full_name + (r.private ? ' (private)' : '')).join('\\n');
-  const choice = prompt('Pick a repo number, or type "owner/repo" directly:\\n\\n' + lines);
-  if (!choice) return;
-  const n = parseInt(choice, 10);
-  const repo = (!isNaN(n) && repos[n - 1]) ? repos[n - 1].full_name : choice.trim();
-  try {
-    await api('PUT', '/frontend-conqueror/projects/' + key + '/github-repo', { repo });
-    toast('GitHub destination set to ' + repo + '.');
-    navigate();
-  } catch (e) { toast(e.message, 'err'); }
+  const body = openModal('Pick a GitHub repo');
+  body.innerHTML = '<div id="ghModalCombo"></div>';
+  const onPick = async (repo) => {
+    if (!repo || !repo.includes('/')) return toast('Repo must be in the form "owner/repo".', 'err');
+    try {
+      await api('PUT', '/frontend-conqueror/projects/' + key + '/github-repo', { repo });
+      body._close();
+      toast('GitHub destination set to ' + repo + '.');
+      navigate();
+    } catch (e) { toast(e.message, 'err'); }
+  };
+  renderRepoCombobox(body.querySelector('#ghModalCombo'), { onPick });
 };
 window.switchToGithub = async function(key) {
-  if (!confirm('Switch this project to GitHub backend? You\\'ll pick a repo next. Existing Linear-filed bugs will keep working but new reports go to GitHub.')) return;
+  if (!confirm('Migrate this project to GitHub? Pick a repo next. Any bugs already filed in Linear stay there (run the migration tool to copy them over); new bugs go to GitHub.')) return;
   window.changeGithubRepo(key);
 };
+// v0.11.2: kept as a callable for ops scripts but no UI exposes it. Linear
+// is legacy-only — there's no "switch back to Linear" path in the gate UI.
 window.switchToLinear = async function(key) {
-  if (!confirm('Switch this project back to Linear backend? You\\'ll pick a Linear destination next.')) return;
+  if (!confirm('Switch this project back to Linear backend (legacy)? You\\'ll pick a Linear destination next.')) return;
   window.changeLinearProject(key);
 };
 window.addUser = async function(key) {
@@ -2603,149 +2857,46 @@ async function renderProjectWizard(key) {
   try { detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project; }
   catch (e) { return renderError(e); }
 
-  // v0.11.0: backend-aware. Three logical steps now:
-  //   1. (skipped when only one backend is configured globally) backend chooser
-  //   2. destination picker (Linear projects OR GitHub repos based on backend)
-  //   3. add first tester
-  // The dots-progress widget adapts to the actual step count.
-  const linearReady = STATE.linear && STATE.linear.hasApiKey && STATE.linear.teamId;
-  const githubReady = STATE.github && STATE.github.hasToken;
-  const hasDestination = (detail.backend === 'github')
-    ? !!detail.githubRepo
-    : !!detail.linearProjectId;
-  // Show the chooser only when BOTH backends are configured globally AND this
-  // project doesn't have a destination yet. Otherwise auto-pick.
-  const showChooser = linearReady && githubReady && !hasDestination;
-  // Default backend: whatever the project already has, or the only configured
-  // option, or 'linear' as the historical default.
-  let backend = detail.backend || (githubReady && !linearReady ? 'github' : 'linear');
-  const totalSteps = (showChooser ? 3 : 2);
+  // v0.11.2: GitHub-only configure wizard. Two steps:
+  //   1. Pick GitHub repo (skipped if already set)
+  //   2. Add first tester (skipped if at least one tester exists)
+  // The previous backend-chooser step is gone entirely. Legacy projects with
+  // backend='linear' AND a linearProjectId already set are short-circuited
+  // to the tester step (their Linear destination keeps working server-side
+  // — switch them via the migration tool when ready).
+  const hasGithubRepo = !!detail.githubRepo;
+  const hasLegacyLinearDest = detail.backend === 'linear' && !!detail.linearProjectId;
+  const hasDestination = hasGithubRepo || hasLegacyLinearDest;
+  const totalSteps = 2;
   const dots = (n) => '<div class="step-dots">' +
-    Array.from({ length: totalSteps }, (_, i) => i + 1)
-      .map(i => '<div class="d ' + (i < n ? 'done' : i === n ? 'on' : '') + '"></div>').join('') +
+    [1, 2].map(i => '<div class="d ' + (i < n ? 'done' : i === n ? 'on' : '') + '"></div>').join('') +
     '</div>';
-  // The "first step" of the wizard depends on what's configured / done.
-  let step = 1;
-  if (!showChooser) step = hasDestination ? 3 : 2;
-  else if (hasDestination) step = 3;
+  let step = hasDestination ? 2 : 1;
 
   function renderStep() {
     if (step === 1) {
-      // Backend chooser. Only reached when both Linear + GitHub are configured.
+      // GitHub repo picker. Only path for new/pending projects in v0.11.2.
       root().innerHTML = html\`
         <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
         <main>
           <div class="crumbs"><a href="#/">← Projects</a></div>
           \${dots(1)}
-          <h2>Where do bugs land?<span class="sub">Step 1 of \${totalSteps} — pick a backend for \${esc(detail.displayName)}.</span></h2>
+          <h2>Which GitHub repo?<span class="sub">Step 1 of \${totalSteps} — bugs from \${esc(detail.displayName)} will land in this repo's Issues tab, tagged <code>fc:bug</code>.</span></h2>
           <div class="card">
-            <button class="palette-option" id="pickLinear" style="margin-bottom:8px;">
-              <span class="dot" style="background:#5e6ad2;"></span>
-              <span class="name">Linear project</span>
-              <span class="desc">Bugs land in a Linear project. Triage in Linear's UI.</span>
-            </button>
-            <button class="palette-option" id="pickGithub">
-              <span class="dot" style="background:#24292e;"></span>
-              <span class="name">GitHub Issues</span>
-              <span class="desc">Bugs land as GitHub Issues in a repo. Triage from \`gh\` CLI or the repo's Issues tab.</span>
-            </button>
-          </div>
-        </main>\`;
-      $('pickLinear').addEventListener('click', () => { backend = 'linear'; step = 2; renderStep(); });
-      $('pickGithub').addEventListener('click', () => { backend = 'github'; step = 2; renderStep(); });
-    } else if (step === 2 && backend === 'linear') {
-      root().innerHTML = html\`
-        <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
-        <main>
-          <div class="crumbs"><a href="#/">← Projects</a></div>
-          \${dots(showChooser ? 2 : 1)}
-          <h2>Where should bugs land?<span class="sub">Step \${showChooser ? 2 : 1} of \${totalSteps} — pick or create a Linear project for \${esc(detail.displayName)}.</span></h2>
-          <div class="card"><div id="projLoad" class="sub-muted">Loading…</div></div>
-        </main>\`;
-      (async () => {
-        let projects = [];
-        try { projects = (await api('GET', '/frontend-conqueror/linear/projects')).projects || []; }
-        catch (e) { return ($('projLoad').textContent = e.message); }
-        const usedBy = fcUsedByMap(detail.key);
-        $('projLoad').outerHTML = html\`
-          <label for="existing">Existing Linear project</label>
-          <select id="existing">
-            <option value="">— pick one —</option>
-            \${projects.map(p => {
-              const u = usedBy.get(p.id);
-              const label = p.name + (u && u.length > 0 ? ' (used by ' + u.join(', ') + ')' : '');
-              return '<option value="' + esc(p.id) + '">' + esc(label) + '</option>';
-            }).join('')}
-          </select>
-          <div style="text-align:center;color:var(--muted);margin:14px 0;font-size:12px;">— or —</div>
-          <label for="newName">Create a new Linear project</label>
-          <input id="newName" placeholder="\${esc(detail.displayName)} Bugs">
-          <div class="err" id="err"></div>
-          <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
-            \${showChooser ? '<button class="ghost" id="back">← Back</button>' : ''}
-            <button class="primary" id="next">Continue →</button>
-          </div>\`;
-        if (showChooser) $('back').addEventListener('click', () => { step = 1; renderStep(); });
-        $('next').addEventListener('click', async () => {
-          const existingId = $('existing').value;
-          const newName = $('newName').value.trim();
-          if (!existingId && !newName) return ($('err').textContent = 'Pick one or type a name.');
-          $('next').disabled = true;
-          try {
-            const body = existingId ? { projectId: existingId } : { newName };
-            await api('PUT', '/frontend-conqueror/projects/' + detail.key + '/linear-project', body);
-            step = 3;
-            renderStep();
-          } catch (e) { $('err').textContent = e.message; $('next').disabled = false; }
-        });
-      })();
-    } else if (step === 2 && backend === 'github') {
-      // v0.11.0: GitHub repo picker. Same shape as the Linear step but talks
-      // to GitHub's Search Repositories API via the gate.
-      root().innerHTML = html\`
-        <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
-        <main>
-          <div class="crumbs"><a href="#/">← Projects</a></div>
-          \${dots(showChooser ? 2 : 1)}
-          <h2>Which GitHub repo?<span class="sub">Step \${showChooser ? 2 : 1} of \${totalSteps} — bugs from \${esc(detail.displayName)} will land in this repo's Issues tab, tagged <code>fc:bug</code>.</span></h2>
-          <div class="card">
-            <label for="ghQuery">Search your repos</label>
-            <input id="ghQuery" placeholder="messarat, owner/repo, or leave blank to list recent" autofocus>
-            <div class="row" style="justify-content:flex-end;margin-top:6px;gap:6px;">
-              <button class="ghost" id="ghSearch">Search</button>
-            </div>
-            <div id="ghResults" style="margin-top:10px;"></div>
+            <div id="ghCombo"></div>
             <div class="err" id="err" style="margin-top:6px;"></div>
-            <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
-              \${showChooser ? '<button class="ghost" id="back">← Back</button>' : ''}
-            </div>
           </div>
         </main>\`;
-      if (showChooser) $('back').addEventListener('click', () => { step = 1; renderStep(); });
-      const runSearch = async () => {
-        $('ghResults').innerHTML = '<div class="sub-muted">Searching…</div>';
-        try {
-          const q = $('ghQuery').value.trim();
-          const repos = (await api('GET', '/frontend-conqueror/github/repos?q=' + encodeURIComponent(q))).repos || [];
-          if (repos.length === 0) { $('ghResults').innerHTML = '<div class="empty">No matching repos. Try a different search, or type the full owner/repo name directly:</div><div class="row" style="margin-top:6px;"><input id="ghDirect" placeholder="owner/repo"><button class="primary" id="ghPickDirect">Use this repo →</button></div>'; $('ghPickDirect').addEventListener('click', () => pickRepo($('ghDirect').value.trim())); return; }
-          $('ghResults').innerHTML = repos.map((r, i) => '<button class="palette-option" data-repo="' + esc(r.full_name) + '"><span class="name" style="font:600 12px/1.2 ui-monospace,Menlo,monospace;">' + esc(r.full_name) + '</span>' + (r.private ? ' <span class="kbd">private</span>' : '') + (r.description ? '<span class="desc" style="display:block;margin-top:4px;">' + esc(r.description) + '</span>' : '') + '</button>').join('');
-          $('ghResults').querySelectorAll('button.palette-option').forEach((btn) => {
-            btn.addEventListener('click', () => pickRepo(btn.getAttribute('data-repo')));
-          });
-        } catch (e) { $('ghResults').innerHTML = '<div class="err">' + esc(e.message) + '</div>'; }
-      };
       const pickRepo = async (repo) => {
         if (!repo || !repo.includes('/')) return ($('err').textContent = 'Repo must be in the form "owner/repo".');
         try {
           await api('PUT', '/frontend-conqueror/projects/' + detail.key + '/github-repo', { repo });
-          step = 3;
+          step = 2;
           renderStep();
         } catch (e) { $('err').textContent = e.message; }
       };
-      $('ghSearch').addEventListener('click', runSearch);
-      $('ghQuery').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSearch(); } });
-      runSearch();  // initial load: show recent repos
-    } else if (step === 3) {
+      renderRepoCombobox($('ghCombo'), { onPick: pickRepo });
+    } else if (step === 2) {
       root().innerHTML = html\`
         <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
         <main>
@@ -2759,7 +2910,7 @@ async function renderProjectWizard(key) {
             <input id="firstPassword" type="text" placeholder="password">
             <div class="err" id="err"></div>
             <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
-              <button class="ghost" onclick="(()=>{step=2;renderStep();})()">← Back</button>
+              <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
               <button class="primary" id="finish">Activate project →</button>
             </div>
           </div>
@@ -2782,8 +2933,97 @@ async function renderProjectWizard(key) {
 }
 
 // ============================== GLOBAL SETTINGS ==============================
+// v0.11.3: redesigned as a tabbed layout matching the project detail page.
+// Three tabs: GitHub (token mgmt), Appearance (mode colors), Security (admin
+// password). Tabs are deep-linkable via #/settings/:tab.
 async function renderSettings() {
   const s = STATE;
+
+  const validTabs = ['github', 'appearance', 'security'];
+  const activeTab = (ROUTE.tab && validTabs.includes(ROUTE.tab)) ? ROUTE.tab : 'github';
+
+  // Surface a warning dot on GitHub when no token is connected — it's the
+  // most-actionable state.
+  const ghWarn = (!s.github || !s.github.hasToken) ? '<span class="dot-warn"></span>' : '';
+  const tabs = [
+    { key: 'github', label: 'GitHub', extra: ghWarn },
+    { key: 'appearance', label: 'Appearance' },
+    { key: 'security', label: 'Security' },
+  ];
+  const tabBar = '<nav class="tabs" aria-label="Settings sections">' +
+    tabs.map((t) => (
+      '<a class="tab' + (t.key === activeTab ? ' active' : '') + '" href="#/settings/' + t.key + '">' +
+        esc(t.label) + (t.extra || '') +
+      '</a>'
+    )).join('') +
+    '</nav>';
+
+  const renderGithubTab = () => html\`
+    <div class="card">
+      <h3>GitHub access token</h3>
+      \${s.github && s.github.hasToken ? html\`
+        <div class="body">Connected as <strong>@\${esc(s.github.username || '?')}</strong>.</div>
+        <div class="meta">Every project on this gate routes bugs to GitHub Issues using this token.</div>
+        <div class="sub-muted" style="margin-top:6px;font-size:11px;">The same token (classic or fine-grained) can be pasted into local and production gates — both treat it identically.</div>
+        <div id="ghTokenReveal" style="margin-top:10px;"></div>
+        <div class="row" style="justify-content:flex-end;margin-top:10px;gap:6px;">
+          <button class="ghost" onclick="showGithubToken()">Show &amp; copy</button>
+          <button class="ghost" onclick="replaceGithubToken()">Replace</button>
+          <button class="danger" onclick="removeGithubToken()">Disconnect</button>
+        </div>
+      \` : html\`
+        <div class="empty">No GitHub PAT set.</div>
+        <div class="sub-muted" style="margin:8px 0 0;line-height:1.55;">
+          <strong>Easiest:</strong> a <a href="https://github.com/settings/tokens/new?scopes=repo&description=frontend-conqueror" target="_blank" rel="noreferrer">classic PAT with <code>repo</code> scope</a> — sees every repo you can see, no org-approval dance.<br>
+          <strong>More secure:</strong> a <a href="https://github.com/settings/tokens?type=beta" target="_blank" rel="noreferrer">fine-grained PAT</a> with <strong>Issues: R/W</strong> + <strong>Metadata: R</strong>. For org repos: pick the org as <em>Resource Owner</em> and have an admin approve it.<br>
+          The same token works on every gate — paste it here and in production.
+        </div>
+        <div class="row" style="justify-content:flex-end;margin-top:8px;">
+          <button class="primary" onclick="replaceGithubToken()">Connect GitHub</button>
+        </div>
+      \`}
+    </div>
+  \`;
+
+  const renderAppearanceTab = () => html\`
+    <div class="card">
+      <h3>Mode colors</h3>
+      <div class="sub-muted" style="margin-bottom:8px;">Border + palette colors for each mode in the overlay (Edit / Test / TODO).</div>
+      <div class="grid3">
+        \${['edit','test','todo'].map(k => html\`
+          <div>
+            <label>\${k}</label>
+            <input type="color" id="color-\${k}" value="\${esc(s.modeColors[k] || '#888888')}" style="height:38px;cursor:pointer;">
+          </div>
+        \`).join('')}
+      </div>
+      <div class="row" style="justify-content:flex-end;margin-top:10px;">
+        <button class="primary" onclick="saveColors()">Save colors</button>
+      </div>
+    </div>
+  \`;
+
+  const renderSecurityTab = () => html\`
+    <div class="card">
+      <h3>Admin password</h3>
+      <div class="sub-muted" style="margin-bottom:10px;font-size:12px;">Used to sign into this admin UI. Forgot it? Run <code>npx frontend-conqueror gate --reset-admin-password</code> on the server.</div>
+      <label for="currentPw">Current password</label>
+      <input id="currentPw" type="password">
+      <label for="newAdminPw">New password (8+ characters)</label>
+      <input id="newAdminPw" type="password">
+      <div class="err" id="pwErr"></div>
+      <div class="row" style="justify-content:flex-end;margin-top:10px;">
+        <button class="primary" onclick="changePassword()">Change password</button>
+      </div>
+    </div>
+  \`;
+
+  const tabContent =
+    activeTab === 'github' ? renderGithubTab() :
+    activeTab === 'appearance' ? renderAppearanceTab() :
+    activeTab === 'security' ? renderSecurityTab() :
+    renderGithubTab();
+
   root().innerHTML = html\`
     <header>
       <span class="brand">frontend-conqueror · gate</span>
@@ -2794,69 +3034,8 @@ async function renderSettings() {
     <main>
       <div class="crumbs"><a href="#/">← Projects</a></div>
       <h2>Global settings<span class="sub">Affects all projects on this gate.</span></h2>
-
-      <div class="card">
-        <h3>GitHub access token</h3>
-        \${s.github && s.github.hasToken ? html\`
-          <div class="body">Connected as <strong>@\${esc(s.github.username || '?')}</strong>.</div>
-          <div class="meta">Every project with backend = github uses this token unless it has a per-project override.</div>
-          <div class="row" style="justify-content:flex-end;margin-top:10px;">
-            <button class="ghost" onclick="replaceGithubToken()">Replace</button>
-            <button class="danger" onclick="removeGithubToken()">Disconnect</button>
-          </div>
-        \` : html\`
-          <div class="empty">No GitHub PAT set.</div>
-          <div class="sub-muted" style="margin:8px 0 0;">Create one at <a href="https://github.com/settings/tokens?type=beta" target="_blank" rel="noreferrer">github.com/settings/tokens (fine-grained)</a>. Permissions needed: <strong>Issues: Read &amp; Write</strong> on the repos you'll route bugs to.</div>
-          <div class="row" style="justify-content:flex-end;margin-top:8px;">
-            <button class="primary" onclick="replaceGithubToken()">Connect GitHub</button>
-          </div>
-        \`}
-      </div>
-
-      <div class="card">
-        <h3>Linear API key</h3>
-        \${s.linear && s.linear.hasApiKey ? html\`
-          <div class="body">Connected to <strong>\${esc(s.linear.teamName || s.linear.teamId || 'a team')}</strong></div>
-          <div class="meta">Projects with backend = linear use this key unless they override it.</div>
-          <div class="row" style="justify-content:flex-end;margin-top:10px;">
-            <button class="ghost" onclick="replaceApiKey()">Replace</button>
-            <button class="danger" onclick="removeApiKey()">Disconnect</button>
-          </div>
-        \` : html\`
-          <div class="empty">No Linear API key set.</div>
-          <div class="row" style="justify-content:flex-end;">
-            <button class="primary" onclick="replaceApiKey()">Connect Linear</button>
-          </div>
-        \`}
-      </div>
-
-      <div class="card">
-        <h3>Mode colors</h3>
-        <div class="sub-muted" style="margin-bottom:8px;">Border + palette colors for each mode in the overlay.</div>
-        <div class="grid3">
-          \${['edit','test','todo'].map(k => html\`
-            <div>
-              <label>\${k}</label>
-              <input type="color" id="color-\${k}" value="\${esc(s.modeColors[k] || '#888888')}" style="height:38px;cursor:pointer;">
-            </div>
-          \`).join('')}
-        </div>
-        <div class="row" style="justify-content:flex-end;margin-top:10px;">
-          <button class="primary" onclick="saveColors()">Save colors</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>Admin password</h3>
-        <label for="currentPw">Current password</label>
-        <input id="currentPw" type="password">
-        <label for="newAdminPw">New password (8+ characters)</label>
-        <input id="newAdminPw" type="password">
-        <div class="err" id="pwErr"></div>
-        <div class="row" style="justify-content:flex-end;margin-top:10px;">
-          <button class="primary" onclick="changePassword()">Change password</button>
-        </div>
-      </div>
+      \${tabBar}
+      \${tabContent}
     </main>\`;
 }
 window.replaceApiKey = async function() {
@@ -2887,7 +3066,7 @@ window.removeApiKey = async function() {
 };
 // v0.10.0+: GitHub PAT management. Same UX shape as Linear, paste-driven.
 window.replaceGithubToken = async function() {
-  const token = prompt('Paste GitHub fine-grained PAT (Issues: R/W on the destination repos):');
+  const token = prompt('Paste GitHub PAT — classic with "repo" scope (easiest, sees all repos) OR fine-grained with Issues: R/W + Metadata: R:');
   if (!token) return;
   try {
     await api('PUT', '/frontend-conqueror/github/token', { token });
@@ -2903,6 +3082,44 @@ window.removeGithubToken = async function() {
     STATE = null;
     toast('GitHub disconnected.');
     navigate();
+  } catch (e) { toast(e.message, 'err'); }
+};
+// v0.11.2: reveal the stored PAT inline + copy to clipboard. Admin-only path.
+// The token renders into the #ghTokenReveal placeholder (rendered by the
+// Settings card) with a Copy button and auto-hides after 20 s so it doesn't
+// linger on screen.
+window.showGithubToken = async function() {
+  const host = $('ghTokenReveal');
+  if (!host) return;
+  try {
+    const r = await api('GET', '/frontend-conqueror/github/token');
+    if (!r || !r.token) return toast('No token stored.', 'err');
+    host.innerHTML =
+      '<div class="card" style="margin:0;padding:10px 12px;background:var(--card2);">' +
+        '<div class="sub-muted" style="font-size:11px;margin-bottom:4px;">Stored PAT — copy and paste into your password manager or another gate.</div>' +
+        '<div class="row" style="gap:6px;">' +
+          '<input id="ghTokenInput" type="text" value="' + esc(r.token) + '" readonly style="font:12px/1.2 ui-monospace,Menlo,monospace;">' +
+          '<button class="primary" id="ghTokenCopy">Copy</button>' +
+          '<button class="ghost" id="ghTokenHide">Hide</button>' +
+        '</div>' +
+      '</div>';
+    const inp = $('ghTokenInput');
+    inp.focus();
+    inp.select();
+    $('ghTokenCopy').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(r.token);
+        toast('Token copied to clipboard.');
+      } catch {
+        // Older browsers / non-secure contexts: fall back to execCommand.
+        inp.select();
+        document.execCommand && document.execCommand('copy');
+        toast('Token copied (fallback).');
+      }
+    });
+    const hide = () => { host.innerHTML = ''; };
+    $('ghTokenHide').addEventListener('click', hide);
+    setTimeout(hide, 20000);
   } catch (e) { toast(e.message, 'err'); }
 };
 window.saveColors = async function() {

@@ -1918,9 +1918,9 @@
     const linearRow = document.createElement('div');
     linearRow.className = 'todo-linear';
     const linearLabel = document.createElement('span');
-    linearLabel.textContent = 'Linear ticket (optional):';
+    linearLabel.textContent = 'Existing issue ID (optional):';
     const linearInput = document.createElement('input');
-    linearInput.placeholder = 'MES-123';
+    linearInput.placeholder = '#123 or MES-456';
     linearInput.spellcheck = false;
     linearRow.appendChild(linearLabel);
     linearRow.appendChild(linearInput);
@@ -2108,7 +2108,7 @@
         if (fcLocallyDeleted.has(id)) continue;  // user did it themselves
         closedMine.push(info.identifier || id.slice(0, 8));
       }
-      if (closedMine.length === 1) toast(closedMine[0] + ' was closed in Linear.', 'success');
+      if (closedMine.length === 1) toast(closedMine[0] + ' was closed.', 'success');
       else if (closedMine.length > 1) toast(closedMine.length + ' of your issues were closed.', 'success');
     }
     const m = new Map();
@@ -2144,7 +2144,11 @@
       updateIndicator();
       return;
     }
-    const sel = `[data-edit-source="${fcEscAttr(issueData.anchor.file + ':' + issueData.anchor.offset)}"]`;
+    // v0.11.3: prefix match — the plugin emits "file:offset:line:col" (4
+    // parts) but the anchor identifies a node by file+offset alone. Was an
+    // exact match, which silently failed when the plugin annotations included
+    // line/col and the fc-meta only carried offset, so bubbles never rendered.
+    const sel = `[data-edit-source^="${fcEscAttr(issueData.anchor.file + ':' + issueData.anchor.offset + ':')}"], [data-edit-source="${fcEscAttr(issueData.anchor.file + ':' + issueData.anchor.offset)}"]`;
     const element = document.querySelector(sel);
     if (!element) return;  // can't anchor — let the next refresh handle it
     fcEnsureBubbleHost();
@@ -2188,7 +2192,8 @@
     if (!byAnchor.size) return;
     fcEnsureBubbleHost();
     for (const [anchorKey, group] of byAnchor) {
-      const sel = `[data-edit-source="${fcEscAttr(group.anchor.file + ':' + group.anchor.offset)}"]`;
+      // v0.11.3: prefix match (see fcInsertOptimisticBubble for the why).
+      const sel = `[data-edit-source^="${fcEscAttr(group.anchor.file + ':' + group.anchor.offset + ':')}"], [data-edit-source="${fcEscAttr(group.anchor.file + ':' + group.anchor.offset)}"]`;
       const element = document.querySelector(sel);
       if (!element) continue;  // anchor exists in Linear but element isn't on the page right now — skip silently
       const dot = document.createElement('div');
@@ -2370,7 +2375,7 @@
   async function fcDeleteIssue(row, iss, group) {
     const ok = await fcConfirm({
       title: 'DELETE ISSUE',
-      body: 'Delete ' + (iss.identifier || 'this issue') + ' from Linear?\n\nIt moves to Linear\'s trash for 30 days — an admin can restore it from there if needed.',
+      body: 'Delete ' + (iss.identifier || 'this issue') + '?\n\nFor Linear-backed projects, it moves to Linear\'s trash for 30 days. For GitHub-backed projects, the Issue is closed (GitHub does not support hard delete via API). Either way, an admin can recover it.',
       confirmText: 'Delete',
       cancelText: 'Cancel',
       danger: true,
@@ -2743,7 +2748,7 @@
     cancelBtn.textContent = 'Cancel';
     const sendBtn = document.createElement('button');
     sendBtn.className = 'save';
-    sendBtn.textContent = 'Send to Linear';
+    sendBtn.textContent = 'Send report';
     row.appendChild(hint); row.appendChild(cancelBtn); row.appendChild(sendBtn);
 
     panel.appendChild(title);
@@ -2797,9 +2802,13 @@
           openLoginPrompt(() => {});
           return;
         }
-        toast((r2.data && r2.data.error) || 'Submission failed', 'error');
+        // v0.11.3: prefer the human-readable .message (when present) over the
+        // machine-readable .error code. The gate sets .message to a clear
+        // explanation for known failure modes (e.g. PAT missing Issues:W).
+        const msg = (r2.data && (r2.data.message || r2.data.error)) || 'Submission failed';
+        toast(msg, 'error');
         sendBtn.disabled = false;
-        sendBtn.textContent = 'Send to Linear';
+        sendBtn.textContent = 'Send report';
         return;
       }
       const created = r2.data && r2.data.issue;
@@ -2825,7 +2834,13 @@
           } : null,
           page: location.pathname + location.search,
           updatedAt: new Date().toISOString(),
-          state: { name: 'Backlog', type: 'unstarted' },
+          // v0.11.3: was { name: 'Backlog', type: 'unstarted' }, but
+          // 'unstarted' maps to blue in fcRenderDotContents (Linear-flavored
+          // "triaged Todo"). A freshly-filed bug is in the backlog and the
+          // gate's reconcile pass 1.5s later returns type='backlog' → mode
+          // color. Matching it here keeps the dot one color throughout, no
+          // blue→yellow flash.
+          state: { name: 'Open', type: 'backlog' },
         }, session.email);
       }
     }
