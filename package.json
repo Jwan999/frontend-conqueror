@@ -1,6 +1,6 @@
 {
   "name": "frontend-conqueror",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "private": true,
   "description": "Edit text in your dev site. Drop TODOs from the browser. Let testers file Linear issues from production. Three modes, one overlay, no server lock-in.",
   "license": "MIT",

@@ -221,12 +221,18 @@ function loadData() {
           id: 'gh-' + username,
           token: data.github.token,
           username,
+          label: username,
           addedAt: Math.floor(Date.now() / 1000),
         }],
       };
     } else {
       data.github = { accounts: [] };
     }
+  }
+  // v0.12.1: backfill .label on accounts that were created under v0.12.0
+  // (before labels were a distinct field). Falls back to the username.
+  for (const a of data.github.accounts) {
+    if (a.label === undefined) a.label = a.username || a.id;
   }
 
   // v0.8.0 migration: convert per-project emails[] to users{} (with no
@@ -963,10 +969,18 @@ function publicLinear(linear) {
 }
 // v0.12.0: surface the list of connected accounts (id + username only — never
 // tokens). Replaces the v0.10.0 single-PAT shape { hasToken, username }.
+// v0.12.1: + label (user-supplied display name, defaults to username) and
+// tokenHint (first 12 chars — distinguishes accounts that share a GitHub
+// username, e.g. two fine-grained PATs owned by the same user).
 function publicGithub(github) {
   if (!github || !github.accounts) return { accounts: [] };
   return {
-    accounts: github.accounts.map((a) => ({ id: a.id, username: a.username || '' })),
+    accounts: github.accounts.map((a) => ({
+      id: a.id,
+      username: a.username || '',
+      label: a.label || a.username || a.id,
+      tokenHint: (a.token || '').slice(0, 12),
+    })),
   };
 }
 // Per-project summary for the admin list (no allowlist values leaked here).
@@ -1794,14 +1808,20 @@ async function handle(req, res) {
   // account is keyed by its GitHub username (id='gh-<username>') with collision
   // disambiguation; the routing happens per-project via proj.githubAccountId.
 
-  // PUT /github/accounts — add or replace an account (by validated username).
-  // Body: { token }. Returns { account: {id, username} }.
+  // PUT /github/accounts — add an account, OR no-op if the exact same token
+  // is already connected. v0.12.1: dedup is by TOKEN, not username — two
+  // fine-grained PATs owned by the same GitHub user (e.g. one for personal
+  // repos, one for an org) authenticate as the same user but reach different
+  // repo sets and must coexist. Optional body.label distinguishes them in
+  // the UI (defaults to the GitHub username).
+  // Body: { token, label? }. Returns { account: {id, username, label} }.
   if (method === 'PUT' && route === '/frontend-conqueror/github/accounts') {
     if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
     let body;
     try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
     const token = typeof body.token === 'string' ? body.token.trim() : '';
     if (!token) return send(res, 400, { error: 'missing-token' });
+    const labelRaw = typeof body.label === 'string' ? body.label.trim().slice(0, 64) : '';
     let username;
     try {
       const me = await githubREST(token, 'GET', '/user');
@@ -1811,28 +1831,54 @@ async function handle(req, res) {
       return send(res, 400, { error: 'token-invalid', message: 'GitHub rejected this token: ' + e.message });
     }
     const data = loadData();
-    // Re-adding an existing username replaces that account's token (the
-    // intended UX for "rotate the PAT for the org I already have connected").
-    let existing = data.github.accounts.find((a) => a.username === username);
-    if (existing) {
-      if (existing.token !== token) _ghRepoCache.delete(existing.token);
-      existing.token = token;
-    } else {
-      let id = 'gh-' + username;
-      let n = 2;
-      while (data.github.accounts.find((a) => a.id === id)) id = 'gh-' + username + '-' + n++;
-      existing = { id, token, username, addedAt: Math.floor(Date.now() / 1000) };
-      data.github.accounts.push(existing);
+    // Exact-token match → no-op (idempotent re-paste).
+    const exactDup = data.github.accounts.find((a) => a.token === token);
+    if (exactDup) {
+      if (labelRaw && labelRaw !== exactDup.label) {
+        exactDup.label = labelRaw;
+        saveData(data);
+      }
+      return send(res, 200, { account: { id: exactDup.id, username: exactDup.username, label: exactDup.label || exactDup.username } });
     }
+    // New account. id = 'gh-' + (label or username), disambiguated if it
+    // collides (same username + no label, or two accounts with the same
+    // label).
+    const idBase = 'gh-' + (labelRaw || username).replace(/[^A-Za-z0-9_-]/g, '-');
+    let id = idBase, n = 2;
+    while (data.github.accounts.find((a) => a.id === id)) id = idBase + '-' + n++;
+    const acct = {
+      id,
+      token,
+      username,
+      label: labelRaw || username,
+      addedAt: Math.floor(Date.now() / 1000),
+    };
+    data.github.accounts.push(acct);
     saveData(data);
-    return send(res, 200, { account: { id: existing.id, username: existing.username } });
+    return send(res, 200, { account: { id: acct.id, username: acct.username, label: acct.label } });
   }
 
   // GET /github/accounts — list connected accounts (no tokens).
   if (method === 'GET' && route === '/frontend-conqueror/github/accounts') {
     if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
     const data = loadData();
-    return send(res, 200, { accounts: data.github.accounts.map((a) => ({ id: a.id, username: a.username })) });
+    return send(res, 200, { accounts: data.github.accounts.map((a) => ({ id: a.id, username: a.username, label: a.label || a.username })) });
+  }
+
+  // PUT /github/accounts/:id — rename. Body: { label }. v0.12.1.
+  const ghAcctRenameMatch = route.match(/^\/frontend-conqueror\/github\/accounts\/([A-Za-z0-9_-]+)$/);
+  if (method === 'PUT' && ghAcctRenameMatch) {
+    if (!isAdmin) return send(res, 401, { error: 'not-authorized' });
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+    const label = typeof body.label === 'string' ? body.label.trim().slice(0, 64) : '';
+    if (!label) return send(res, 400, { error: 'missing-label' });
+    const data = loadData();
+    const acct = data.github.accounts.find((a) => a.id === ghAcctRenameMatch[1]);
+    if (!acct) return send(res, 404, { error: 'no-such-account' });
+    acct.label = label;
+    saveData(data);
+    return send(res, 200, { account: { id: acct.id, username: acct.username, label: acct.label } });
   }
 
   // GET /github/accounts/:id/token — reveal a single account's PAT.
@@ -1883,16 +1929,15 @@ async function handle(req, res) {
       return send(res, 400, { error: 'token-invalid', message: 'GitHub rejected this token: ' + e.message });
     }
     const data = loadData();
-    let existing = data.github.accounts.find((a) => a.username === username);
-    if (existing) {
-      if (existing.token !== token) _ghRepoCache.delete(existing.token);
-      existing.token = token;
-    } else {
-      let id = 'gh-' + username;
-      let n = 2;
-      while (data.github.accounts.find((a) => a.id === id)) id = 'gh-' + username + '-' + n++;
-      existing = { id, token, username, addedAt: Math.floor(Date.now() / 1000) };
-      data.github.accounts.push(existing);
+    // v0.12.1: shim now dedups by token. The legacy shape only ever held one
+    // account; with the new accounts list, dedupe-by-token preserves multi-
+    // account semantics for callers that came in via the new path.
+    const exactDup = data.github.accounts.find((a) => a.token === token);
+    if (!exactDup) {
+      const idBase = 'gh-' + username;
+      let id = idBase, n = 2;
+      while (data.github.accounts.find((a) => a.id === id)) id = idBase + '-' + n++;
+      data.github.accounts.push({ id, token, username, label: username, addedAt: Math.floor(Date.now() / 1000) });
     }
     saveData(data);
     return send(res, 200, { github: publicGithub(data.github) });
@@ -1960,7 +2005,7 @@ async function handle(req, res) {
         description: repo.description || '',
         private: !!repo.private,
         accountId: acct.id,
-        accountUsername: acct.username,
+        accountLabel: acct.label || acct.username,
       }));
       let hint = null;
       // Direct-lookup fallback when the query is owner/repo-shaped. Try every
@@ -1969,7 +2014,7 @@ async function handle(req, res) {
         for (const acct of accounts) {
           const direct = await tryDirectRepoLookup(acct.token, qRaw);
           if (direct) {
-            repos = [{ ...direct, accountId: acct.id, accountUsername: acct.username }];
+            repos = [{ ...direct, accountId: acct.id, accountLabel: acct.label || acct.username }];
             break;
           }
         }
@@ -1981,7 +2026,7 @@ async function handle(req, res) {
           if (!acct.username) continue;
           const direct = await tryDirectRepoLookup(acct.token, acct.username + '/' + qRaw);
           if (direct) {
-            repos = [{ ...direct, accountId: acct.id, accountUsername: acct.username }];
+            repos = [{ ...direct, accountId: acct.id, accountLabel: acct.label || acct.username }];
             break;
           }
         }
@@ -2252,7 +2297,7 @@ function renderRepoCombobox(host, opts) {
       '<button class="palette-option" data-repo="' + esc(r.full_name) + '" data-account="' + esc(r.accountId || '') + '" data-idx="' + i + '"' + (i === activeIdx ? ' aria-selected="true"' : '') + '>' +
         '<span class="name" style="font:600 12px/1.2 ui-monospace,Menlo,monospace;">' + esc(r.full_name) + '</span>' +
         (r.private ? ' <span class="kbd">private</span>' : '') +
-        (r.accountUsername ? ' <span class="kbd" style="opacity:0.75;">@' + esc(r.accountUsername) + '</span>' : '') +
+        (r.accountLabel ? ' <span class="kbd" style="opacity:0.75;">' + esc(r.accountLabel) + '</span>' : '') +
         (r.description ? '<span class="desc" style="display:block;margin-top:4px;">' + esc(r.description) + '</span>' : '') +
       '</button>'
     )).join('');
@@ -2864,8 +2909,8 @@ async function renderProjectDetail(key) {
             // change-account action when more than one is connected.
             const accounts = (STATE.github && STATE.github.accounts) || [];
             const acct = accounts.find((a) => a.id === detail.githubAccountId);
-            const acctLabel = acct ? '@' + acct.username
-              : (detail.githubAccountId ? 'Account removed — pick a new one' : (accounts.length > 0 ? 'Default account' : 'No account connected'));
+            const acctLabel = acct ? (acct.label || ('@' + acct.username))
+              : (detail.githubAccountId ? 'Account removed — pick a new one' : (accounts.length > 0 ? (accounts[0].label || ('@' + accounts[0].username)) + ' (default)' : 'No account connected'));
             const showChangeAccount = accounts.length > 1 && detail.githubRepo;
             return html\`
               <div class="body">Reports go to: <strong><a href="https://github.com/\${esc(detail.githubRepo)}/issues" target="_blank" rel="noreferrer">\${esc(detail.githubRepo)}</a></strong> (GitHub Issues)</div>
@@ -3025,8 +3070,8 @@ window.changeGithubAccount = async function(key) {
   const body = openModal('Route this project through which account?');
   body.innerHTML = accounts.map((a) => (
     '<button class="palette-option" data-account="' + esc(a.id) + '" style="margin-bottom:8px;">' +
-      '<span class="name">@' + esc(a.username || a.id) + '</span>' +
-      '<span class="desc" style="display:block;margin-top:4px;font-family:ui-monospace,Menlo,monospace;font-size:11px;">' + esc(a.id) + '</span>' +
+      '<span class="name">' + esc(a.label || a.username || a.id) + '</span>' +
+      '<span class="desc" style="display:block;margin-top:4px;font-family:ui-monospace,Menlo,monospace;font-size:11px;">' + esc(a.id) + (a.label && a.label !== a.username ? ' · GitHub user: @' + esc(a.username || '?') : '') + '</span>' +
     '</button>'
   )).join('');
   body.querySelectorAll('button.palette-option').forEach((btn) => {
@@ -3207,25 +3252,25 @@ async function renderSettings() {
   // "Add account" button. Zero-state preserves the existing onboarding copy.
   const renderGithubTab = () => html\`
     \${ghAccounts.length > 0 ? html\`
-      <div class="sub-muted" style="margin-bottom:10px;font-size:12px;">Each project routes through one of these accounts. Add another to reach repos a single PAT can't see (e.g. across orgs).</div>
+      <div class="sub-muted" style="margin-bottom:10px;font-size:12px;">Each project routes through one of these accounts. Add another to reach repos a single PAT can't see (e.g. across orgs, or a fine-grained PAT scoped to a different repo set).</div>
       \${ghAccounts.map((acct) => html\`
         <div class="card">
-          <div class="row spaced">
+          <div class="row spaced" style="align-items:flex-start;">
             <div>
-              <div class="body">Connected as <strong>@\${esc(acct.username || '?')}</strong></div>
-              <div class="meta">Account id: <code>\${esc(acct.id)}</code></div>
+              <div class="body"><strong>\${esc(acct.label || acct.username || '?')}</strong>\${acct.label && acct.label !== acct.username ? ' <span class="sub-muted" style="font-size:11px;font-weight:normal;">— GitHub user: @' + esc(acct.username || '?') + '</span>' : ''}</div>
+              <div class="meta" style="font-family:ui-monospace,Menlo,monospace;font-size:11px;">Token: <code>\${esc(acct.tokenHint || '')}…</code> · id: <code>\${esc(acct.id)}</code></div>
             </div>
+            <button class="ghost" onclick="renameGithubAccount('\${esc(acct.id)}', '\${esc(acct.label || acct.username || '')}')" style="font-size:11px;padding:4px 10px;">Rename</button>
           </div>
           <div id="ghTokenReveal-\${esc(acct.id)}" style="margin-top:10px;"></div>
           <div class="row" style="justify-content:flex-end;margin-top:10px;gap:6px;">
             <button class="ghost" onclick="showGithubToken('\${esc(acct.id)}')">Show &amp; copy</button>
-            <button class="ghost" onclick="replaceGithubToken()">Replace</button>
-            <button class="danger" onclick="removeGithubToken('\${esc(acct.id)}', '\${esc(acct.username)}')">Disconnect</button>
+            <button class="danger" onclick="removeGithubToken('\${esc(acct.id)}', '\${esc(acct.label || acct.username || '')}')">Disconnect</button>
           </div>
         </div>
       \`).join('')}
       <div class="row" style="justify-content:flex-end;margin-top:6px;">
-        <button class="primary" onclick="replaceGithubToken()">+ Add account</button>
+        <button class="primary" onclick="addGithubAccount()">+ Add account</button>
       </div>
     \` : html\`
       <div class="card">
@@ -3322,15 +3367,31 @@ window.removeApiKey = async function() {
     navigate();
   } catch (e) { toast(e.message, 'err'); }
 };
-// v0.12.0: GitHub account management. "Replace" is now "Add or replace" — the
-// server dedups by username so re-pasting an existing account's PAT rotates it.
-window.replaceGithubToken = async function() {
+// v0.12.1: Add an account. Dedups by EXACT token (re-paste = no-op); allows
+// multiple accounts with the same GitHub username (e.g. fine-grained PATs
+// for different repo sets), distinguished by user-supplied labels.
+window.addGithubAccount = async function() {
   const token = prompt('Paste GitHub PAT — classic with "repo" scope (easiest, sees all repos) OR fine-grained with Issues: R/W + Metadata: R:');
   if (!token) return;
+  const label = prompt('Label this account (helps when you have multiple PATs from the same GitHub user — e.g. "Personal", "Makers org"). Leave blank to use the GitHub username:') || '';
   try {
-    const r = await api('PUT', '/frontend-conqueror/github/accounts', { token });
+    const r = await api('PUT', '/frontend-conqueror/github/accounts', { token, label });
     STATE = null;
-    toast('Connected as @' + (r.account ? r.account.username : '?') + '.');
+    toast('Connected as ' + (r.account ? (r.account.label || ('@' + r.account.username)) : '?') + '.');
+    navigate();
+  } catch (e) { toast(e.message, 'err'); }
+};
+// Backward-compat alias — the zero-state "Connect GitHub" button still calls
+// replaceGithubToken from older HTML; keep it pointed at addGithubAccount.
+window.replaceGithubToken = function() { return window.addGithubAccount(); };
+// v0.12.1: rename an account in place (label only — token + username untouched).
+window.renameGithubAccount = async function(accountId, currentLabel) {
+  const label = prompt('Rename this account:', currentLabel || '');
+  if (!label) return;
+  try {
+    await api('PUT', '/frontend-conqueror/github/accounts/' + encodeURIComponent(accountId), { label });
+    STATE = null;
+    toast('Renamed.');
     navigate();
   } catch (e) { toast(e.message, 'err'); }
 };

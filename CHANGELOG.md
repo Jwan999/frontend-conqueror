@@ -10,6 +10,22 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.12.1] — 2026-05-31
+
+### Fixed
+- **Adding a second account replaced the first one** when both PATs were owned by the same GitHub user (e.g. a fine-grained PAT for personal repos + a separate fine-grained PAT for an org's repos). v0.12.0's `PUT /github/accounts` deduped by `username`, which collapsed two distinct PATs into one. Dedup is now by exact `token` value — re-pasting an identical token is still idempotent, but two different tokens owned by the same user coexist as separate accounts.
+
+### Added
+- **Account labels** (`label` field, user-supplied display name, default = GitHub username). Lets you distinguish multiple accounts owned by the same GitHub user. Settings card shows the label as the primary heading + the GitHub username + token prefix as fingerprint.
+- **Token-prefix fingerprint** (first 12 chars of the PAT) on each Settings card — visually distinguishes accounts at a glance without revealing the full token.
+- **`PUT /github/accounts/:id`** — rename an account in place (body: `{ label }`).
+- **Rename button** on each account card in Settings → GitHub.
+
+### Changed
+- **"+ Add account" button** added in Settings → GitHub (was just "Connect GitHub"). Prompts for an optional label after the PAT.
+- **Combobox badges** show the account label instead of the username, so two accounts owned by `@Jwan999` with labels `Personal` / `Makers org` are visually distinct on each repo row.
+- **Destination card** shows the routing account by label (with GitHub-user as a secondary detail in the rename UI when label differs from username).
+
 ## [0.12.0] — 2026-05-31
 
 **Multi-account GitHub support.** The gate now holds an arbitrary list of GitHub accounts (each its own PAT) so admins can route different projects through different orgs' tokens. Lands the use case "I have a personal PAT for my repos AND a separate PAT for my company's org repos that needed org-approval — let the gate use both, route each project through the right one."
