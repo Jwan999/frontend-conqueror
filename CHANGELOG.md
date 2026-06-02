@@ -10,6 +10,16 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.12.7] — 2026-06-02
+
+### Added
+- **Composed-text picker.** When the click target has no source anchor but its descendants do (e.g. a wrapper `<div>` containing two separately-anchored children with their own visible text), the overlay walks down, collects the anchored descendants, and opens a centered modal asking which piece to edit. Dynamic / animated descendants (marked `data-edit-dyn="1"`) are listed but disabled with a "edit the underlying value in your script" explanation. Editable children open a fresh editor scoped to just that child's text.
+
+### Changed
+- **Edit-mode error toast for runtime-computed text** is no longer the misleading "Found 32 match(es) across 2 file(s). Cannot safely edit." That message came from the agent's text-search fallback hitting incidental substring matches (e.g. searching for the displayed text `15` and finding 31 hits inside SVG path data, CSS `rgba(…, 0.15)` opacity values, image URL fragments, etc.). Now the overlay detects the case earlier: if the click target is inside a `data-edit-dyn` element, it skips the text-search send entirely and surfaces a clear toast: `This text is runtime-computed (animated counter, derived data, or a formatted value). It can't be edited via the overlay — edit the underlying value in your source.` Plus a source hint from any nearby `data-edit-script-loc(s)` so the user knows where in the file to go (e.g. `app/pages/index.vue (offsets 8922, 9005, 9080, 9160)` for the four `suffix: '+'` literals in a stats data array).
+
+The TM-frontend stats counter (`{{ animatedStats[index] }}{{ stat.suffix }}` → "+15") was the smoking-gun case. Diagnosis credit: jwan99.
+
 ## [0.12.6] — 2026-05-31
 
 ### Fixed

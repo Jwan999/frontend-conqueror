@@ -1206,6 +1206,110 @@
     };
   }
 
+  // v0.12.7: when the click target itself has no source anchor (e.g. a wrapper
+  // div containing two adjacent {{ … }} interpolations like
+  //   <div>{{ animatedStats[index] }}{{ stat.suffix }}</div>
+  // → rendered as "15+" / "+15"), walk DOWN to find descendants that DO carry
+  // an anchor. Returns the list of {el, kind, visibleText, hint} entries.
+  // Children explicitly marked `data-edit-dyn="1"` (the plugin's "I tried to
+  // resolve this expression and gave up" signal) are included with kind='dyn'
+  // so the picker can render them as not-editable with an explanation.
+  function findAnchoredDescendants(rootEl) {
+    if (!rootEl) return [];
+    const parts = [];
+    const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_ELEMENT);
+    let node = walker.nextNode();
+    while (node) {
+      const visibleText = (node.textContent || '').trim();
+      if (visibleText) {
+        const editLoc = node.getAttribute('data-edit-loc');
+        const scriptLoc = node.getAttribute('data-edit-script-loc');
+        const i18nPath = node.getAttribute('data-edit-i18n-path');
+        const i18nPaths = node.getAttribute('data-edit-i18n-paths');
+        const dyn = node.getAttribute('data-edit-dyn');
+        if (editLoc) parts.push({ el: node, kind: 'loc', visibleText });
+        else if (i18nPath || i18nPaths) parts.push({ el: node, kind: 'i18n', visibleText });
+        else if (scriptLoc) parts.push({ el: node, kind: 'script', visibleText });
+        else if (dyn === '1') parts.push({ el: node, kind: 'dyn', visibleText });
+      }
+      node = walker.nextNode();
+    }
+    // Dedup: if a parent and child both list the SAME visible text, keep only
+    // the child (more specific). Also drop entries whose visibleText fully
+    // contains another entry's visibleText (parent of two children gets
+    // dropped in favor of the children).
+    const filtered = parts.filter((p) => {
+      return !parts.some((q) => q !== p && q.el !== p.el && p.el.contains(q.el));
+    });
+    return filtered;
+  }
+
+  // Renders a small picker modal listing each anchored descendant. User picks
+  // one → onPick is called with that part's element. Dyn parts are listed but
+  // disabled with a helpful explanation.
+  function openComposedPartsPicker(parentEl, composedText, parts, onPick, onCancel) {
+    // Reuse the existing fcConfirm-style backdrop look. Simple inline-built modal.
+    const backdrop = document.createElement('div');
+    backdrop.className = 'fc-confirm-backdrop';
+    backdrop.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:2147483640;display:flex;align-items:flex-start;justify-content:center;padding-top:90px;';
+    const card = document.createElement('div');
+    card.style.cssText = 'background:#fff;border-radius:10px;padding:20px;width:min(520px,calc(100vw - 32px));box-shadow:0 20px 60px rgba(0,0,0,0.5);color:#111827;font:14px/1.4 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;';
+    const title = document.createElement('h3');
+    title.style.cssText = 'margin:0 0 6px;font-size:16px;font-weight:600;';
+    title.textContent = 'Which part do you want to edit?';
+    const sub = document.createElement('div');
+    sub.style.cssText = 'margin:0 0 14px;font-size:12px;color:#6b7280;';
+    sub.textContent = 'You clicked "' + composedText + '" — it\'s rendered by combining multiple values from your source. Pick the piece to edit:';
+    card.appendChild(title);
+    card.appendChild(sub);
+    const close = () => { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); document.removeEventListener('keydown', onKey); };
+    const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); close(); onCancel && onCancel(); } };
+    document.addEventListener('keydown', onKey);
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) { close(); onCancel && onCancel(); } });
+    for (const p of parts) {
+      const btn = document.createElement('button');
+      const isEditable = p.kind !== 'dyn';
+      btn.disabled = !isEditable;
+      btn.style.cssText = 'display:block;width:100%;text-align:left;padding:10px 14px;margin-bottom:6px;background:' + (isEditable ? '#f9fafb' : '#f3f4f6') + ';border:1px solid #e5e7eb;border-radius:8px;cursor:' + (isEditable ? 'pointer' : 'not-allowed') + ';font:inherit;color:' + (isEditable ? '#111827' : '#9ca3af') + ';';
+      const top = document.createElement('div');
+      top.style.cssText = 'font-weight:600;font-size:13px;display:flex;align-items:center;gap:8px;';
+      const val = document.createElement('code');
+      val.style.cssText = 'background:' + (isEditable ? '#e5e7eb' : '#e5e7eb') + ';padding:2px 8px;border-radius:4px;font-size:12px;font-family:ui-monospace,Menlo,monospace;color:#111827;';
+      val.textContent = p.visibleText;
+      top.appendChild(val);
+      const kindBadge = document.createElement('span');
+      kindBadge.style.cssText = 'font-size:11px;color:#6b7280;font-weight:normal;';
+      kindBadge.textContent = p.kind === 'dyn' ? '· animated / dynamic'
+        : p.kind === 'script' ? '· from script literal'
+        : p.kind === 'i18n' ? '· from i18n key'
+        : '· from template';
+      top.appendChild(kindBadge);
+      btn.appendChild(top);
+      const desc = document.createElement('div');
+      desc.style.cssText = 'font-size:11px;color:#6b7280;margin-top:4px;';
+      desc.textContent = p.kind === 'dyn'
+        ? 'This value is computed at runtime (animation, derived data). Edit the underlying value in your script — likely a data() property or a reactive ref.'
+        : 'Click to edit this piece directly.';
+      btn.appendChild(desc);
+      if (isEditable) {
+        btn.addEventListener('mouseenter', () => { btn.style.background = '#eff6ff'; });
+        btn.addEventListener('mouseleave', () => { btn.style.background = '#f9fafb'; });
+        btn.addEventListener('click', () => { close(); onPick(p); });
+      }
+      card.appendChild(btn);
+    }
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;margin-top:8px;';
+    const cancel = document.createElement('button');
+    cancel.textContent = 'Cancel';
+    cancel.style.cssText = 'background:transparent;border:1px solid #e5e7eb;color:#6b7280;padding:6px 14px;border-radius:6px;cursor:pointer;font:inherit;';
+    cancel.addEventListener('click', () => { close(); onCancel && onCancel(); });
+    row.appendChild(cancel);
+    card.appendChild(row);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+  }
+
   function buildEditMessage(el, oldText, newText, id) {
     // 1. Exact byte range on the element itself (literal template text). The
     //    plugin recorded the trimmed-text byte range, so oldText (trimmed) matches.
@@ -1853,6 +1957,107 @@
       const msg = activeEntry
         ? entryToMessage(activeEntry, oldText, newText, id)
         : buildEditMessage(targetEl, originalText, newText, id);
+      // v0.12.7: if buildEditMessage fell through to text-search (type: 'edit'),
+      // try to give the user actionable info instead of "32 matches" noise.
+      // Two cases, checked in order:
+      //
+      // (1) Composed text with editable children — walk down and show a picker.
+      //     E.g. <div>{{ literalText }}{{ stat.label }}</div> where each child
+      //     has its own anchor and distinct visible text.
+      //
+      // (2) The click is on (or inside) a data-edit-dyn element — the plugin
+      //     told us "this is computed at runtime, no source location maps".
+      //     For animated counters, derived data, formatted values: show a
+      //     clear error that tells the user to edit their source data array
+      //     directly. Surface any nearby script-loc/script-locs hints so they
+      //     know WHERE to look. Skipping the text-search send avoids the
+      //     misleading 32-match toast.
+      if (msg && msg.type === 'edit' && !activeEntry) {
+        const parts = findAnchoredDescendants(targetEl);
+        const editable = parts.filter((p) => p.kind !== 'dyn' && p.visibleText);
+        if (editable.length >= 1) {
+          pending.delete(id);
+          saveBtn.disabled = false;
+          saveBtn.textContent = 'Save';
+          close();
+          openComposedPartsPicker(
+            targetEl,
+            originalText,
+            parts,
+            (picked) => { openEditor(picked.el); },
+            () => {}
+          );
+          return;
+        }
+        // Check for a dyn marker on the click target or its ancestors. If
+        // present, this text is runtime-computed and the source-search the
+        // agent would do is doomed to noise — give a useful error instead.
+        const dynEl = (function findDynAncestor(el) {
+          let n = el;
+          while (n && n.nodeType === 1) {
+            if (n.getAttribute && n.getAttribute('data-edit-dyn') === '1') return n;
+            n = n.parentNode;
+          }
+          return null;
+        })(targetEl);
+        if (dynEl) {
+          // Look for a nearby script-loc/script-locs anchor to point the user
+          // at the source. Search descendants first (the wrapping span the
+          // plugin emits next to the interpolation), then ancestors.
+          let sourceHint = '';
+          const decodeOne = (val) => {
+            // data-edit-script-loc = "file:offset:length:kind"
+            const parts = val.split(':');
+            if (parts.length >= 4) {
+              const file = parts.slice(0, parts.length - 3).join(':');
+              return file + ':' + parts[parts.length - 3];
+            }
+            return val;
+          };
+          const decodeMulti = (val) => {
+            // data-edit-script-locs = "file|off:len:kind|off:len:kind|..."
+            const segs = val.split('|');
+            if (segs.length >= 2) {
+              const file = segs[0];
+              const offsets = segs.slice(1).map((s) => s.split(':')[0]).filter(Boolean);
+              return file + ' (offsets ' + offsets.slice(0, 4).join(', ') + ')';
+            }
+            return val;
+          };
+          const findLocIn = (root) => {
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+            let n = walker.currentNode;
+            while (n) {
+              if (n.getAttribute) {
+                const sl = n.getAttribute('data-edit-script-loc');
+                if (sl) return decodeOne(sl);
+                const sls = n.getAttribute('data-edit-script-locs');
+                if (sls) return decodeMulti(sls);
+              }
+              n = walker.nextNode();
+            }
+            return null;
+          };
+          sourceHint = findLocIn(dynEl);
+          if (!sourceHint) {
+            let p = dynEl.parentNode;
+            while (p && p.nodeType === 1) {
+              const sl = p.getAttribute && p.getAttribute('data-edit-script-loc');
+              if (sl) { sourceHint = decodeOne(sl); break; }
+              const sls = p.getAttribute && p.getAttribute('data-edit-script-locs');
+              if (sls) { sourceHint = decodeMulti(sls); break; }
+              p = p.parentNode;
+            }
+          }
+          pending.delete(id);
+          saveBtn.disabled = false;
+          saveBtn.textContent = 'Save';
+          const baseMsg = 'This text is runtime-computed (animated counter, derived data, or a formatted value). It can\'t be edited via the overlay — edit the underlying value in your source.';
+          const hintMsg = sourceHint ? ' Source hint: ' + sourceHint : '';
+          toast(baseMsg + hintMsg, 'error');
+          return;
+        }
+      }
       send(msg);
     }
   }
