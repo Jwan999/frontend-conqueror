@@ -20,6 +20,20 @@ const OVERLAY_URL = '/__frontend-conqueror/overlay.js';
 const MAP_URL = '/__frontend-conqueror/map.json';
 const REFS_URL = '/__frontend-conqueror/refs.json';
 
+// v0.12.5: Module-level singleton for the spawned agent process. Nuxt's dev
+// server runs TWO Vite instances under the hood (client + SSR), both of
+// which load this plugin and call configureServer. Before this guard, the
+// second configureServer call spawned a second agent that immediately
+// EADDRINUSE'd on the agent port — see the EADDRINUSE log in TM-frontend's
+// initial dev boot. The first agent kept running but the spawn log + crash
+// noise was confusing, and the per-Vite `server.httpServer.once('close')`
+// handler used to kill the shared agent any time either Vite restarted
+// (HMR, config change), leaving the overlay showing "Agent not connected"
+// until the next reload. Singleton + remove the per-Vite kill = the dev
+// agent stays alive for the whole `npm run dev` lifetime, killed only on
+// real process exit.
+let _agentChild = null;
+
 function relPath(root, p) {
   return path.relative(root, p).replace(/\\/g, '/');
 }
@@ -1025,18 +1039,33 @@ module.exports = function frontendConquerorPlugin(options = {}) {
       if (opt.autoStartAgent) {
         if (!fs.existsSync(opt.agentPath)) {
           console.warn(`[frontend-conqueror] agent not found at ${opt.agentPath} — Edit/TODO modes won't write to disk`);
+        } else if (_agentChild && _agentChild.exitCode === null) {
+          // v0.12.5: already started by a sibling Vite instance in the same
+          // Node process (Nuxt's client+SSR case). Skip — one agent serves
+          // both. The first spawn's process-level handlers cover shutdown.
         } else {
           const child = spawn(process.execPath, [opt.agentPath, projectRoot, String(opt.agentPort)], {
             stdio: ['ignore', 'inherit', 'inherit'],
             env: process.env,
           });
+          _agentChild = child;
           child.on('error', (err) => {
             console.warn(`[frontend-conqueror] agent failed to start: ${err.message}`);
           });
+          // Clear the singleton when the agent itself exits (crash or kill),
+          // so a later HMR-triggered configureServer can respawn.
+          child.on('exit', () => {
+            if (_agentChild === child) _agentChild = null;
+          });
           const stop = () => {
-            try { if (!child.killed) child.kill(); } catch {}
+            try { if (!child.killed && child.exitCode === null) child.kill(); } catch {}
           };
-          server.httpServer?.once('close', stop);
+          // v0.12.5: removed `server.httpServer?.once('close', stop)`. Each
+          // Vite server in Nuxt closes + restarts on HMR/config changes,
+          // which used to kill the shared agent and leave the overlay
+          // toasting "Agent not connected" until the next page load. The
+          // process-level handlers below correctly tie agent lifetime to
+          // the whole `npm run dev` process.
           process.once('exit', stop);
           process.once('SIGINT', stop);
           process.once('SIGTERM', stop);

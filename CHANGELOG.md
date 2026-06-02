@@ -10,6 +10,15 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.12.5] — 2026-05-31
+
+### Fixed
+- **Plugin double-spawned the dev agent in Nuxt, then killed it on every HMR.** Nuxt's dev server creates two Vite instances (client + SSR), both of which load this plugin and called `configureServer`. The second `configureServer` call spawned a second agent that immediately `EADDRINUSE`'d on the agent port — visible as a `listen EADDRINUSE :::54325` stack trace in the dev boot log. Worse, the per-Vite `server.httpServer.once('close', stop)` handler killed the shared agent whenever either Vite restarted (HMR, config change), leaving the overlay toasting `Agent not connected` until the next full reload.
+
+  Fixed by promoting the spawned child to a module-level singleton: if an agent is already alive (`exitCode === null`), the second `configureServer` call no-ops. Removed the per-Vite close handler entirely — the existing process-level `exit` / `SIGINT` / `SIGTERM` handlers correctly tie agent lifetime to the whole `npm run dev` process. If the agent crashes or is killed externally, the singleton clears on its `exit` event so the next `configureServer` invocation can respawn cleanly.
+
+  Single-Vite projects (Vue + Vite without Nuxt) behave identically as before — they only call `configureServer` once.
+
 ## [0.12.4] — 2026-05-31
 
 ### Fixed
