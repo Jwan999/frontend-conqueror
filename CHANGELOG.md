@@ -10,6 +10,17 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.12.6] — 2026-05-31
+
+### Fixed
+- **Edit mode silently rejected every save on indented (formatted) Vue templates.** The plugin called `@vue/compiler-dom`'s `parse()` with no options, which inherits Vue 3's default `whitespace: 'condense'`. Under condense, text-node `.content` is trimmed but `loc.start.offset` keeps pointing at the original pre-trim position. So when the plugin computed `leadingWs = raw.length - raw.replace(/^\s*/, '').length` on the already-trimmed `raw`, it always evaluated to 0 — and the agent received an offset+length slice that pointed at the leading whitespace before the text instead of the text itself. The agent's `slice === oldText` sanity check rejected every write.
+
+  Triggered whenever the source had indented text inside an element (almost every well-formatted Vue template, and universal in Arabic/RTL projects). LTR English text without indentation happened to work because the math degenerated to a no-op.
+
+  Fixed by passing `{ whitespace: 'preserve' }` to `compilerDom.parse(templateInner, ...)`. With preserve, `.content` keeps the raw whitespace and the existing `leadingWs` / `trailingWs` / `trimmedOffset` / `trimmedLength` math resolves to the correct positions.
+
+  Diagnosis credit: jwan99. Verified end-to-end against TM-frontend's Arabic homepage tagline before release.
+
 ## [0.12.5] — 2026-05-31
 
 ### Fixed

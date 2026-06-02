@@ -753,7 +753,20 @@ function transformVueSource(code, fileRel, deps, options) {
     : { locals: new Map(), i18nCallsUsed: [] };
 
   let ast;
-  try { ast = deps.compilerDom.parse(templateInner); }
+  // v0.12.6: pass whitespace:'preserve' so the parser leaves leading/trailing
+  // whitespace inside text nodes intact in .content. Vue 3's default
+  // 'condense' mode trims that whitespace from .content but KEEPS
+  // textNode.loc.start.offset pointing at the original pre-trim position —
+  // which made our leadingWs math (a few lines below at the trimmedOffset
+  // computation) always evaluate to 0, even for source like
+  //   <p>\n      نقدم ... الصناعية\n    </p>
+  // So the agent received an offset+length pair pointing at the indentation
+  // before the text, never at the text itself. The agent's slice ≠ oldText
+  // sanity check rejected every Edit-mode write on indented templates (which
+  // is most well-formatted Vue, and universal in Arabic/RTL projects). With
+  // 'preserve', .content keeps the raw whitespace and the existing math
+  // resolves to the correct offset+length pair.
+  try { ast = deps.compilerDom.parse(templateInner, { whitespace: 'preserve' }); }
   catch { return null; }
 
   const transforms = [];
