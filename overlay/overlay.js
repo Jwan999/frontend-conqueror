@@ -14,6 +14,9 @@
       // Which modes are reachable in this environment. Dev defaults to all
       // three; prod (overlay served by the gate) trims this to ['test'].
       enabledModes: ['edit', 'todo', 'test'],
+      // v0.13.0: the plugin/gate version this overlay was loaded with. Sent on
+      // heartbeat so the gate can warn when it drifts from the gate's version.
+      version: null,
     },
     (window.__frontendConquerorConfig || {})
   );
@@ -127,22 +130,43 @@
   // page reload doesn't re-fire — the gate's auto-registration is
   // idempotent but the message would be confusing on subsequent loads.
   function gateHeartbeat() {
-    if (!GATE || !GATE.url || !gateProject()) return;
+    // v0.13.0: a project key is no longer required — a bare /overlay.js install
+    // sends the heartbeat with no project and the gate auto-routes (or
+    // auto-registers) by the request's Origin host.
+    if (!GATE || !GATE.url) return;
     try {
       fetch(`${GATE.url}/api/heartbeat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          project: gateProject(),
+          project: gateProject() || undefined,
           origin: location.origin,
           url: location.href.slice(0, 300),
+          v: CFG.version || undefined,
         }),
         keepalive: true,
       })
         .then((r) => r.ok ? r.json().catch(() => null) : null)
-        .then((data) => { if (data && data.justCreated) fcMaybeHintPendingProject(); })
+        .then((data) => {
+          if (!data) return;
+          if (data.justCreated) fcMaybeHintPendingProject();
+          if (data.versionMismatch && data.gateVersion) fcMaybeWarnVersion(data.gateVersion);
+        })
         .catch(() => {});
     } catch {}
+  }
+  // v0.13.0: warn once when the pinned plugin/overlay version differs from the
+  // gate's version. Console always (useful in prod too); a dev toast only when
+  // Edit mode is reachable (i.e. running under the dev plugin), so testers on
+  // production never see it.
+  function fcMaybeWarnVersion(gateVersion) {
+    const key = '__fc_ver_warned:' + GATE.url + ':' + (CFG.version || '?') + ':' + gateVersion;
+    try { if (sessionStorage.getItem(key)) return; sessionStorage.setItem(key, '1'); } catch {}
+    const msg = 'frontend-conqueror: this site is on v' + (CFG.version || '?') +
+      ' but the gate is on v' + gateVersion + ' — update the plugin (npm install ' +
+      '--save-dev github:Jwan999/frontend-conqueror#v' + gateVersion + ') to stay in sync.';
+    try { console.warn('[frontend-conqueror] ' + msg); } catch {}
+    if (ENABLED.has('edit')) setTimeout(() => toast(msg, 'info'), 1500);
   }
   function fcMaybeHintPendingProject() {
     const key = '__fc_pending_hinted:' + GATE.url + ':' + gateProject();

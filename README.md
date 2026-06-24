@@ -25,14 +25,24 @@ Edit and Dev TODO are **local-only.** Test is the only mode that ships to produc
 ## Install
 
 ```bash
-npm install --save-dev github:Jwan999/frontend-conqueror#v0.7.0
+npm install --save-dev github:Jwan999/frontend-conqueror#v0.13.0
 ```
 
 Pin to a tag — see [Releases](https://github.com/Jwan999/frontend-conqueror/releases) for the latest. Watch the repo (Watch → Custom → Releases) to get notified of new versions. Changes per version live in [CHANGELOG.md](./CHANGELOG.md).
 
+The overlay reports its version to the gate on each heartbeat; when a site is pinned to a different version than the gate it talks to, you get a one-time console warning (and a dev toast) telling you the exact `npm install` line to resync.
+
 ---
 
 ## Wire it up
+
+Run `npx frontend-conqueror init` in your project — it detects your stack (Nuxt / Vite / Laravel) and prints the exact config to paste, with the gate URL and project key filled in:
+
+```bash
+npx frontend-conqueror init --gate-url=https://gate.your-domain.com --project=my-app
+```
+
+Or wire it by hand:
 
 ```js
 // nuxt.config.js (or vite.config.js)
@@ -70,10 +80,20 @@ Per-stack configs (Nuxt / Vite / Laravel-Blade) live in [`examples/`](./examples
 In production, only Test mode is reachable — Edit and Dev TODO are config-trimmed out. Deploy the gate alongside your app and point your prod overlay tag at it. **Full step-by-step in [DEPLOY.md](./DEPLOY.md)** — covers PM2, Docker, systemd, Caddy, nginx.
 
 ```html
-<script src="https://gate.your-domain.com/<project>/overlay.js" defer></script>
+<script src="https://gate.your-domain.com/<project>/overlay.js?v=0.13.0" defer></script>
 ```
 
-The gate is the auth boundary. No host-app auth integration needed.
+The `?v=` is the plugin version you pinned — the gate uses it to warn you when a site drifts from the gate's version. The gate is the auth boundary. No host-app auth integration needed.
+
+### One gate, many sites — routing by domain (v0.13.0+)
+
+A single gate can serve many projects. Bind each project's domain(s) in the gate admin (Configure → Domains, or the project's Integration tab), and a site can then load a **bare** overlay with no project key in its URL:
+
+```html
+<script src="https://gate.your-domain.com/overlay.js?v=0.13.0" defer></script>
+```
+
+The gate maps the request to the right project by its `Origin` host. A site whose domain isn't bound yet auto-registers as a pending project named after its hostname, ready to configure. Pinning the project into the URL (`/<project>/overlay.js`) still works and takes precedence.
 
 ### GitHub backend (v0.10.0+) — one PAT, every gate
 

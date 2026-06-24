@@ -20,6 +20,12 @@ const OVERLAY_URL = '/__frontend-conqueror/overlay.js';
 const MAP_URL = '/__frontend-conqueror/map.json';
 const REFS_URL = '/__frontend-conqueror/refs.json';
 
+// v0.13.0: the plugin's own version, injected into the overlay config so the
+// overlay can report it on heartbeat and the gate can warn on version drift.
+let PLUGIN_VERSION = '0.0.0';
+try { PLUGIN_VERSION = require('./package.json').version; }
+catch { try { PLUGIN_VERSION = require('../package.json').version; } catch {} }
+
 // v0.12.5: Module-level singleton for the spawned agent process. Nuxt's dev
 // server runs TWO Vite instances under the hood (client + SSR), both of
 // which load this plugin and call configureServer. Before this guard, the
@@ -1115,6 +1121,7 @@ module.exports = function frontendConquerorPlugin(options = {}) {
             locales: opt.locales,
             gate: opt.gate || null,
             enabledModes: ['edit', 'todo', 'test'],
+            version: PLUGIN_VERSION,
           };
           const prelude = `window.__frontendConquerorConfig=${JSON.stringify(cfg)};\n`;
           res.setHeader('Content-Type', 'application/javascript');
@@ -1138,6 +1145,7 @@ module.exports = function frontendConquerorPlugin(options = {}) {
           locales: opt.locales,
           gate: opt.gate || null,
           enabledModes: ['edit', 'todo', 'test'],
+          version: PLUGIN_VERSION,
         };
         const tag = `<script>window.__frontendConquerorConfig=${JSON.stringify(cfg)};</script>` +
                     `<script src="${OVERLAY_URL}" defer></script>`;

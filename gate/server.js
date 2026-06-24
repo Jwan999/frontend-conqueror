@@ -91,6 +91,19 @@ const DEFAULT_MODE_COLORS = { edit: '#2563eb', test: '#f59e0b', todo: '#059669' 
 //                                      dailyIpHashes: [{ day, hashes: [] }],  (rolling 7 days)
 //                                      reportsCount },
 //                          createdAt } } }
+// v0.13.0: the gate reports its own version so overlays/plugins can warn when a
+// consumer is pinned to a different version than the gate they talk to.
+const GATE_VERSION = (() => {
+  try { return require('./package.json').version; }
+  catch { try { return require('../package.json').version; } catch { return '0.0.0'; } }
+})();
+// Two versions "drift" when their major.minor differ (patch differences are
+// compatible by semver convention, so we don't nag about them).
+function versionsDrift(a, b) {
+  if (!a || !b) return false;
+  const mm = (v) => String(v).split('.').slice(0, 2).join('.');
+  return mm(a) !== mm(b);
+}
 const DEFAULT_DATA = () => ({
   modeColors: { ...DEFAULT_MODE_COLORS },
   linear: null,    // { apiKey, teamId, teamName, availableTeams }
@@ -134,6 +147,10 @@ function emptyProject(key, displayName) {
     githubAccountIdFrontend: null,
     githubRepoBackend: '',
     githubAccountIdBackend: null,
+    // v0.13.0: domains/subdomains bound to this project. The gate auto-routes
+    // an overlay that sends no explicit project key to the project whose
+    // domains[] contains the request host. Hostnames only — no protocol/port.
+    domains: [],
     activity: emptyActivity(),
     createdAt: Math.floor(Date.now() / 1000),
   };
@@ -280,6 +297,10 @@ function loadData() {
     if (proj.githubAccountIdFrontend === undefined) proj.githubAccountIdFrontend = null;
     if (proj.githubRepoBackend === undefined) proj.githubRepoBackend = '';
     if (proj.githubAccountIdBackend === undefined) proj.githubAccountIdBackend = null;
+    // v0.13.0: domain-routing backfill. Existing projects start with no bound
+    // domains — the admin adds them in Configure (or the next heartbeat from a
+    // bare /overlay.js install records the host on a fresh pending project).
+    if (proj.domains === undefined) proj.domains = [];
     // v0.12.0: migrate any legacy proj.githubToken into a new account on the
     // gate. None of the current projects on local or prod gates use this
     // override, but the data shape change shouldn't silently drop a real
@@ -321,6 +342,36 @@ function defaultProject(data) {
   if (envDefault && data.projects[envDefault]) return data.projects[envDefault];
   const active = Object.values(data.projects).filter((p) => p.status === 'active');
   if (active.length === 1) return active[0];
+  return null;
+}
+// v0.13.0: domain-based routing. The overlay's fetch sets an Origin header to
+// the page's origin; we derive the bare hostname from it (falling back to
+// Referer, then Host) so the gate can map a request to a project by domain.
+function requestHost(req) {
+  const fromUrl = (v) => {
+    if (!v || typeof v !== 'string') return '';
+    try { return new URL(v).hostname.toLowerCase(); } catch { return ''; }
+  };
+  return fromUrl(req.headers.origin)
+      || fromUrl(req.headers.referer)
+      || (req.headers.host ? String(req.headers.host).split(':')[0].toLowerCase() : '');
+}
+// Normalize a user-entered domain to a bare lowercase hostname: strips an
+// accidental protocol, path, or :port so "https://app.foo.com:443/x" → "app.foo.com".
+function normalizeDomain(s) {
+  return String(s || '').trim().toLowerCase()
+    .replace(/^[a-z]+:\/\//, '')
+    .replace(/\/.*$/, '')
+    .replace(/:\d+$/, '')
+    .slice(0, 253);
+}
+// Find the project whose domains[] claims this host (exact, case-insensitive).
+// A host belongs to at most one project (enforced when domains are saved).
+function projectByHost(data, host) {
+  if (!host) return null;
+  for (const p of Object.values(data.projects)) {
+    if (Array.isArray(p.domains) && p.domains.some((d) => String(d).toLowerCase() === host)) return p;
+  }
   return null;
 }
 // Resolve the Linear credentials a project uses: per-project override if set,
@@ -1069,6 +1120,9 @@ function publicProjectSummary(p) {
     githubAccountIdFrontend: p.githubAccountIdFrontend || null,
     githubRepoBackend: p.githubRepoBackend || '',
     githubAccountIdBackend: p.githubAccountIdBackend || null,
+    // v0.13.0: domains bound to this project (for the Configure screen + the
+    // admin list's "auto-routes from" hint).
+    domains: p.domains || [],
     activity: {
       firstSeenAt: a.firstSeenAt,
       lastSeenAt: a.lastSeenAt,
@@ -1132,7 +1186,10 @@ async function handle(req, res) {
     }
     const data = loadData();
     const projKey = normalizeProjectKey(body.project || '');
-    const proj = projKey ? data.projects[projKey] : defaultProject(data);
+    // v0.13.0: an explicit project key still wins (back-compat). With none,
+    // resolve by request host, then fall back to the lone-active-project rule.
+    const proj = projKey ? data.projects[projKey]
+               : (projectByHost(data, requestHost(req)) || defaultProject(data));
     if (!proj || proj.status !== 'active') return send(res, 401, { error: 'invalid-credentials' });
     const lcEmail = body.email.toLowerCase().trim();
     const user = (proj.users || {})[lcEmail];
@@ -1440,10 +1497,19 @@ async function handle(req, res) {
     if (!rateLimit('heartbeat', getClientIp(req), 60, 60_000)) return send(res, 204, null);
     let body;
     try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
-    const key = normalizeProjectKey(body && body.project);
-    if (!key) return send(res, 400, { error: 'missing-project' });
     const data = loadData();
-    let proj = data.projects[key];
+    const host = requestHost(req);
+    // v0.13.0: explicit project key wins (back-compat with overlays that bake
+    // it into their config). With no key, auto-route by the request host so a
+    // site that only knows the gate URL still maps to the right project.
+    let key = normalizeProjectKey(body && body.project);
+    let proj = null;
+    if (key) {
+      proj = data.projects[key];
+    } else {
+      proj = projectByHost(data, host);
+      if (proj) key = proj.key;
+    }
     // v0.10.6: track whether THIS heartbeat is the one that created the
     // pending entry, so the overlay can show a one-time toast pointing the
     // dev at the admin UI. We always return a JSON status object now (the
@@ -1451,11 +1517,20 @@ async function handle(req, res) {
     // it gets one).
     let justCreated = false;
     if (!proj) {
-      proj = emptyProject(key, body.displayName || key);
-      proj.status = 'pending';
-      data.projects[key] = proj;
-      justCreated = true;
-      console.log(`[gate] pending project auto-registered: ${key}`);
+      // v0.13.0: nothing matched. Key the new pending project by the explicit
+      // key if one was sent, else by a slug of the host. Record the host in
+      // domains[] so the admin's Configure screen shows exactly what to bind.
+      if (!key) key = normalizeProjectKey(host);
+      if (!key) return send(res, 400, { error: 'missing-project' });
+      proj = data.projects[key];
+      if (!proj) {
+        proj = emptyProject(key, body.displayName || host || key);
+        proj.status = 'pending';
+        if (host && !proj.domains.includes(host)) proj.domains.push(host);
+        data.projects[key] = proj;
+        justCreated = true;
+        console.log(`[gate] pending project auto-registered: ${key} (host: ${host || 'n/a'})`);
+      }
     }
     const a = proj.activity = proj.activity || emptyActivity();
     const now = Math.floor(Date.now() / 1000);
@@ -1491,7 +1566,16 @@ async function handle(req, res) {
       if (today_entry.hashes.length > 10_000) today_entry.hashes.shift();
     }
     saveData(data);
-    return send(res, 200, { pending: proj.status === 'pending', justCreated });
+    // v0.13.0: echo the gate's version + whether the client (plugin/overlay
+    // pinned version, sent as body.v) drifts from it, so the overlay can warn
+    // the developer in the console / a dev toast.
+    const clientV = typeof (body && body.v) === 'string' ? body.v : null;
+    return send(res, 200, {
+      pending: proj.status === 'pending',
+      justCreated,
+      gateVersion: GATE_VERSION,
+      versionMismatch: versionsDrift(clientV, GATE_VERSION),
+    });
   }
 
   if (method === 'GET' && route === '/api/mode-colors') {
@@ -1522,11 +1606,16 @@ async function handle(req, res) {
       // without any client-side injection. Consumer-app deploy configs append
       // it to the overlay.js src.
       const sideQ = (parsed.query && (parsed.query.side === 'frontend' || parsed.query.side === 'backend')) ? parsed.query.side : null;
+      // v0.13.0: the consumer's prod tag carries ?v=<pinnedPluginVersion>; pass
+      // it through as cfg.version so the overlay can report it on heartbeat and
+      // the gate can flag a version drift.
+      const vParam = (parsed.query && typeof parsed.query.v === 'string') ? parsed.query.v : null;
       const cfg = {
         gate: { url: PUBLIC_URL, project: project || null, side: sideQ || undefined },
         enabledModes: ['test'],
         mapUrl: null,
         wsUrl: null,
+        version: vParam,
       };
       const prelude = `window.__frontendConquerorConfig=${JSON.stringify(cfg)};\n`;
       // Browser + edge cache: short max-age (5 min) AND s-maxage so Cloudflare
@@ -1730,6 +1819,30 @@ async function handle(req, res) {
       } catch (e) {
         return send(res, 502, { error: 'linear-unreachable', message: e.message });
       }
+    }
+    // v0.13.0: bind domains/subdomains to this project. The gate auto-routes an
+    // overlay that sends no explicit project key (heartbeat/login) to the
+    // project whose domains[] contains the request host. Full-replace semantics:
+    // the body's `domains` array becomes the project's complete domain list.
+    if (method === 'PUT' && sub === 'domains') {
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch { return send(res, 400, { error: 'invalid-json' }); }
+      if (!Array.isArray(body.domains)) return send(res, 400, { error: 'missing-domains' });
+      const cleaned = [];
+      for (const d of body.domains) {
+        const nd = normalizeDomain(d);
+        if (nd && !cleaned.includes(nd)) cleaned.push(nd);
+      }
+      // A host belongs to exactly one project — reject a collision so routing
+      // stays unambiguous. Report which project already owns the domain.
+      for (const [k, other] of Object.entries(data.projects)) {
+        if (k === key) continue;
+        const clash = cleaned.find((nd) => Array.isArray(other.domains) && other.domains.includes(nd));
+        if (clash) return send(res, 409, { error: 'domain-claimed', message: `${clash} is already bound to project "${k}".` });
+      }
+      proj.domains = cleaned;
+      saveData(data);
+      return send(res, 200, { project: publicProjectDetail(proj) });
     }
     // v0.10.0+: set the GitHub repo destination. Flips backend to 'github'.
     // v0.12.2: in split mode, body.side ('frontend'|'backend') routes the
@@ -3115,6 +3228,20 @@ async function renderProjectDetail(key) {
 
   const renderIntegrationTab = () => html\`
     <div class="card">
+      <h3 style="margin-bottom:8px;">Domains</h3>
+      <div class="sub-muted" style="margin-bottom:8px;font-size:12px;">Reports from these domains auto-route to this project — a site can point at a bare <code>/overlay.js</code> with no project key and still land here. One domain belongs to one project.</div>
+      <div id="domainChips" style="display:flex;flex-wrap:wrap;gap:6px;">
+        \${(detail.domains || []).length
+          ? detail.domains.map(d => '<span class="pill">' + esc(d) + ' <a href="#" onclick="removeProjectDomain(\\'' + esc(detail.key) + '\\', \\'' + esc(d) + '\\');return false;" style="color:inherit;opacity:.6;text-decoration:none;" title="remove">×</a></span>').join('')
+          : '<span class="sub-muted">No domains bound yet — add the production domain(s) so reports route automatically.</span>'}
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <input id="newDomain" type="text" placeholder="app.example.com" onkeydown="if(event.key==='Enter'){event.preventDefault();addProjectDomain('\${esc(detail.key)}');}">
+        <button class="primary" onclick="addProjectDomain('\${esc(detail.key)}')">Add</button>
+      </div>
+      <div class="err" id="domErr"></div>
+    </div>
+    <div class="card">
       <h3 style="margin-bottom:8px;">In your project's Vite/Nuxt plugin config</h3>
       <div class="sub-muted" style="margin-bottom:8px;font-size:12px;">Add this to <code>frontendConqueror()</code> in your <code>vite.config.ts</code> / <code>nuxt.config.ts</code>:</div>
       <div><code>\${esc(pluginCfg)}</code></div>
@@ -3196,6 +3323,32 @@ async function renderProjectDetail(key) {
       \${tabContent}
     </main>\`;
 }
+// v0.13.0: domain binding from the project detail page (Integration tab), so
+// an already-active project can be rebound without re-running the wizard. Both
+// handlers re-fetch the current list, mutate, and PUT the full array (the
+// server normalizes + enforces one-project-per-domain, surfacing a 409 here).
+window.addProjectDomain = async function(key) {
+  const input = $('newDomain');
+  const v = input ? (input.value || '').trim() : '';
+  if (!v) return;
+  try {
+    const detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project;
+    const domains = (detail.domains || []).slice();
+    domains.push(v);
+    await api('PUT', '/frontend-conqueror/projects/' + key + '/domains', { domains });
+    toast('Domain added.');
+    navigate();
+  } catch (e) { const el = $('domErr'); if (el) el.textContent = e.message; else toast(e.message, 'err'); }
+};
+window.removeProjectDomain = async function(key, domain) {
+  try {
+    const detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project;
+    const domains = (detail.domains || []).filter((d) => d !== domain);
+    await api('PUT', '/frontend-conqueror/projects/' + key + '/domains', { domains });
+    toast('Domain removed.');
+    navigate();
+  } catch (e) { toast(e.message, 'err'); }
+};
 window.changeLinearProject = async function(key) {
   let projects;
   try { projects = (await api('GET', '/frontend-conqueror/linear/projects')).projects || []; } catch (e) { return toast(e.message, 'err'); }
@@ -3344,46 +3497,120 @@ async function renderProjectWizard(key) {
   try { detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project; }
   catch (e) { return renderError(e); }
 
-  // v0.11.2: GitHub-only configure wizard. Two steps:
-  //   1. Pick GitHub repo (skipped if already set)
-  //   2. Add first tester (skipped if at least one tester exists)
-  // The previous backend-chooser step is gone entirely. Legacy projects with
-  // backend='linear' AND a linearProjectId already set are short-circuited
-  // to the tester step (their Linear destination keeps working server-side
-  // — switch them via the migration tool when ready).
+  // v0.13.0: three-step configure flow — Domains → Source → Testers.
+  //   1. Domains: which site(s) auto-route to this project (pre-filled with
+  //      the host(s) the gate already saw via heartbeats).
+  //   2. Pick GitHub repo (skipped if already set).
+  //   3. Add first tester, then activate (skipped to if a tester exists).
+  // Legacy projects with backend='linear' AND a linearProjectId already set
+  // keep routing to Linear server-side; the repo step is treated as satisfied.
+  const hasDomains = Array.isArray(detail.domains) && detail.domains.length > 0;
   const hasGithubRepo = !!detail.githubRepo;
   const hasLegacyLinearDest = detail.backend === 'linear' && !!detail.linearProjectId;
   const hasDestination = hasGithubRepo || hasLegacyLinearDest;
-  const totalSteps = 2;
+  const totalSteps = 3;
   const dots = (n) => '<div class="step-dots">' +
-    [1, 2].map(i => '<div class="d ' + (i < n ? 'done' : i === n ? 'on' : '') + '"></div>').join('') +
+    [1, 2, 3].map(i => '<div class="d ' + (i < n ? 'done' : i === n ? 'on' : '') + '"></div>').join('') +
     '</div>';
-  let step = hasDestination ? 2 : 1;
+  let step = !hasDomains ? 1 : !hasDestination ? 2 : 3;
+
+  // Working copy of the domain list — edited client-side, saved on Continue.
+  let domains = (detail.domains || []).slice();
+  // Suggestions: hostnames the gate already observed for this project that
+  // aren't bound yet (skip localhost — that's the dev box, not a routable host).
+  const observed = Object.keys((detail.activity && detail.activity.origins) || {})
+    .map((o) => { try { return new URL(o).hostname.toLowerCase(); } catch (e) { return ''; } })
+    .filter((h) => h && h !== 'localhost' && h !== '0.0.0.0' && !h.startsWith('127.'));
+  const suggestions = [...new Set(observed)];
 
   function renderStep() {
     if (step === 1) {
-      // GitHub repo picker. Only path for new/pending projects in v0.11.2.
+      // Domain binding. Reports from these hosts auto-route to this project.
       root().innerHTML = html\`
         <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
         <main>
           <div class="crumbs"><a href="#/">← Projects</a></div>
           \${dots(1)}
-          <h2>Which GitHub repo?<span class="sub">Step 1 of \${totalSteps} — bugs from \${esc(detail.displayName)} will land in this repo's Issues tab, tagged <code>fc:bug</code>.</span></h2>
+          <h2>Which domains?<span class="sub">Step 1 of \${totalSteps} — bug reports from these domains route to \${esc(detail.displayName)} automatically. Add the production domain and any subdomains.</span></h2>
+          <div class="card">
+            <div id="chips" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+            <div class="row" style="gap:6px;margin-top:10px;">
+              <input id="domInput" type="text" placeholder="app.example.com" autofocus>
+              <button class="ghost" id="addDom">Add</button>
+            </div>
+            <div id="suggest"></div>
+            <div class="err" id="err" style="margin-top:6px;"></div>
+            <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
+              <button class="primary" id="contDom">Continue →</button>
+            </div>
+          </div>
+        </main>\`;
+      const normalize = (raw) => {
+        let v = String(raw || '').trim().toLowerCase();
+        const p = v.indexOf('://'); if (p >= 0) v = v.slice(p + 3);
+        const s = v.indexOf('/'); if (s >= 0) v = v.slice(0, s);
+        const c = v.indexOf(':'); if (c >= 0) v = v.slice(0, c);
+        return v;
+      };
+      const drawChips = () => {
+        $('chips').innerHTML = domains.length
+          ? domains.map((d, i) => '<span class="pill">' + esc(d) + ' <a href="#" data-i="' + i + '" class="chip-x" style="color:inherit;text-decoration:none;opacity:.6;">×</a></span>').join('')
+          : '<span class="sub-muted">No domains yet — add one below, or continue to bind it later.</span>';
+        $('chips').querySelectorAll('.chip-x').forEach((x) => x.addEventListener('click', (e) => {
+          e.preventDefault(); domains.splice(+x.dataset.i, 1); drawChips(); drawSuggest();
+        }));
+      };
+      const drawSuggest = () => {
+        const fresh = suggestions.filter((h) => !domains.includes(h));
+        $('suggest').innerHTML = fresh.length
+          ? '<div class="sub-muted" style="margin-top:8px;">Seen by the gate: ' +
+            fresh.map((h) => '<a href="#" class="sug" data-h="' + esc(h) + '" style="margin-right:8px;">+ ' + esc(h) + '</a>').join('') + '</div>'
+          : '';
+        $('suggest').querySelectorAll('.sug').forEach((sg) => sg.addEventListener('click', (e) => { e.preventDefault(); addDomain(sg.dataset.h); }));
+      };
+      const addDomain = (raw) => {
+        const v = normalize(raw);
+        if (!v) return;
+        if (!domains.includes(v)) domains.push(v);
+        $('domInput').value = '';
+        drawChips(); drawSuggest();
+      };
+      drawChips(); drawSuggest();
+      $('addDom').addEventListener('click', () => addDomain($('domInput').value));
+      $('domInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addDomain($('domInput').value); } });
+      $('contDom').addEventListener('click', async () => {
+        try {
+          await api('PUT', '/frontend-conqueror/projects/' + detail.key + '/domains', { domains });
+          step = hasDestination ? 3 : 2;
+          renderStep();
+        } catch (e) { $('err').textContent = e.message; }
+      });
+    } else if (step === 2) {
+      // GitHub repo picker.
+      root().innerHTML = html\`
+        <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
+        <main>
+          <div class="crumbs"><a href="#/">← Projects</a></div>
+          \${dots(2)}
+          <h2>Which GitHub repo?<span class="sub">Step 2 of \${totalSteps} — bugs from \${esc(detail.displayName)} will land in this repo's Issues tab, tagged <code>fc:bug</code>.</span></h2>
           <div class="card">
             <div id="ghCombo"></div>
             <div class="err" id="err" style="margin-top:6px;"></div>
+            <div class="row" style="justify-content:flex-start;margin-top:14px;gap:6px;">
+              <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
+            </div>
           </div>
         </main>\`;
       const pickRepo = async (repo, accountId) => {
         if (!repo || !repo.includes('/')) return ($('err').textContent = 'Repo must be in the form "owner/repo".');
         try {
           await api('PUT', '/frontend-conqueror/projects/' + detail.key + '/github-repo', { repo, accountId });
-          step = 2;
+          step = 3;
           renderStep();
         } catch (e) { $('err').textContent = e.message; }
       };
       renderRepoCombobox($('ghCombo'), { onPick: pickRepo });
-    } else if (step === 2) {
+    } else if (step === 3) {
       root().innerHTML = html\`
         <header><span class="brand">frontend-conqueror · gate · configuring \${esc(detail.displayName)}</span></header>
         <main>
@@ -3397,7 +3624,7 @@ async function renderProjectWizard(key) {
             <input id="firstPassword" type="text" placeholder="password">
             <div class="err" id="err"></div>
             <div class="row" style="justify-content:flex-end;margin-top:14px;gap:6px;">
-              <button class="ghost" onclick="(()=>{step=1;renderStep();})()">← Back</button>
+              <button class="ghost" onclick="(()=>{step=2;renderStep();})()">← Back</button>
               <button class="primary" id="finish">Activate project →</button>
             </div>
           </div>

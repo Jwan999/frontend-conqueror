@@ -10,6 +10,23 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.13.0] — 2026-06-24
+
+### Added
+- **Domain-based auto-routing.** A project now owns a list of `domains` (hostnames/subdomains). The gate maps an incoming overlay to a project by the request's `Origin` host, so a site can load a **bare `/overlay.js` with no project key baked into its config** and still route correctly. An explicit `project:` key (path `/<project>/overlay.js`, `?project=`, or plugin config) still wins, so every existing install keeps working unchanged. A brand-new host that matches no project auto-registers a pending project keyed by its hostname, with that domain pre-recorded.
+  - New admin endpoint `PUT /frontend-conqueror/projects/:key/domains` (full-replace; normalizes `https://App.Foo.com:443/x` → `app.foo.com`, dedupes, and returns `409 domain-claimed` if another project already owns a host so routing stays unambiguous).
+- **Rebuilt Configure flow.** The configure wizard went from two steps to three — **Domains → Source (GitHub repo) → Testers → Activate** — organized around intent instead of exposing the plumbing. The Domains step pre-fills with the hostnames the gate has already observed for the project (skipping localhost).
+- **Domains editor on the project detail page** (Integration tab) so an already-active project can be rebound without re-running the wizard.
+- **`fc init` command.** Detects the project's stack (Nuxt / vanilla Vite / Laravel + Vite) and prints ready-to-paste wiring with the gate URL, project key, locales, and split-repo side already filled in, plus the pinned install line and the "configure in the gate" next step. Flags: `--gate-url`, `--project`, `--locales`, `--side`.
+- **Version-drift warning.** The plugin/overlay now reports the version it was built or pinned with (dev: the plugin's version; prod: the `?v=` on the overlay tag) on each heartbeat. The gate returns its own version and a `versionMismatch` flag when the two drift at major.minor. The overlay logs a one-time `console.warn` (in any environment) and shows a dev-only toast telling you the exact `npm install` line to resync.
+
+### Changed
+- **Heartbeats no longer require a project key.** `gateHeartbeat()` previously no-op'd without one; it now always fires so the gate can auto-route/auto-register by host. The heartbeat response gained `gateVersion` and `versionMismatch`.
+
+### Migration
+- No action required for existing consumers — explicit project keys still take precedence. To adopt auto-routing, bind a project's domain(s) in the gate (Configure wizard or the Integration tab), then your sites can point at a bare `/overlay.js`.
+- To resync a project after deploying this gate, bump its plugin pin to `#v0.13.0` and `npm install`. The version-drift warning will tell you which sites are behind.
+
 ## [0.12.7] — 2026-06-02
 
 ### Added

@@ -7,6 +7,7 @@
 // as if it had been invoked directly via `node`.
 //
 // Subcommands today:
+//   init                              Print ready-to-paste wiring for this project
 //   gate                              Run the gate HTTP server
 //   gate --reset-admin-password       Reset the admin password (server stopped or
 //                                     running — operates on the data file directly)
@@ -25,6 +26,8 @@ const HELP = [
   'Usage: frontend-conqueror <command> [options]',
   '',
   'Commands:',
+  '  init                          Detect the stack and print ready-to-paste wiring',
+  '                                (flags: --gate-url --project --locales --side)',
   '  gate                          Run the gate HTTP server',
   '  gate --reset-admin-password   Reset the admin password (use the default printed',
   '                                on stderr to log in, then change it from Settings)',
@@ -61,6 +64,9 @@ function runModule(rel) {
 }
 
 switch (subcommand) {
+  case 'init':
+    runModule('bin/init.js');
+    break;
   case 'gate':
     runModule('gate/server.js');
     break;
