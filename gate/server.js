@@ -87,7 +87,6 @@ const DEFAULT_MODE_COLORS = { edit: '#2563eb', test: '#f59e0b', todo: '#059669' 
 //                          linearApiKey, linearTeamId,         (per-project overrides; null=use global)
 //                          activity: { firstSeenAt, lastSeenAt, totalHeartbeats,
 //                                      origins: { [origin]: count },
-//                                      pages: [url, ...],            (rolling, max 100)
 //                                      dailyIpHashes: [{ day, hashes: [] }],  (rolling 7 days)
 //                                      reportsCount },
 //                          createdAt } } }
@@ -116,7 +115,6 @@ function emptyActivity() {
     lastSeenAt: null,
     totalHeartbeats: 0,
     origins: {},
-    pages: [],
     dailyIpHashes: [],
     reportsCount: 0,
   };
@@ -268,6 +266,9 @@ function loadData() {
   for (const proj of Object.values(data.projects)) {
     if (!proj) continue;
     if (!proj.users) proj.users = {};
+    // v0.13.1: drop the legacy per-page URL list — unused since the Activity
+    // tab was removed, and it bloated data.json with fbclid/utm_* tracking URLs.
+    if (proj.activity && proj.activity.pages) delete proj.activity.pages;
     if (Array.isArray(proj.emails)) {
       for (const e of proj.emails) {
         const lc = String(e).toLowerCase().trim();
@@ -1128,7 +1129,6 @@ function publicProjectSummary(p) {
       lastSeenAt: a.lastSeenAt,
       totalHeartbeats: a.totalHeartbeats,
       originsCount: Object.keys(a.origins || {}).length,
-      pagesCount: (a.pages || []).length,
       reportsCount: a.reportsCount || 0,
       uniqueIpsToday: ((a.dailyIpHashes || []).find((d) => d.day === dayKey())?.hashes.length) || 0,
     },
@@ -1156,7 +1156,6 @@ function publicProjectDetail(p) {
     activity: {
       ...publicProjectSummary(p).activity,
       origins: p.activity?.origins || {},
-      pages: (p.activity?.pages || []).slice(-50),
     },
   };
 }
@@ -1542,14 +1541,9 @@ async function handle(req, res) {
       a.origins = a.origins || {};
       a.origins[origin] = (a.origins[origin] || 0) + 1;
     }
-    if (body.url && typeof body.url === 'string') {
-      a.pages = a.pages || [];
-      const u = body.url.slice(0, 300);
-      if (!a.pages.includes(u)) {
-        a.pages.push(u);
-        if (a.pages.length > 100) a.pages.shift();
-      }
-    }
+    // v0.13.1: body.url (per-page list) is no longer stored — it bloated
+    // data.json with tracking-param URLs (fbclid/utm_*) and the admin UI that
+    // displayed it was removed. The overlay still sends it; we just ignore it.
     // Daily-unique-IP count via hashed bucket.
     const today = dayKey();
     a.dailyIpHashes = a.dailyIpHashes || [];
@@ -3049,18 +3043,20 @@ async function renderProjectDetail(key) {
   const _topOriginHits = _topOriginEntry ? _topOriginEntry[1] : 0;
 
   // Pick the active tab. Default to 'destination' when destination is unset
-  // (most-actionable next step), otherwise 'activity' (the most-checked view).
-  const validTabs = ['activity', 'testers', 'destination', 'integration', 'settings'];
-  const defaultTab = !hasDestination ? 'destination' : 'activity';
+  // (most-actionable next step), otherwise 'domains' (the main thing admins
+  // manage here). v0.13.1 removed the Activity tab — at-a-glance activity lives
+  // on the Projects list card; the detail page is for configuration only.
+  const validTabs = ['domains', 'destination', 'testers', 'integration', 'settings'];
+  const defaultTab = !hasDestination ? 'destination' : 'domains';
   const activeTab = (ROUTE.tab && validTabs.includes(ROUTE.tab)) ? ROUTE.tab : defaultTab;
 
   // Each tab definition: key, label, optional badge (number or warning dot).
   const testerWarn = detail.usersNeedingPassword > 0 ? '<span class="dot-warn"></span>' : '';
   const destWarn = !hasDestination ? '<span class="dot-warn"></span>' : '';
   const tabs = [
-    { key: 'activity', label: 'Activity' },
-    { key: 'testers', label: 'Testers', extra: '<span class="count">' + detail.users.length + '</span>' + testerWarn },
+    { key: 'domains', label: 'Domains', extra: '<span class="count">' + (detail.domains || []).length + '</span>' },
     { key: 'destination', label: 'Destination', extra: destWarn },
+    { key: 'testers', label: 'Testers', extra: '<span class="count">' + detail.users.length + '</span>' + testerWarn },
     { key: 'integration', label: 'Integration' },
     { key: 'settings', label: 'Settings' },
   ];
@@ -3074,38 +3070,34 @@ async function renderProjectDetail(key) {
 
   // -------- Tab content renderers (HTML strings, plugged into the page below) --------
 
-  const renderActivityTab = () => html\`
-    <div class="card">
-      <div class="grid3">
-        <div class="stat"><span class="v">\${detail.activity.totalHeartbeats || 0}</span><span class="l">total heartbeats</span></div>
-        <div class="stat"><span class="v">\${detail.activity.uniqueIpsToday}</span><span class="l">unique today</span></div>
-        <div class="stat"><span class="v">\${detail.activity.reportsCount || 0}</span><span class="l">reports filed</span></div>
-      </div>
-      <div style="margin-top:14px;font-size:12px;color:var(--muted);">
-        First seen: \${detail.activity.firstSeenAt ? new Date(detail.activity.firstSeenAt * 1000).toISOString() : 'never'}<br>
-        Last heartbeat: \${detail.activity.lastSeenAt ? relTime(detail.activity.lastSeenAt) : 'never'}
-      </div>
-    </div>
-    \${Object.keys(_origins).length > 0 ? html\`
+  // v0.13.1: the Domains tab is the primary view — bind the hostnames that
+  // auto-route to this project. Suggestions come from the hosts the gate has
+  // actually seen (origins), minus localhost and anything already bound.
+  const renderDomainsTab = () => {
+    const bound = detail.domains || [];
+    const observedHosts = [...new Set(Object.keys(_origins)
+      .map((o) => { try { return new URL(o).hostname.toLowerCase(); } catch (e) { return ''; } })
+      .filter((h) => h && h !== 'localhost' && h !== '0.0.0.0' && !h.startsWith('127.')))];
+    const suggestions = observedHosts.filter((h) => !bound.includes(h));
+    return html\`
       <div class="card">
-        <h3>Origins seen</h3>
-        <div class="origin-list">
-          \${Object.entries(_origins).sort((a,b) => b[1]-a[1]).slice(0,10).map(([o,c]) => '<div class="o"><span>' + esc(o) + '</span><span>' + c + ' hits</span></div>').join('')}
+        <div class="sub-muted" style="margin-bottom:10px;font-size:12px;line-height:1.55;">Bug reports from these domains route to this project automatically — a site can point at a bare <code>/overlay.js</code> with no project key and still land here. One domain belongs to one project.</div>
+        <div id="domainChips" style="display:flex;flex-wrap:wrap;gap:6px;">
+          \${bound.length
+            ? bound.map(d => '<span class="pill">' + esc(d) + ' <a href="#" onclick="removeProjectDomain(\\'' + esc(detail.key) + '\\', \\'' + esc(d) + '\\');return false;" style="color:inherit;opacity:.6;text-decoration:none;" title="remove">×</a></span>').join('')
+            : '<span class="sub-muted">No domains bound yet — add the production domain(s) below.</span>'}
         </div>
-      </div>
-    \` : ''}
-    \${detail.activity.pages.length > 0 ? html\`
-      <div class="card">
-        <h3>Pages seen (\${detail.activity.pages.length})</h3>
-        <div class="origin-list">
-          \${detail.activity.pages.slice(-10).reverse().map(p => '<div class="o" style="display:block;"><a href="' + esc(p) + '" target="_blank" rel="noreferrer">' + esc(p) + '</a></div>').join('')}
+        <div class="row" style="margin-top:12px;">
+          <input id="newDomain" type="text" placeholder="app.example.com" onkeydown="if(event.key==='Enter'){event.preventDefault();addProjectDomain('\${esc(detail.key)}');}">
+          <button class="primary" onclick="addProjectDomain('\${esc(detail.key)}')">Add</button>
         </div>
+        \${suggestions.length ? html\`
+          <div class="sub-muted" style="margin-top:12px;font-size:12px;">Seen by the gate: \${suggestions.map(h => '<a href="#" onclick="addProjectDomain(\\'' + esc(detail.key) + '\\', \\'' + esc(h) + '\\');return false;" style="margin-right:12px;white-space:nowrap;">+ ' + esc(h) + '</a>').join('')}</div>
+        \` : ''}
+        <div class="err" id="domErr"></div>
       </div>
-    \` : ''}
-    \${Object.keys(_origins).length === 0 && detail.activity.pages.length === 0 && !detail.activity.firstSeenAt ? html\`
-      <div class="card"><div class="empty">No activity yet. Once the overlay loads this project's key, heartbeats start flowing here.</div></div>
-    \` : ''}
-  \`;
+    \`;
+  };
 
   const renderTestersTab = () => html\`
     <div class="card">
@@ -3228,20 +3220,6 @@ async function renderProjectDetail(key) {
 
   const renderIntegrationTab = () => html\`
     <div class="card">
-      <h3 style="margin-bottom:8px;">Domains</h3>
-      <div class="sub-muted" style="margin-bottom:8px;font-size:12px;">Reports from these domains auto-route to this project — a site can point at a bare <code>/overlay.js</code> with no project key and still land here. One domain belongs to one project.</div>
-      <div id="domainChips" style="display:flex;flex-wrap:wrap;gap:6px;">
-        \${(detail.domains || []).length
-          ? detail.domains.map(d => '<span class="pill">' + esc(d) + ' <a href="#" onclick="removeProjectDomain(\\'' + esc(detail.key) + '\\', \\'' + esc(d) + '\\');return false;" style="color:inherit;opacity:.6;text-decoration:none;" title="remove">×</a></span>').join('')
-          : '<span class="sub-muted">No domains bound yet — add the production domain(s) so reports route automatically.</span>'}
-      </div>
-      <div class="row" style="margin-top:10px;">
-        <input id="newDomain" type="text" placeholder="app.example.com" onkeydown="if(event.key==='Enter'){event.preventDefault();addProjectDomain('\${esc(detail.key)}');}">
-        <button class="primary" onclick="addProjectDomain('\${esc(detail.key)}')">Add</button>
-      </div>
-      <div class="err" id="domErr"></div>
-    </div>
-    <div class="card">
       <h3 style="margin-bottom:8px;">In your project's Vite/Nuxt plugin config</h3>
       <div class="sub-muted" style="margin-bottom:8px;font-size:12px;">Add this to <code>frontendConqueror()</code> in your <code>vite.config.ts</code> / <code>nuxt.config.ts</code>:</div>
       <div><code>\${esc(pluginCfg)}</code></div>
@@ -3284,12 +3262,12 @@ async function renderProjectDetail(key) {
   \`;
 
   const tabContent =
-    activeTab === 'activity' ? renderActivityTab() :
+    activeTab === 'domains' ? renderDomainsTab() :
     activeTab === 'testers' ? renderTestersTab() :
     activeTab === 'destination' ? renderDestinationTab() :
     activeTab === 'integration' ? renderIntegrationTab() :
     activeTab === 'settings' ? renderSettingsTab() :
-    renderActivityTab();
+    renderDomainsTab();
 
   root().innerHTML = html\`
     <header>
@@ -3327,9 +3305,9 @@ async function renderProjectDetail(key) {
 // an already-active project can be rebound without re-running the wizard. Both
 // handlers re-fetch the current list, mutate, and PUT the full array (the
 // server normalizes + enforces one-project-per-domain, surfacing a 409 here).
-window.addProjectDomain = async function(key) {
+window.addProjectDomain = async function(key, value) {
   const input = $('newDomain');
-  const v = input ? (input.value || '').trim() : '';
+  const v = (value != null ? String(value) : (input ? input.value : '')).trim();
   if (!v) return;
   try {
     const detail = (await api('GET', '/frontend-conqueror/projects/' + key)).project;

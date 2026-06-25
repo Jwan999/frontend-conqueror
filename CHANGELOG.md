@@ -10,6 +10,14 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.13.1] — 2026-06-25
+
+### Changed
+- **Project detail page is now configuration-only.** Removed the **Activity** tab — total heartbeats / unique-IP / "Origins seen" / "Pages seen" were noise for the admin's actual job (wiring a project up). At-a-glance activity (last seen, unique today, reports) still lives on the Projects list card. **Domains** is now its own first-class tab and the default view: bind/unbind domains as chips, with one-click suggestions from the hosts the gate has actually seen. (The domains editor was previously tucked inside the Integration tab.)
+
+### Removed
+- **Per-page URL tracking.** The gate no longer stores `activity.pages` — it bloated `data.json` with `fbclid=` / `utm_*` tracking-param URLs and the only thing that displayed it (the Activity tab's "Pages seen" list) is gone. The overlay still sends `url` on heartbeat; the gate ignores it. Existing `data.json` files have the stale `pages` arrays purged on next load.
+
 ## [0.13.0] — 2026-06-24
 
 ### Added
