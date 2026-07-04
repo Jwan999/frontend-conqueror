@@ -10,6 +10,20 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.14.0] — 2026-07-05
+
+Field-driven hotfix from real use on an animated, HMR-fragile site (dawwama). Broader connectivity/reliability work (lazy gate probe, agent reconnect, port-in-use handling, gate data-race) is tracked separately.
+
+### Added
+- **`reloadAfterTodo` / `reloadAfterEdit` plugin options.** After a successful overlay write the overlay can auto-reload the page. A TODO is a source comment with no rendered effect, yet the write still triggers an HMR update that can strand pages whose animations aren't HMR-safe (imperative canvas/WebGL) on a blank/black render until a full reload — so `reloadAfterTodo` defaults **on**. Edits usually want the live HMR result, so `reloadAfterEdit` defaults **off**. After the reload the overlay restores the active mode from `sessionStorage`, so you land back in TODO mode.
+
+### Changed
+- **Hit-testing now pierces animated / `pointer-events:none` layers.** Selecting text (Edit) or a component (Dev TODO / Test) falls back from `document.elementFromPoint` to the full `document.elementsFromPoint` z-stack and then to a geometric rect-search over anchored elements, and freezes the resolved target on `mousedown`. This lets the overlay reach template text buried under a full-viewport animated `<canvas>` or a `pointer-events:none` overlay (e.g. a hero animation) instead of grabbing the canvas. DOM injected at runtime with no source location still can't be anchored — that's inherent to a source-editing tool.
+- **Gate-unreachable startup hint downgraded from a red error toast to a one-time `console.warn`.** The startup mode-colors probe fires whenever a gate URL is configured, but Edit and Dev-TODO modes never need the gate — only Test mode does — so a red error toast on every dev load of an Edit/TODO-only project was noise for an optional subsystem. Test mode still surfaces a scoped error in its own panel when the gate is actually unreachable.
+
+### Migration
+- No action for existing consumers. To adopt: re-pin to `#v0.14.0` and `npm install`. To opt out of the TODO auto-reload, pass `reloadAfterTodo: false` in the plugin options (needs a dev-server restart). To auto-reload after edits too, pass `reloadAfterEdit: true`.
+
 ## [0.13.1] — 2026-06-25
 
 ### Changed

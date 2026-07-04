@@ -946,6 +946,13 @@ module.exports = function frontendConquerorPlugin(options = {}) {
     //            POST /api/report-issue and GET /api/issues by this value.
     // Without `gate`, Test mode shows a "configure gate" toast.
     gate: options.gate || null,
+    // v0.14.0: reload the page after a successful overlay write. A TODO is a
+    // source comment with no rendered effect, but the write still triggers an
+    // HMR update that can strand pages with HMR-fragile imperative animations
+    // (canvas/WebGL) on a blank render — so reload after TODO by default. Edits
+    // usually want the live HMR result, so they don't reload unless asked.
+    reloadAfterTodo: options.reloadAfterTodo !== false,
+    reloadAfterEdit: options.reloadAfterEdit === true,
   };
 
   let projectRoot;
@@ -1122,6 +1129,8 @@ module.exports = function frontendConquerorPlugin(options = {}) {
             gate: opt.gate || null,
             enabledModes: ['edit', 'todo', 'test'],
             version: PLUGIN_VERSION,
+            reloadAfterTodo: opt.reloadAfterTodo,
+            reloadAfterEdit: opt.reloadAfterEdit,
           };
           const prelude = `window.__frontendConquerorConfig=${JSON.stringify(cfg)};\n`;
           res.setHeader('Content-Type', 'application/javascript');
@@ -1146,6 +1155,8 @@ module.exports = function frontendConquerorPlugin(options = {}) {
           gate: opt.gate || null,
           enabledModes: ['edit', 'todo', 'test'],
           version: PLUGIN_VERSION,
+          reloadAfterTodo: opt.reloadAfterTodo,
+          reloadAfterEdit: opt.reloadAfterEdit,
         };
         const tag = `<script>window.__frontendConquerorConfig=${JSON.stringify(cfg)};</script>` +
                     `<script src="${OVERLAY_URL}" defer></script>`;

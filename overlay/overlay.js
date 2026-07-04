@@ -17,6 +17,12 @@
       // v0.13.0: the plugin/gate version this overlay was loaded with. Sent on
       // heartbeat so the gate can warn when it drifts from the gate's version.
       version: null,
+      // v0.14.0: reload the page after a successful write, so pages with
+      // HMR-fragile imperative animations don't get stranded on a broken
+      // hot-update. A TODO never needs a live view (default on); an edit
+      // usually does (default off).
+      reloadAfterTodo: true,
+      reloadAfterEdit: false,
     },
     (window.__frontendConquerorConfig || {})
   );
@@ -206,21 +212,23 @@
   }
   // Fire-and-forget: the rest of the overlay works fine with defaults if this
   // fails (no gate, offline, etc.). When it resolves, current colors update live.
-  // v0.10.4: on network failure during *dev* (localhost gate), show a one-time
-  // toast pointing at the CLI command. Pre-v0.10.4 the failure was silent and
-  // first-time integrators saw nothing in the UI — they had to open devtools
-  // to discover the gate wasn't running.
+  // v0.10.4: on network failure, hint that the gate isn't reachable.
+  // v0.14.0: downgraded from a red error *toast* to a one-time console.warn.
+  // The startup mode-colors probe fires whenever a gate URL is configured —
+  // but Edit and Dev-TODO modes never need the gate (only Test mode does), so
+  // an error toast on every dev load of an Edit/TODO-only project was noise
+  // for an optional subsystem. Test mode still surfaces a scoped error in its
+  // own panel when the gate is actually unreachable. (The cloud connectivity
+  // plan makes this probe fully lazy; this is the minimal immediate fix.)
   let fcGateUnreachableHinted = false;
   function fcMaybeWarnGateUnreachable() {
     if (fcGateUnreachableHinted) return;
     fcGateUnreachableHinted = true;
     const isLocal = /^(?:https?:\/\/)?(?:localhost|127\.0\.0\.1|\[::1\])/i.test(GATE.url);
-    // Defer so toast() definition has executed and so the toast actually
-    // renders after the page has finished setting up.
-    setTimeout(() => {
-      if (isLocal) toast('Gate not running at ' + GATE.url + ' — run `npx frontend-conqueror gate`', 'error');
-      else toast("Can't reach gate at " + GATE.url, 'error');
-    }, 800);
+    const msg = isLocal
+      ? 'Gate not running at ' + GATE.url + ' — run `npx frontend-conqueror gate` (only needed for Test mode).'
+      : "Can't reach gate at " + GATE.url + ' (only needed for Test mode).';
+    try { console.warn('[frontend-conqueror] ' + msg); } catch {}
   }
   if (GATE && GATE.url) {
     fetch(GATE.url + '/api/mode-colors', { cache: 'no-store' })
@@ -758,6 +766,16 @@
       toast(`Saved → ${data.file}`, 'success');
       invalidateI18nMap();
       if (cb) cb(null, data);
+      // v0.14.0: a TODO is a source comment with zero rendered effect, yet the
+      // write still triggers an HMR update that can strand pages whose
+      // animations aren't HMR-safe (imperative canvas/WebGL) on a blank/black
+      // render until a full reload. Since there's nothing to see live, reload
+      // to a guaranteed-clean state. Edits are opt-in (they usually want live
+      // HMR). Toggle via plugin config `reloadAfterTodo` / `reloadAfterEdit`.
+      const isTodo = data.kind === 'todo';
+      if ((isTodo && CFG.reloadAfterTodo) || (!isTodo && CFG.reloadAfterEdit)) {
+        setTimeout(() => { try { location.reload(); } catch {} }, 350);
+      }
     } else if (data.type === 'rejected') {
       let detail = data.message || 'Edit rejected';
       if (data.reason === 'ambiguous' && Array.isArray(data.files)) {
@@ -864,22 +882,85 @@
     positionOverlays(target);
   }
 
-  // Test + Dev TODO modes hover the whole *component*, not the text node — walk
-  // up from the cursor to the nearest element carrying data-edit-source (which
-  // the plugin emits on every real template element). If none is found (e.g.
-  // an element coming from a third-party component or rendered by host-side
-  // JavaScript), fall back to the deepest element under the cursor so hovering
-  // still shows a highlight — the panel can decide what to do without a source
-  // location.
-  function findComponentAtPoint(x, y) {
-    const root = document.elementFromPoint(x, y);
-    if (!root || isInsideHost(root) || !isEditableHost(root)) return null;
-    let el = root;
+  // ---------- Geometric hit-testing (v0.14.0) ----------
+  // document.elementFromPoint / elementsFromPoint / caretRangeFromPoint all
+  // respect `pointer-events`, so on a page with a full-viewport animated
+  // <canvas> stacked over `pointer-events:none` text (e.g. dawwama's hurricane
+  // hero) they return the canvas and never the editable text beneath it. These
+  // helpers locate the editable element by geometry instead of hit-testing,
+  // bypassing pointer-events and z-order entirely.
+  const ANCHOR_SELECTOR =
+    '[data-edit-source],[data-edit-loc],[data-edit-i18n-path],[data-edit-i18n-paths],' +
+    '[data-edit-script-loc],[data-edit-script-locs],[data-edit-dyn]';
+  function hasEditAnchor(el) {
+    return el.hasAttribute('data-edit-loc') || el.hasAttribute('data-edit-i18n-path') ||
+      el.hasAttribute('data-edit-i18n-paths') || el.hasAttribute('data-edit-script-loc') ||
+      el.hasAttribute('data-edit-script-locs');
+  }
+  // Cached snapshot of every anchored element. Rebuilt lazily; invalidated when
+  // the i18n map is invalidated (i.e. after an overlay-driven edit). Slightly
+  // stale entries are harmless — detached nodes report a zero-size rect and are
+  // skipped below.
+  let _anchorNodesCache = null;
+  function anchorNodes() {
+    if (!_anchorNodesCache) _anchorNodesCache = Array.from(document.querySelectorAll(ANCHOR_SELECTOR));
+    return _anchorNodesCache;
+  }
+  function invalidateAnchorCache() { _anchorNodesCache = null; }
+  // Smallest anchored element whose box contains (x,y). Smallest = most
+  // specific (innermost text container). `predicate` optionally narrows to a
+  // kind of anchor (e.g. editable-text anchors for Edit mode).
+  function anchoredElementByRect(x, y, predicate) {
+    let best = null, bestArea = Infinity;
+    for (const el of anchorNodes()) {
+      if (!el || el.nodeType !== 1 || isInsideHost(el)) continue;
+      if (predicate && !predicate(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
+      const area = r.width * r.height;
+      if (area < bestArea) { best = el; bestArea = area; }
+    }
+    return best;
+  }
+  function nearestSourceAncestor(el) {
     while (el && el.nodeType === 1) {
       if (el.getAttribute && el.getAttribute('data-edit-source')) return el;
       el = el.parentElement;
     }
-    return root;
+    return null;
+  }
+  // First element in the full z-ordered hit stack that carries a source anchor.
+  // Pierces normal (pointer-events:auto) stacked overlays that elementFromPoint
+  // would stop at.
+  function anchoredElementInStack(x, y) {
+    const stack = document.elementsFromPoint ? document.elementsFromPoint(x, y) : [];
+    for (const el of stack) {
+      if (isInsideHost(el) || !isEditableHost(el)) continue;
+      const a = nearestSourceAncestor(el);
+      if (a) return a;
+    }
+    return null;
+  }
+
+  // Test + Dev TODO modes hover the whole *component*, not the text node.
+  // Resolution order: (1) topmost element or its ancestor carries the anchor;
+  // (2) pierce pointer-events:auto stacked overlays via the full hit stack;
+  // (3) pierce pointer-events:none / z-buried text via geometric rect search;
+  // (4) last resort — the deepest element under the cursor, so hovering still
+  // shows a highlight (panel decides what to do without a source location).
+  function findComponentAtPoint(x, y) {
+    const root = document.elementFromPoint(x, y);
+    const rootOk = root && !isInsideHost(root) && isEditableHost(root);
+    if (rootOk) {
+      const a = nearestSourceAncestor(root);
+      if (a) return a;
+    }
+    const stackEl = anchoredElementInStack(x, y);
+    if (stackEl) return stackEl;
+    const rectEl = anchoredElementByRect(x, y);
+    if (rectEl) return nearestSourceAncestor(rectEl) || rectEl;
+    return rootOk ? root : null;
   }
 
   function onMouseMove(e) {
@@ -889,6 +970,11 @@
     let target = null;
     if (activeMode === 'edit') {
       target = findTextNodeAtPoint(e.clientX, e.clientY);
+      // Caret hit-testing skips pointer-events:none / z-buried text (animated
+      // hero canvases, etc.). Fall back to the smallest editable-anchored
+      // element under the cursor — openEditor + getEditableTextFromTarget both
+      // accept an element target.
+      if (!target) target = anchoredElementByRect(e.clientX, e.clientY, hasEditAnchor);
     } else {
       target = findComponentAtPoint(e.clientX, e.clientY);
     }
@@ -937,8 +1023,16 @@
     if (e.altKey) return false;
     return true;
   }
+  // Freeze the resolved target at mousedown so a moving animation (or a tiny
+  // cursor jitter onto an overlay) can't swap it out from under the click
+  // before onDocClick reads it.
+  let frozenTarget = null;
   function onDocMouseDown(e) {
-    if (shouldInterceptClick(e)) { e.preventDefault(); e.stopPropagation(); }
+    if (shouldInterceptClick(e)) {
+      frozenTarget = currentTarget;
+      e.preventDefault();
+      e.stopPropagation();
+    }
   }
   // Each mode supplies a label + handler for its primary action. The choice
   // picker (shown on interactive elements) uses these to render its first button.
@@ -949,17 +1043,19 @@
     return null;
   }
   function onDocClick(e) {
-    if (!shouldInterceptClick(e)) return;
+    if (!shouldInterceptClick(e)) { frozenTarget = null; return; }
     e.preventDefault();
     e.stopPropagation();
-    if (!currentTarget) return;
+    const target = frozenTarget || currentTarget;
+    frozenTarget = null;
+    if (!target) return;
     const action = getPrimaryActionForActiveMode();
     if (!action) return;
-    const el = elementForTarget(currentTarget);
+    const el = elementForTarget(target);
     if (isInsideInteractive(el)) {
-      openChoicePicker(currentTarget, el, action);
+      openChoicePicker(target, el, action);
     } else {
-      action.run(currentTarget);
+      action.run(target);
     }
   }
 
@@ -1079,7 +1175,7 @@
   // map around so lookups don't suddenly return null between an edit and its
   // refetch. submit() always awaits the latest before sending, so stale offsets
   // can't reach the agent.
-  function invalidateI18nMap() { i18nMapPromise = null; fetchI18nMap(); fetchRefs(); }
+  function invalidateI18nMap() { i18nMapPromise = null; invalidateAnchorCache(); fetchI18nMap(); fetchRefs(); }
 
   function getActiveLocale() {
     if (typeof window.__activeLocale === 'string') return window.__activeLocale.toLowerCase();
