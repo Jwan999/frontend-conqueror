@@ -10,6 +10,16 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.15.0] — 2026-07-07
+
+### Added
+- **Test-mode task history.** A small **History** button (top-right) opens a modal listing **every task the project ever filed** — open, done, and removed — across all pages, newest first, each with its **creation date**, a **Done / Open / Closed** status, and a **"Go to"** button that navigates (cross-page if needed), scrolls to, and briefly highlights the exact element the task was filed on. The button is shown **only to logged-in testers** (regular production visitors, who also load the overlay script, never see it) and prompts login on first use.
+  - New gate endpoint **`GET /api/issues/history`** (Bearer, project-scoped, own `issues-history` rate bucket) backed by all-states fetchers (`fetchLinearAllIssues`, `fetchGithubAllIssues`, `fetchAllIssuesForProject`) that run **parallel to** the open-issue/bubble path — the existing `/api/issues` route and bubbles are untouched. Status is derived from real backend state (Linear `state.type`; GitHub `state`/`state_reason`), so an overlay "delete" (GitHub close-as-`not_planned`) shows as **Removed**, distinct from **Done**; a dedicated `normalizeGithubIssueHistory` preserves `created_at`/`closed_at` (the open-path normalizer drops them).
+  - **Deploy note:** production gates must be redeployed to expose `/api/issues/history`; overlay changes take effect on reload.
+
+### Changed
+- **Rounded mode-frame corners.** The active-mode viewport border (`.frame`) gained `border-radius`, softening the previously sharp 90° inner corner of the inset-box-shadow ring. Purely cosmetic; mode colors and glow unchanged.
+
 ## [0.14.0] — 2026-07-05
 
 Field-driven hotfix from real use on an animated, HMR-fragile site (dawwama). Broader connectivity/reliability work (lazy gate probe, agent reconnect, port-in-use handling, gate data-race) is tracked separately.

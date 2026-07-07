@@ -680,6 +680,38 @@ async function fetchLinearOpenIssues(linear) {
   }
   return all;
 }
+// v0.15.0: like fetchLinearOpenIssues but ALL states (open + completed +
+// canceled) with createdAt/completedAt, for the task-history endpoint. Kept
+// separate so the open-issue/bubble path is untouched. Higher page cap since
+// history is a bigger set.
+async function fetchLinearAllIssues(linear) {
+  if (!linear || !linear.apiKey) return [];
+  if (!linear.projectId) return [];
+  let all = [];
+  let after = null;
+  for (let pageCount = 0; pageCount < 20; pageCount++) {
+    const data = await linearGraphQL(
+      linear.apiKey,
+      `query($projectId: ID!, $after: String) {
+        issues(
+          first: 100,
+          after: $after,
+          filter: { project: { id: { eq: $projectId } } },
+          orderBy: createdAt
+        ) {
+          nodes { id identifier url title description createdAt updatedAt completedAt canceledAt state { name type } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      { projectId: linear.projectId, after },
+    );
+    const conn = data.issues || {};
+    if (Array.isArray(conn.nodes)) all = all.concat(conn.nodes);
+    if (!conn.pageInfo || !conn.pageInfo.hasNextPage) break;
+    after = conn.pageInfo.endCursor;
+  }
+  return all;
+}
 async function fetchLinearIssue(linear, issueId) {
   if (!linear || !linear.apiKey) return null;
   const data = await linearGraphQL(
@@ -897,6 +929,49 @@ function normalizeGithubIssue(issue, repoStr) {
     state: _ghStateFromLabels(issue),
   };
 }
+// v0.15.0: history normalizer. Unlike normalizeGithubIssue (which derives state
+// from workflow *labels* and drops timestamps — fine for open bubbles but it
+// would mislabel a truly CLOSED issue as "Open"), this preserves createdAt/
+// closedAt and derives state from GitHub's real `state`/`state_reason` so the
+// history modal can distinguish Done (closed as completed) from Removed (an
+// overlay "delete", which closes as not_planned) from Open.
+function normalizeGithubIssueHistory(issue, repoStr) {
+  let state;
+  if (issue.state === 'closed') {
+    state = issue.state_reason === 'not_planned'
+      ? { name: 'Removed', type: 'canceled' }
+      : { name: 'Done', type: 'completed' };
+  } else {
+    state = _ghStateFromLabels(issue);
+  }
+  return {
+    id: ghEncodeIssueId(repoStr, issue.number),
+    identifier: '#' + issue.number,
+    url: issue.html_url,
+    title: issue.title,
+    description: issue.body || '',
+    createdAt: issue.created_at,
+    updatedAt: issue.updated_at,
+    completedAt: issue.state === 'closed' ? issue.closed_at : null,
+    state,
+  };
+}
+// v0.15.0: like fetchGithubOpenIssues but ALL states (open + closed) for the
+// task-history endpoint. Higher page cap since history is a bigger set.
+async function fetchGithubAllIssues(token, repoStr) {
+  if (!token || !repoStr) return [];
+  const { owner, repo } = parseGithubRepo(repoStr);
+  let all = [];
+  for (let page = 1; page <= 20; page++) {
+    const data = await githubREST(token, 'GET',
+      `/repos/${owner}/${repo}/issues?state=all&labels=${encodeURIComponent(FC_BUG_LABEL)}&per_page=100&page=${page}`);
+    const arr = Array.isArray(data) ? data : [];
+    const issues = arr.filter((x) => !x.pull_request);
+    all = all.concat(issues);
+    if (arr.length < 100) break;
+  }
+  return all;
+}
 function ghEncodeIssueId(repoStr, number) {
   return 'gh-' + Buffer.from(repoStr + '#' + number, 'utf8').toString('base64url');
 }
@@ -1058,6 +1133,37 @@ async function fetchOpenIssuesForProject(data, proj, side) {
     const lin = projectLinear(data, proj);
     if (!lin.apiKey || !lin.projectId) return [];
     issues = await fetchLinearOpenIssues(lin);
+  }
+  issuesCache.set(cacheKey, { fetchedAt: now, issues });
+  return issues;
+}
+
+// v0.15.0: ALL-states fetch for the task-history endpoint. Mirrors
+// fetchOpenIssuesForProject's backend/split-repo dispatch but uses the
+// all-states fetchers + history normalizer, tags each row's `side` (the
+// fc-meta marker doesn't carry it), and uses a separate ':history' cache key
+// so it never poisons the 30s open-issues/bubble cache. bustIssuesCache
+// clears these too (it matches any "<projKey>:" prefix).
+async function fetchAllIssuesForProject(data, proj, side) {
+  const cacheKey = proj.key + ':history:' + (side || 'all');
+  const cached = issuesCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && now - cached.fetchedAt < ISSUES_CACHE_TTL_MS) return cached.issues;
+  let issues = [];
+  if (proj.backend === 'github') {
+    const sides = proj.repoMode === 'split' ? (side ? [side] : ['frontend', 'backend']) : [null];
+    const lists = await Promise.all(sides.map(async (s) => {
+      const gh = projectGithub(data, proj, s);
+      if (!gh.token || !gh.repo) return [];
+      const raw = await fetchGithubAllIssues(gh.token, gh.repo);
+      return raw.map((iss) => ({ ...normalizeGithubIssueHistory(iss, gh.repo), side: s }));
+    }));
+    issues = lists.flat();
+  } else {
+    const lin = projectLinear(data, proj);
+    if (!lin.apiKey || !lin.projectId) return [];
+    const raw = await fetchLinearAllIssues(lin);
+    issues = raw.map((iss) => ({ ...iss, side: null }));
   }
   issuesCache.set(cacheKey, { fetchedAt: now, issues });
   return issues;
@@ -1347,6 +1453,55 @@ async function handle(req, res) {
       return send(res, 200, { issues });
     } catch (e) {
       console.error('[gate] list error:', e.message);
+      return send(res, 502, { error: 'backend-failed', message: e.message });
+    }
+  }
+
+  // v0.15.0: full task history — every fc-tagged issue the project ever filed
+  // (open + done + removed), across ALL pages, for the history modal. Same
+  // auth/project-scoping as /api/issues, but: all-states fetch, no page
+  // filter, and each row carries createdAt + a real done/open/canceled status
+  // plus its own `page` so the overlay can navigate cross-page.
+  if (method === 'GET' && route === '/api/issues/history') {
+    if (!rateLimit('issues-history', getClientIp(req), 30, 60_000)) return send(res, 429, { error: 'rate-limited' });
+    const payload = readTesterToken(req);
+    if (!payload || !payload.project) return send(res, 401, { error: 'not-authorized' });
+    const data = loadData();
+    const proj = data.projects[payload.project];
+    if (!proj || proj.status !== 'active') return send(res, 401, { error: 'project-gone' });
+    if (!(proj.users || {})[payload.email]) return send(res, 401, { error: 'revoked' });
+    const reqSide = (parsed.query && (parsed.query.side === 'frontend' || parsed.query.side === 'backend')) ? parsed.query.side : null;
+    try {
+      const all = await fetchAllIssuesForProject(data, proj, reqSide);
+      const issues = all
+        .map((iss) => {
+          const bodyText = iss.description || iss.body || '';
+          const fc = parseFcMeta(bodyText);
+          if (!fc || fc.v !== 1) return null;
+          const t = iss.state && iss.state.type;
+          const status = t === 'completed' ? 'done' : (t === 'canceled' ? 'canceled' : 'open');
+          return {
+            id: iss.id || iss.node_id,
+            identifier: iss.identifier || ('#' + iss.number),
+            url: iss.url || iss.html_url,
+            title: iss.title,
+            note: typeof fc.note === 'string' ? fc.note : '',
+            filer: fc.filer || null,
+            anchor: fc.anchor || null,
+            page: fc.page || null,
+            side: iss.side || null,
+            createdAt: iss.createdAt || iss.created_at || null,
+            completedAt: iss.completedAt || iss.canceledAt || iss.closed_at || null,
+            state: iss.state || null,
+            status,
+            mine: !!(fc.filer && fc.filer === payload.email),
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+      return send(res, 200, { issues });
+    } catch (e) {
+      console.error('[gate] history error:', e.message);
       return send(res, 502, { error: 'backend-failed', message: e.message });
     }
   }
