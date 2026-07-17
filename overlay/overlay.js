@@ -53,10 +53,12 @@
   function storeGateToken(token, expiresAt, email) {
     if (!GATE) return;
     try { sessionStorage.setItem(gateStorageKey(), JSON.stringify({ token, expiresAt, email })); } catch {}
+    try { fcUpdateHistoryButtonVisibility(); } catch {}  // v0.15.0: reveal the history button once logged in
   }
   function clearGateToken() {
     if (!GATE) return;
     try { sessionStorage.removeItem(gateStorageKey()); } catch {}
+    try { fcUpdateHistoryButtonVisibility(); } catch {}  // v0.15.0: hide it on logout
   }
   // v0.8.0: email + password login. Gate intentionally collapses every failure
   // (no such user, wrong password, lockout, missing password, disabled project)
@@ -99,6 +101,22 @@
     const r = await fetch(`${GATE.url}/api/issues?page=${encodeURIComponent(page)}${sideQ}`, {
       headers: { 'Authorization': 'Bearer ' + token },
     });
+    if (!r.ok) return { ok: false, status: r.status, issues: [] };
+    const data = await r.json().catch(() => null);
+    return { ok: true, issues: (data && data.issues) || [] };
+  }
+  // v0.15.0: full task history (all pages, open + done + removed) for the
+  // history modal. Bearer auth like gateListIssues.
+  async function gateListHistory(token) {
+    const sideQ = GATE.side ? '?side=' + encodeURIComponent(GATE.side) : '';
+    let r;
+    try {
+      r = await fetch(`${GATE.url}/api/issues/history${sideQ}`, {
+        headers: { 'Authorization': 'Bearer ' + token },
+      });
+    } catch (e) {
+      return { ok: false, status: 0, issues: [] };
+    }
     if (!r.ok) return { ok: false, status: r.status, issues: [] };
     const data = await r.json().catch(() => null);
     return { ok: true, issues: (data && data.issues) || [] };
@@ -283,6 +301,11 @@
     .frame {
       position: fixed; inset: 0;
       pointer-events: none;
+      /* v0.15.0: round the corner. An inset box-shadow follows the border-box
+         corner, so a radius rounds both the outer edge and the 7px-in inner
+         ring (inner radius = radius - 7px), softening the previously sharp
+         90-degree inner corner. */
+      border-radius: 14px;
       box-shadow: inset 0 0 0 7px var(--mode-color),
                   inset 0 0 36px var(--mode-color-glow);
       z-index: 2147483646;
@@ -667,6 +690,64 @@
     .fc-edit-actions .fc-edit-err {
       flex: 1; color: #dc2626; font-size: 11px; min-height: 14px;
     }
+    /* v0.15.0 — task history */
+    .fc-history-btn {
+      position: fixed; top: 14px; right: 14px;
+      display: none; align-items: center; gap: 6px;
+      padding: 6px 12px; border: none; border-radius: 999px;
+      background: #111827; color: #fff;
+      font: 700 11px/1 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      letter-spacing: 0.06em; cursor: pointer;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+      pointer-events: auto; user-select: none;
+      z-index: 2147483647;
+      transition: transform 0.12s ease, box-shadow 0.12s ease;
+    }
+    .fc-history-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,0,0,0.32); }
+    .fc-history-btn svg { display: block; }
+    .fc-history-list {
+      overflow-y: auto; margin: 10px 0; flex: 1;
+      display: flex; flex-direction: column; gap: 6px;
+    }
+    .fc-history-empty { color: #6b7280; font-size: 12px; padding: 16px 4px; text-align: center; }
+    .fc-history-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff;
+    }
+    .fc-history-row:hover { border-color: #d1d5db; background: #fafafa; }
+    .fc-history-main { flex: 1; min-width: 0; }
+    .fc-history-title { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; }
+    .fc-history-titletext {
+      font-weight: 600; color: #111827; font-size: 13px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .fc-history-badge {
+      flex: none; font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+      padding: 2px 7px; border-radius: 999px; text-transform: uppercase;
+      color: #fff; background: var(--mode-color);
+    }
+    .fc-status-done { background: #059669; }
+    .fc-status-open { background: var(--mode-color); }
+    .fc-status-canceled { background: #6b7280; }
+    .fc-history-meta { display: flex; align-items: center; gap: 10px; font-size: 11px; color: #6b7280; }
+    .fc-history-id { color: var(--mode-color); text-decoration: none; font-weight: 600; }
+    .fc-history-id:hover { text-decoration: underline; }
+    .fc-history-go {
+      flex: none; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px;
+      background: #fff; color: #111827; font-weight: 600; font-size: 11px; cursor: pointer;
+      white-space: nowrap;
+    }
+    .fc-history-go:hover { border-color: var(--mode-color); color: var(--mode-color); }
+    .fc-history-flash {
+      position: fixed; pointer-events: none;
+      border: 2px solid var(--mode-color); border-radius: 4px;
+      box-shadow: 0 0 0 3px var(--mode-color-glow), 0 0 22px var(--mode-color-glow);
+      z-index: 2147483646;
+      animation: fc-history-flash-anim 1.8s ease-out forwards;
+    }
+    @keyframes fc-history-flash-anim {
+      0% { opacity: 0; } 12% { opacity: 1; } 70% { opacity: 1; } 100% { opacity: 0; }
+    }
   `;
   shadow.appendChild(style);
 
@@ -687,6 +768,33 @@
 
   shadow.appendChild(outline);
   shadow.appendChild(bubble);
+
+  // v0.15.0: persistent "task history" button. Appended once, unconditionally,
+  // but kept hidden unless Test mode is enabled AND a tester session exists —
+  // so regular production visitors (who also load this script) never see it.
+  // Visibility is refreshed on load and after login/logout (storeGateToken /
+  // clearGateToken hooks).
+  const historyBtn = document.createElement('button');
+  historyBtn.className = 'fc-history-btn';
+  historyBtn.type = 'button';
+  historyBtn.title = 'Task history';
+  historyBtn.setAttribute('aria-label', 'Task history');
+  historyBtn.innerHTML =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l3 2"/></svg>' +
+    '<span>History</span>';
+  historyBtn.style.display = 'none';
+  historyBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    fcOpenHistoryModal();
+  });
+  shadow.appendChild(historyBtn);
+  function fcUpdateHistoryButtonVisibility() {
+    const show = ENABLED.has('test') && !!getStoredGateToken();
+    historyBtn.style.display = show ? 'flex' : 'none';
+  }
 
   document.documentElement.appendChild(host);
 
@@ -2335,6 +2443,20 @@
   let fcBubblePanelDismiss = null;
   let fcBubbleResizeHandler = null;
   function fcEscAttr(s) { return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"'); }
+  // v0.15.0: the anchor→element selector (prefix-match on data-edit-source,
+  // handling both the 4-part file:offset:line:col and legacy 2-part formats).
+  // Mirrors the inline selector used by the bubbles; used by the history modal's
+  // "Go to" jump. (Bubble call sites keep their own inline copy to avoid churn.)
+  function fcAnchorSelector(file, offset) {
+    return `[data-edit-source^="${fcEscAttr(file + ':' + offset + ':')}"], [data-edit-source="${fcEscAttr(file + ':' + offset)}"]`;
+  }
+  // v0.15.0: creation-date formatter for the history list (date only, no time).
+  function fcFmtDate(iso) {
+    const t = typeof iso === 'number' ? iso * 1000 : Date.parse(iso || '');
+    if (!t || isNaN(t)) return '';
+    try { return new Date(t).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }); }
+    catch { return new Date(t).toISOString().slice(0, 10); }
+  }
   // Build the bubble's contents: a small chat-bubble icon + the issue count.
   // Extracted so optimistic-insert (after submit), delete-time count update,
   // and the initial render all produce the same markup. v0.9.7: background
@@ -3020,6 +3142,181 @@
     backdrop.addEventListener('click', () => close({ ok: false }));
   }
 
+  // ---------- Task history modal (v0.15.0) ----------
+  // Lists every fc task the project ever filed (open + done + removed), with
+  // creation date, status, and a cross-page "Go to" jump. Requires a tester
+  // session — prompts login if missing.
+  function fcOpenHistoryModal() {
+    if (!GATE || !GATE.url) { toast('Test mode requires `gate: { url }` in the plugin config.', 'error'); return; }
+    const session = getStoredGateToken();
+    if (!session) {
+      openLoginPrompt((result) => { if (result && result.ok) fcOpenHistoryModal(); });
+      return;
+    }
+    const backdrop = document.createElement('div');
+    backdrop.className = 'palette-backdrop';
+    const panel = document.createElement('div');
+    panel.className = 'panel fc-history-panel';
+    panel.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(560px,92vw);max-height:80vh;display:flex;flex-direction:column;';
+    panel.addEventListener('click', (e) => e.stopPropagation());
+
+    const title = document.createElement('div');
+    title.className = 'panel-title';
+    title.textContent = 'TASK HISTORY';
+
+    const list = document.createElement('div');
+    list.className = 'fc-history-list';
+    list.textContent = 'Loading…';
+
+    const row = document.createElement('div');
+    row.className = 'row';
+    const hint = document.createElement('div'); hint.className = 'hint'; hint.textContent = 'Esc to close';
+    const closeBtn = document.createElement('button'); closeBtn.className = 'cancel'; closeBtn.textContent = 'Close';
+    row.appendChild(hint); row.appendChild(closeBtn);
+
+    panel.appendChild(title);
+    panel.appendChild(list);
+    panel.appendChild(row);
+    backdrop.appendChild(panel);
+    shadow.appendChild(backdrop);
+
+    function close() {
+      backdrop.remove();
+      document.removeEventListener('keydown', onKey, true);
+    }
+    function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); close(); } }
+    document.addEventListener('keydown', onKey, true);
+    closeBtn.addEventListener('click', close);
+    backdrop.addEventListener('click', close);
+
+    function showMessage(text) {
+      list.textContent = '';
+      const p = document.createElement('div');
+      p.className = 'fc-history-empty';
+      p.textContent = text;
+      list.appendChild(p);
+    }
+
+    gateListHistory(session.token).then((res) => {
+      if (!res.ok) {
+        if (res.status === 401) { clearGateToken(); showMessage('Your session expired — close and sign in again.'); return; }
+        showMessage("Couldn't load history — is the gate running?");
+        return;
+      }
+      const issues = res.issues || [];
+      if (!issues.length) { showMessage('No tasks filed yet.'); return; }
+      list.textContent = '';
+      for (const iss of issues) list.appendChild(fcBuildHistoryRow(iss, close));
+    });
+  }
+
+  function fcBuildHistoryRow(iss, closeModal) {
+    const rowEl = document.createElement('div');
+    rowEl.className = 'fc-history-row';
+
+    const main = document.createElement('div');
+    main.className = 'fc-history-main';
+
+    const titleLine = document.createElement('div');
+    titleLine.className = 'fc-history-title';
+    const status = iss.status || 'open';
+    const badge = document.createElement('span');
+    badge.className = 'fc-history-badge fc-status-' + status;
+    badge.textContent = (iss.state && iss.state.name) || (status === 'done' ? 'Done' : status === 'canceled' ? 'Closed' : 'Open');
+    titleLine.appendChild(badge);
+    const titleText = document.createElement('span');
+    titleText.className = 'fc-history-titletext';
+    titleText.textContent = iss.title || iss.identifier || '(untitled)';
+    titleLine.appendChild(titleText);
+    main.appendChild(titleLine);
+
+    const meta = document.createElement('div');
+    meta.className = 'fc-history-meta';
+    if (iss.identifier) {
+      const idLink = document.createElement('a');
+      idLink.href = iss.url || '#'; idLink.target = '_blank'; idLink.rel = 'noopener';
+      idLink.className = 'fc-history-id';
+      idLink.textContent = iss.identifier;
+      meta.appendChild(idLink);
+    }
+    const dateStr = fcFmtDate(iss.createdAt);
+    if (dateStr) {
+      const d = document.createElement('span'); d.className = 'fc-history-date'; d.textContent = dateStr;
+      meta.appendChild(d);
+    }
+    main.appendChild(meta);
+    rowEl.appendChild(main);
+
+    // "Go to" — only when there's a resolvable anchor + page.
+    if (iss.anchor && iss.anchor.file && typeof iss.anchor.offset === 'number' && iss.page) {
+      const go = document.createElement('button');
+      go.className = 'fc-history-go';
+      go.type = 'button';
+      go.textContent = 'Go to →';
+      go.title = 'Open the page and highlight where this was filed';
+      go.addEventListener('click', (e) => { e.stopPropagation(); closeModal(); fcGoToIssue(iss); });
+      rowEl.appendChild(go);
+    }
+    return rowEl;
+  }
+
+  // Navigate to (possibly another page) and highlight the anchored element.
+  function fcGoToIssue(iss) {
+    const here = location.pathname + location.search;
+    if (iss.page && iss.page !== here) {
+      try { sessionStorage.setItem('__fc_history_jump', JSON.stringify({ file: iss.anchor.file, offset: iss.anchor.offset, ts: Date.now() })); } catch {}
+      location.href = iss.page;
+      return;
+    }
+    fcJumpToAnchor(iss.anchor.file, iss.anchor.offset);
+  }
+
+  function fcJumpToAnchor(file, offset) {
+    let el = null;
+    try { el = document.querySelector(fcAnchorSelector(file, offset)); } catch {}
+    if (!el) { toast('That element is no longer on this page.', 'info'); return; }
+    try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch { try { el.scrollIntoView(); } catch {} }
+    // Flash after the smooth scroll settles so the box lands on the final position.
+    setTimeout(() => fcFlashHighlight(el), 450);
+  }
+
+  function fcFlashHighlight(el) {
+    let r;
+    try { r = el.getBoundingClientRect(); } catch { return; }
+    const box = document.createElement('div');
+    box.className = 'fc-history-flash';
+    box.style.top = (r.top - 4) + 'px';
+    box.style.left = (r.left - 4) + 'px';
+    box.style.width = (r.width + 8) + 'px';
+    box.style.height = (r.height + 8) + 'px';
+    shadow.appendChild(box);
+    setTimeout(() => box.remove(), 1800);
+  }
+
+  // On load: if we arrived from a cross-page "Go to", scroll + highlight the
+  // stashed anchor once it appears (retrying briefly for late-rendering DOM).
+  function fcMaybeConsumeHistoryJump() {
+    let raw = null;
+    try { raw = sessionStorage.getItem('__fc_history_jump'); } catch {}
+    if (!raw) return;
+    try { sessionStorage.removeItem('__fc_history_jump'); } catch {}
+    let data = null;
+    try { data = JSON.parse(raw); } catch { return; }
+    if (!data || !data.file || typeof data.offset !== 'number') return;
+    if (!data.ts || Date.now() - data.ts > 30000) return;  // stale — ignore
+    const tryJump = (attemptsLeft) => {
+      let el = null;
+      try { el = document.querySelector(fcAnchorSelector(data.file, data.offset)); } catch {}
+      if (el) {
+        try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch { try { el.scrollIntoView(); } catch {} }
+        setTimeout(() => fcFlashHighlight(el), 450);
+        return;
+      }
+      if (attemptsLeft > 0) setTimeout(() => tryJump(attemptsLeft - 1), 400);
+    };
+    setTimeout(() => tryJump(6), 300);
+  }
+
   function openTestPanel(target) {
     if (!GATE || !GATE.url) {
       toast('Test mode requires `gate: { url }` in the plugin config.', 'error');
@@ -3382,6 +3679,11 @@
   // Restore the persisted mode on load. Deferred to next macrotask so all the
   // module-level functions and event listeners are wired up first.
   setTimeout(fcRestoreMode, 0);
+
+  // v0.15.0: reflect any existing tester session in the history button, and
+  // consume a pending cross-page "Go to" jump (navigated here from the modal).
+  fcUpdateHistoryButtonVisibility();
+  fcMaybeConsumeHistoryJump();
 
   // While an editor panel is open, swallow any keydown that originated inside
   // our shadow DOM at the capture phase so page-level handlers (e.g., arrow-key
