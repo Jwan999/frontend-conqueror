@@ -211,6 +211,44 @@ function scanI18nAst(content, fileRel, localeNames, babelParser) {
   return entries;
 }
 
+// ----- Locale discovery -----
+// `locales` defaulted to ['en'], and every locale outside that list is skipped
+// silently: no warning, no missing-file error, just half the strings absent from
+// the map and un-editable in the overlay. On a bilingual site that's half of
+// every string. So when the caller doesn't pass `locales`, discover them; when
+// they do, still discover, and warn about anything their list leaves out.
+const LOCALE_CODE_RE = /^[a-z]{2}(?:[-_][A-Za-z0-9]{2,4})?$/;
+
+function discoverLocales(projectRoot, i18nFile) {
+  const found = new Set();
+  // 1. JSON bundles: i18n/locales/<code>.json, locales/<code>.json.
+  for (const parts of [['i18n', 'locales'], ['locales']]) {
+    const dir = path.join(projectRoot, ...parts);
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names) {
+      if (!n.endsWith('.json')) continue;
+      const code = n.slice(0, -5);
+      if (LOCALE_CODE_RE.test(code)) found.add(code);
+    }
+  }
+  // 2. Object-literal i18n module: `export const ar = { … }` beside `const en`.
+  // Matched on source text rather than the AST because this runs before the
+  // parser is needed and a two-letter top-level const in an i18n file is a
+  // locale in every layout we've seen.
+  if (i18nFile) {
+    try {
+      const src = fs.readFileSync(i18nFile, 'utf8');
+      const re = /^\s*(?:export\s+)?const\s+([A-Za-z][\w-]*)\s*(?::[^=]+)?=/gm;
+      let m;
+      while ((m = re.exec(src))) {
+        if (LOCALE_CODE_RE.test(m[1])) found.add(m[1]);
+      }
+    } catch {}
+  }
+  return Array.from(found).sort();
+}
+
 // ----- Scan a JSON locale file (e.g. i18n/locales/en.json) and emit one entry per leaf string. -----
 // Tracks byte offsets manually because JSON.parse loses positions. Mini recursive-descent parser
 // kept small and dep-free — JSON is simple enough that 80 lines covers the whole spec for our use case
@@ -741,6 +779,48 @@ function resolveInterpolationAttr(expr, symbolTable, options, deps, fileRel, sco
   return null;
 }
 
+// Vue built-ins that render a Fragment (or hand their attrs straight to a child)
+// rather than a DOM element of their own. Annotating these is wrong two ways:
+//
+//   <TransitionGroup> / <Suspense> / <template> render a fragment, so Vue logs
+//   "Extraneous non-props attributes ... were passed to component but could not
+//   be automatically inherited because component renders fragment root nodes"
+//   on every render — one warning per instance, per page.
+//
+//   <Transition> / <KeepAlive> render their single child and merge fallthrough
+//   attrs onto it, so our data-edit-source OVERWRITES the child element's own
+//   pointer (mergeProps lets the later value win). Any edit/TODO aimed at that
+//   child resolved to the <Transition> tag's byte offset instead. Skipping the
+//   wrapper leaves the child's own — correct — annotation in place.
+//
+//   <slot> turns stray attributes into slot props, leaking `data-edit-source`
+//   into the consumer's slot scope.
+//
+// Children are still walked in every case; only the attribute on the built-in
+// itself is dropped.
+const FRAGMENT_TAGS = new Set([
+  'transition-group', 'TransitionGroup',
+  'transition', 'Transition',
+  'keep-alive', 'KeepAlive',
+  'teleport', 'Teleport',
+  'suspense', 'Suspense',
+  'slot', 'template',
+]);
+
+function canCarryAttrs(node) {
+  const tag = node.tag;
+  if (!FRAGMENT_TAGS.has(tag)) return true;
+  // <TransitionGroup tag="ul"> (or :tag="x") renders a real element and can
+  // carry the attribute like any other host element — keep annotating it.
+  if (tag === 'transition-group' || tag === 'TransitionGroup') {
+    return (node.props || []).some(
+      (p) => (p.type === 6 && p.name === 'tag') ||
+             (p.type === 7 && p.name === 'bind' && p.arg && p.arg.content === 'tag')
+    );
+  }
+  return false;
+}
+
 // ----- Transform a .vue source string: emit data-edit-loc / data-edit-i18n-path / data-edit-dyn -----
 function transformVueSource(code, fileRel, deps, options) {
   if (!deps.compilerSfc) return null;
@@ -842,12 +922,17 @@ function transformVueSource(code, fileRel, deps, options) {
       // The byte offset remains the second field — every existing overlay
       // (and the bubble system) keeps working unchanged because they parse
       // by byte-offset, not by line/col.
-      const elementSourceOffset = templateOffset + node.loc.start.offset;
-      const { line: elLine, col: elCol } = getLineCol(code, elementSourceOffset);
-      transforms.push({
-        at: insertionPoint(node),
-        str: ` data-edit-source="${escapeAttr(fileRel)}:${elementSourceOffset}:${elLine}:${elCol + 1}"`,
-      });
+      //
+      // v0.15.1: fragment-rendering built-ins are skipped — see FRAGMENT_TAGS.
+      const attrsOk = canCarryAttrs(node);
+      if (attrsOk) {
+        const elementSourceOffset = templateOffset + node.loc.start.offset;
+        const { line: elLine, col: elCol } = getLineCol(code, elementSourceOffset);
+        transforms.push({
+          at: insertionPoint(node),
+          str: ` data-edit-source="${escapeAttr(fileRel)}:${elementSourceOffset}:${elLine}:${elCol + 1}"`,
+        });
+      }
 
       // v-for / v-slot bindings introduce new scope variables. Push for the
       // duration of this subtree.
@@ -864,7 +949,14 @@ function transformVueSource(code, fileRel, deps, options) {
         nonEmptyTextChildren.length === 0;
       const hasMixedInterpolations = interpChildren.length > 0 && !isSingleInterpolationOnly;
 
-      if (isOnlyText) {
+      if (!attrsOk && !hasMixedInterpolations) {
+        // No attribute host: data-edit-loc / data-edit-i18n-path / data-edit-dyn
+        // would be dropped by Vue (or land on the wrong element), so emit
+        // nothing for this node. The text still resolves through whichever
+        // annotated ancestor or child wraps it. The mixed-interpolation branch
+        // below is exempt — it inserts <span> hosts inside the node instead of
+        // attributes on it, so it works on a fragment host too.
+      } else if (attrsOk && isOnlyText) {
         const textNode = nonEmptyTextChildren[0];
         const raw = textNode.content;
         const leadingWs = raw.length - raw.replace(/^\s*/, '').length;
@@ -875,7 +967,7 @@ function transformVueSource(code, fileRel, deps, options) {
           at: insertionPoint(node),
           str: ` data-edit-loc="${escapeAttr(fileRel)}:${trimmedOffset}:${trimmedLength}"`,
         });
-      } else if (isSingleInterpolationOnly) {
+      } else if (attrsOk && isSingleInterpolationOnly) {
         const expr = exprOf(interpChildren[0]);
         const attr = resolveInterpolationAttr(expr, symbolTable, options, deps, fileRel, scopeStack);
         if (attr) {
@@ -915,7 +1007,10 @@ function transformVueSource(code, fileRel, deps, options) {
 // ===================================================================================
 module.exports = function frontendConquerorPlugin(options = {}) {
   const opt = {
-    locales: options.locales || ['en'],
+    // v0.15.1: left unset, this is filled in from the locale files actually on
+    // disk during configResolved (see discoverLocales) instead of defaulting to
+    // English-only. ['en'] remains the fallback when nothing is discoverable.
+    locales: Array.isArray(options.locales) && options.locales.length ? options.locales : null,
     i18nFile: options.i18nFile || null,
     // Map of locale → JSON file path, e.g.
     //   { en: 'i18n/locales/en.json', ar: 'i18n/locales/ar.json' }
@@ -1025,6 +1120,25 @@ module.exports = function frontendConquerorPlugin(options = {}) {
 
       loadDeps();
 
+      // Locales: use the caller's list if given, otherwise take what's on disk.
+      // Either way, say out loud when a locale file exists that the active list
+      // doesn't cover — that file's strings would be missing from the map with
+      // nothing on screen to explain why.
+      const discovered = discoverLocales(projectRoot, i18nFile);
+      let localeNote = '';
+      if (!opt.locales) {
+        opt.locales = discovered.length ? discovered : ['en'];
+        localeNote = discovered.length ? ' (auto)' : ' (default)';
+      } else {
+        const missed = discovered.filter((l) => !opt.locales.includes(l));
+        if (missed.length) {
+          console.warn(
+            `[frontend-conqueror] locale files found for [${missed.join(',')}] but not listed in locales:[${opt.locales.join(',')}] — ` +
+            `those strings won't be editable. Pass locales:[${discovered.map((l) => `'${l}'`).join(',')}] or drop the option to auto-detect.`
+          );
+        }
+      }
+
       // Resolve i18nJsonFiles: either explicit map, or auto-discover common paths.
       i18nJsonResolved = null;
       if (opt.i18nJsonFiles && typeof opt.i18nJsonFiles === 'object') {
@@ -1054,6 +1168,7 @@ module.exports = function frontendConquerorPlugin(options = {}) {
       const flags = [
         `i18n=${i18nFile ? relPath(projectRoot, i18nFile) : '(none)'}`,
         `json=${jsonLocalesFound ? Object.entries(i18nJsonResolved).map(([l, p]) => `${l}:${relPath(projectRoot, p)}`).join(',') : '(none)'}`,
+        `locales=[${opt.locales.join(',')}]${localeNote}`,
         `roots=[${opt.i18nRoots.join(',')}]`,
         `vue=${deps.compilerDom && deps.compilerSfc ? 'on' : 'off'}`,
         `ast=${deps.babelParser ? 'on' : 'off'}`,
@@ -1198,3 +1313,6 @@ module.exports = function frontendConquerorPlugin(options = {}) {
 };
 
 module.exports.default = module.exports;
+// Shared with `fc init` so the snippet it prints lists the same locales the
+// plugin would auto-detect at dev time.
+module.exports.discoverLocales = discoverLocales;

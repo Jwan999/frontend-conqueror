@@ -53,7 +53,7 @@ const isDev = process.env.NODE_ENV !== 'production'
 export default defineNuxtConfig({
   vite: { plugins: isDev ? [frontendConquerorPlugin({
     projectRoot: process.cwd(),
-    locales: ['en', 'ar'],
+    locales: ['en', 'ar'],   // optional — auto-detected from your locale files
     gate: { url: 'http://localhost:54322', project: 'my-app' },
   })] : [] },
   app: { head: { script: isDev

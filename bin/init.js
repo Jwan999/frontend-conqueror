@@ -15,7 +15,7 @@
 // Flags (all optional — sensible defaults derived from the project):
 //   --gate-url=<url>     gate base URL          (default: http://localhost:54322)
 //   --project=<key>      gate project key       (default: package.json "name", slugified)
-//   --locales=en,ar      editable locales       (default: en)
+//   --locales=en,ar      editable locales       (default: detected from disk)
 //   --side=frontend|backend   split-repo side   (default: none)
 
 'use strict';
@@ -56,6 +56,22 @@ function pluginVersion() {
   return pkg && pkg.version ? pkg.version : '0.0.0';
 }
 
+// ---- locale detection ----
+// Same discovery the plugin runs at dev time, so the printed snippet doesn't
+// hardcode `locales: ['en']` on a bilingual project and quietly leave half the
+// strings un-editable. Falls back to ['en'] when nothing is on disk.
+function detectLocales() {
+  try {
+    const i18nFile = [
+      'app/i18n.ts', 'app/i18n.js', 'src/i18n.ts', 'src/i18n.js',
+      'i18n.ts', 'i18n.js', 'locales/index.ts', 'locales/index.js',
+    ].map((p) => path.join(cwd, p)).find((p) => fs.existsSync(p)) || null;
+    const found = require('../plugin/index.js').discoverLocales(cwd, i18nFile);
+    if (found.length) return found;
+  } catch {}
+  return ['en'];
+}
+
 // ---- stack detection ----
 function exists(...rel) { return fs.existsSync(path.join(cwd, ...rel)); }
 function detectStack() {
@@ -83,7 +99,9 @@ function main() {
 
   const gateUrl = String(flags['gate-url'] || 'http://localhost:54322').replace(/\/+$/, '');
   const project = slugify(flags.project || (consumerPkg && consumerPkg.name) || path.basename(cwd)) || 'my-app';
-  const locales = String(flags.locales || 'en').split(',').map((s) => s.trim()).filter(Boolean);
+  const locales = flags.locales
+    ? String(flags.locales).split(',').map((s) => s.trim()).filter(Boolean)
+    : detectLocales();
   const localesLit = locales.map((l) => `'${l}'`).join(', ');
   const side = (flags.side === 'frontend' || flags.side === 'backend') ? flags.side : null;
   const sideProp = side ? `, side: '${side}'` : '';

@@ -10,6 +10,21 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.15.1] — 2026-07-28
+
+Field-driven install/annotation fixes from a first run in a fresh bilingual project.
+
+### Fixed
+- **No more Vue warnings from fragment-rendering built-ins.** The annotator gave every element node a `data-edit-source`, including Vue's built-ins that don't render a DOM element of their own. `<TransitionGroup>` (without a `tag`), `<Suspense>` and `<template>` render a fragment, so Vue logged *"Extraneous non-props attributes … could not be automatically inherited because component renders fragment root nodes"* on every render, once per instance, per page. Worse and quieter: `<Transition>` and `<KeepAlive>` render their single child and **merge fallthrough attrs onto it**, so our attribute overwrote the child element's own pointer — every edit or TODO aimed at that child resolved to the *wrapper's* byte offset. These tags are now skipped; their children are still walked and annotated normally, so the child keeps its correct pointer. `<TransitionGroup tag="ul">` / `:tag="x"` renders a real element and is still annotated. `<slot>` is skipped too — stray attributes there leak into the consumer's slot props.
+- **`ws` and `@babel/parser` are now declared at the package root.** They were only listed in the `agent`/`plugin` workspace manifests, which npm does not install for a consumer pulling the package from GitHub. Result: the auto-spawned agent died on `Cannot find module 'ws'` and every project had to add it by hand. Installing the package now brings its own runtime deps.
+
+### Changed
+- **`locales` is auto-detected.** It defaulted to `['en']`, and any locale outside the list was skipped in silence — no warning, no error, just half the strings missing from the map and un-editable on a bilingual site. Left unset, the plugin now discovers locales from `i18n/locales/*.json`, `locales/*.json`, and top-level locale-named consts in the i18n module (`export const ar = { … }`). Passing `locales` explicitly still wins, but a locale file the list doesn't cover now produces a startup warning naming the missing locales and the exact list to paste. The startup line reports the active set: `locales=[ar,en] (auto)`.
+- **`fc init` fills in the detected locales** instead of hardcoding `locales: ['en']` in the snippet it prints. `--locales=en,ar` still overrides.
+
+### Migration
+- Re-pin to `#v0.15.1` and `npm install`. If you added `ws` to your project only to make the agent boot, you can drop it. If you passed `locales` by hand, you can drop that too — or keep it and let the new warning tell you when a locale file falls outside it.
+
 ## [0.15.0] — 2026-07-07
 
 ### Added
