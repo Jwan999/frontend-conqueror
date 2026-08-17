@@ -10,6 +10,14 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.15.2] — 2026-08-17
+
+### Fixed
+- **A save right after another save could get a false "Agent not connected."** `reloadAfterTodo`/`reloadAfterEdit` (default on for TODOs) call `location.reload()` ~350ms after a successful write, which tears down the overlay's WebSocket — the fresh page has to reconnect from scratch. Edit, hardcoded-text-edit, and Dev TODO submit all checked `connected` synchronously and failed instantly if the reload's reconnect hadn't landed yet, even though the agent was fine and about to be back within well under a second. Also inconsistent: the TODO submit handler was the only one of the three still a plain (non-`async`) function. All three now await a new `waitForConnection(timeoutMs = 2000)` helper that polls the existing `connected` flag for up to 2s before giving up — same eventual error if the agent is genuinely unreachable, just without the instant false negative. As a side effect this also smooths over the agent's own startup race (auto-spawned by the Vite plugin, needs a moment to bind its port) if an action is attempted the instant `npm run dev` finishes.
+
+### Migration
+- Re-pin to `#v0.15.2` and `npm install`. No config or behavior changes — this only removes a race, nothing to opt into.
+
 ## [0.15.1] — 2026-07-28
 
 Field-driven install/annotation fixes from a first run in a fresh bilingual project.

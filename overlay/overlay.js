@@ -866,6 +866,32 @@
     return true;
   }
 
+  // A save (Edit/TODO) triggers `location.reload()` shortly after — see
+  // `reloadAfterTodo`/`reloadAfterEdit` below — which tears down this socket.
+  // The very next action a user takes lands on the fresh page's brief
+  // reconnect window; without this, that action would see `connected === false`
+  // and fail instantly even though the agent is fine and about to reconnect.
+  // Also smooths over the agent's own startup race (auto-spawned by the Vite
+  // plugin, needs a moment to bind its port). Same fallback error either way
+  // if the agent is genuinely unreachable — just after a bounded wait instead
+  // of an instant false negative.
+  function waitForConnection(timeoutMs = 2000) {
+    if (connected) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const poll = setInterval(() => {
+        if (connected) {
+          clearInterval(poll);
+          clearTimeout(timer);
+          resolve(true);
+        }
+      }, 100);
+      const timer = setTimeout(() => {
+        clearInterval(poll);
+        resolve(false);
+      }, timeoutMs);
+    });
+  }
+
   function handleAgentMessage(data) {
     const cb = data.id != null ? pending.get(data.id) : null;
     if (cb) pending.delete(data.id);
@@ -1707,7 +1733,7 @@
       // Collect changed fields.
       const changed = fields.filter((f) => f.textarea.value !== f.originalValue);
       if (changed.length === 0) { close(); return; }
-      if (!connected) { toast('Agent not connected', 'error'); return; }
+      if (!connected && !(await waitForConnection())) { toast('Agent not connected', 'error'); return; }
 
       saveBtn.disabled = true;
       saveBtn.textContent = `Saving ${changed.length}…`;
@@ -2159,7 +2185,7 @@
       const newText = ta.value;
       const oldText = activeEntry ? activeText : originalText;
       if (newText === oldText) { close(); return; }
-      if (!connected) { toast('Agent not connected', 'error'); return; }
+      if (!connected && !(await waitForConnection())) { toast('Agent not connected', 'error'); return; }
       if (compositions.length > 0 && !activeEntry) {
         toast('Pick which piece to edit (click a chip above)', 'error');
         return;
@@ -2396,11 +2422,11 @@
       currentTarget = null;
       outline.style.display = 'none';
     }
-    function submit() {
+    async function submit() {
       const body = ta.value.trim();
       if (!body) { toast('Enter a TODO description', 'error'); return; }
       if (!src) { toast('No source location available for this element', 'error'); return; }
-      if (!connected) { toast('Agent not connected', 'error'); return; }
+      if (!connected && !(await waitForConnection())) { toast('Agent not connected', 'error'); return; }
       const id = ++pendingId;
       insertBtn.disabled = true;
       insertBtn.textContent = 'Inserting…';
