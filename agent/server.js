@@ -228,6 +228,34 @@ function getLineIndent(content, offset) {
   return content.slice(start, i);
 }
 
+// The plugin's data-edit-source offset is the element's `<` — but on a stale
+// HMR compile, or when another dev-only Vite plugin decorates the template
+// before ours sees it (e.g. an inspector injecting attributes), that offset
+// can drift and land inside the tag's own attribute list instead. Splicing a
+// comment in there produces an unparseable SFC (comment mid-attribute-list),
+// so before trusting `offset` as a line-insertion point, check whether it's
+// actually inside an unclosed tag and if so redirect to that tag's real `<`.
+// Bounded backward window + forward quote-tracking so a `>` inside an
+// attribute value (e.g. :class="a > b ? …") can't fake a tag close.
+const TAG_SCAN_WINDOW = 4000;
+function findEnclosingTagStart(content, offset) {
+  if (content[offset] === '<') return offset;
+  const scanStart = Math.max(0, offset - TAG_SCAN_WINDOW);
+  let quote = null;
+  let lastOpen = -1;
+  for (let i = scanStart; i < offset; i++) {
+    const ch = content[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '<') { lastOpen = i; continue; }
+    if (ch === '>') { lastOpen = -1; continue; }
+  }
+  return lastOpen;
+}
+
 function handleAddTodo(ws, msg) {
   const { id, file, offset, body, linearId } = msg;
   if (typeof file !== 'string' || typeof offset !== 'number' || typeof body !== 'string') {
@@ -263,16 +291,29 @@ function handleAddTodo(ws, msg) {
     return;
   }
 
-  const indent = getLineIndent(content, offset);
-  const lineStart = findLineStart(content, offset);
+  const isHtmlFile = /\.(vue|html?|svelte|astro)$/i.test(file);
+  let insertOffset = offset;
+  if (isHtmlFile && content[offset] !== '<') {
+    const tagStart = findEnclosingTagStart(content, offset);
+    if (tagStart === -1) {
+      ws.send(JSON.stringify({
+        type: 'rejected', id, reason: 'unsafe-position',
+        message: `can't safely place a TODO here — the source position doesn't line up with an element's opening tag. Refresh and try again.`,
+      }));
+      return;
+    }
+    insertOffset = tagStart;
+  }
+
+  const indent = getLineIndent(content, insertOffset);
+  const lineStart = findLineStart(content, insertOffset);
   // The plugin only emits data-edit-source on template elements, so .vue offsets
   // are always inside the <template> block — HTML comment is correct.
   // For .ts/.js/.tsx/.jsx we use a // line comment.
-  const isHtml = /\.(vue|html?|svelte|astro)$/i.test(file);
   const prefix = linearId ? `TODO (${linearId}): ` : 'TODO: ';
   const safeLinear = linearId ? String(linearId).replace(/[^A-Za-z0-9_\-]/g, '') : '';
   const finalBody = safeBody.slice(0, 500); // hard cap so a runaway paste doesn't blow up the source line
-  const commentLine = isHtml
+  const commentLine = isHtmlFile
     ? `${indent}<!-- ${safeLinear ? `TODO (${safeLinear}): ` : 'TODO: '}${finalBody} -->\n`
     : `${indent}// ${safeLinear ? `TODO (${safeLinear}): ` : 'TODO: '}${finalBody}\n`;
 
