@@ -19,9 +19,10 @@
       version: null,
       // v0.14.0: reload the page after a successful write, so pages with
       // HMR-fragile imperative animations don't get stranded on a broken
-      // hot-update. A TODO never needs a live view (default on); an edit
-      // usually does (default off).
-      reloadAfterTodo: true,
+      // hot-update. v0.16.0: both default off — a template-only write is now
+      // an in-place re-render (see the plugin's handleHotUpdate), and when a
+      // reload does happen the scroll position is restored.
+      reloadAfterTodo: false,
       reloadAfterEdit: false,
     },
     (window.__frontendConquerorConfig || {})
@@ -866,7 +867,7 @@
     return true;
   }
 
-  // A save (Edit/TODO) triggers `location.reload()` shortly after — see
+  // A save (Edit/TODO) can trigger `location.reload()` shortly after — see
   // `reloadAfterTodo`/`reloadAfterEdit` below — which tears down this socket.
   // The very next action a user takes lands on the fresh page's brief
   // reconnect window; without this, that action would see `connected === false`
@@ -892,23 +893,104 @@
     });
   }
 
+  // ---------- Keep the user's place across writes (v0.16.0) ----------
+  // A write hot-updates the page. Usually that's an in-place re-render and the
+  // scroll position never moves, but some writes still remount a component
+  // (script / i18n-module edits) or reload the page (Vite full-reload, or the
+  // opt-in reloadAfterTodo / reloadAfterEdit). Content rendered client-side
+  // isn't there yet when the browser tries to restore scroll on reload, and
+  // scroll-snap / on-mount hash scrolling can move it too — so the user lost
+  // their place. We remember where they were and put them back, but only
+  // after one of our own writes, and we stop the moment they scroll, click or
+  // type themselves.
+  const FC_SCROLL_KEY = '__fc_scroll';
+  const FC_SCROLL_TTL = 30000;
+  let fcLastWriteAt = 0;
+  function fcSaveScroll() {
+    try {
+      sessionStorage.setItem(FC_SCROLL_KEY, JSON.stringify({
+        path: location.pathname + location.search,
+        x: window.scrollX, y: window.scrollY, ts: Date.now(),
+      }));
+    } catch {}
+  }
+  // Re-apply (x, y) for up to `ms` while the page settles. Waits until the
+  // document is tall enough, corrects at most a few times, and accepts where
+  // the browser lands after a correction when it's within a viewport of the
+  // target (scroll-snap may nudge it to the nearest snap point) so we never
+  // fight the page's own snapping. Moves
+  // smaller than `tolerance` px are left alone (e.g. the browser's own scroll
+  // anchoring when edited text above the viewport changes height).
+  function fcHoldScroll(x, y, ms, tolerance = 2) {
+    const USER_INPUT = ['wheel', 'touchstart', 'keydown', 'mousedown'];
+    const until = Date.now() + ms;
+    let corrections = 0;
+    let stopped = false;
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      USER_INPUT.forEach((t) => window.removeEventListener(t, stop, true));
+    };
+    const tick = () => {
+      if (stopped) return;
+      if (Date.now() > until) { stop(); return; }
+      if (Math.abs(window.scrollY - y) <= tolerance && Math.abs(window.scrollX - x) <= tolerance) return;
+      const doc = document.documentElement;
+      if (doc.scrollHeight - window.innerHeight + 2 < y) return; // not rendered yet
+      if (corrections >= 5) { stop(); return; }
+      corrections++;
+      try { window.scrollTo({ left: x, top: y, behavior: 'instant' }); } catch { window.scrollTo(x, y); }
+      requestAnimationFrame(() => {
+        // Snapped to a nearby point → that's "here" now. A bigger move means
+        // something else scrolled the page again; correct on the next tick.
+        if (!stopped && Math.abs(window.scrollY - y) < window.innerHeight) { x = window.scrollX; y = window.scrollY; }
+      });
+    };
+    USER_INPUT.forEach((t) => window.addEventListener(t, stop, { capture: true, passive: true }));
+    const timer = setInterval(tick, 50);
+    tick();
+  }
+  function fcRestoreScrollAfterReload() {
+    let saved = null;
+    try {
+      saved = JSON.parse(sessionStorage.getItem(FC_SCROLL_KEY) || 'null');
+      sessionStorage.removeItem(FC_SCROLL_KEY);
+    } catch {}
+    if (!saved || saved.path !== location.pathname + location.search) return;
+    if (Date.now() - saved.ts > FC_SCROLL_TTL) return;
+    let navType = '';
+    try { navType = performance.getEntriesByType('navigation')[0].type; } catch {}
+    if (navType && navType !== 'reload') return;
+    fcHoldScroll(saved.x || 0, saved.y || 0, 5000);
+  }
+  // Covers reloads we don't trigger ourselves (Vite's full-reload after a
+  // write to a module with no HMR boundary).
+  window.addEventListener('pagehide', () => {
+    if (fcLastWriteAt && Date.now() - fcLastWriteAt < 15000) fcSaveScroll();
+  });
+  fcRestoreScrollAfterReload();
+
   function handleAgentMessage(data) {
     const cb = data.id != null ? pending.get(data.id) : null;
     if (cb) pending.delete(data.id);
 
     if (data.type === 'applied') {
+      fcLastWriteAt = Date.now();
+      // Guard the hot update that's about to land: a remount can jump the
+      // page (to the top, or to a hash an on-mount handler scrolls to).
+      fcHoldScroll(window.scrollX, window.scrollY, 2500, Math.max(100, window.innerHeight / 4));
       toast(`Saved → ${data.file}`, 'success');
       invalidateI18nMap();
       if (cb) cb(null, data);
-      // v0.14.0: a TODO is a source comment with zero rendered effect, yet the
-      // write still triggers an HMR update that can strand pages whose
-      // animations aren't HMR-safe (imperative canvas/WebGL) on a blank/black
-      // render until a full reload. Since there's nothing to see live, reload
-      // to a guaranteed-clean state. Edits are opt-in (they usually want live
-      // HMR). Toggle via plugin config `reloadAfterTodo` / `reloadAfterEdit`.
+      // v0.14.0: optional reload after a write, for pages whose imperative
+      // animations (canvas/WebGL) don't survive a hot update. v0.16.0: off by
+      // default for TODOs too — a TODO is now an in-place re-render with no
+      // remount — and the reload keeps the scroll position when it does run.
+      // Toggle via plugin config `reloadAfterTodo` / `reloadAfterEdit`.
       const isTodo = data.kind === 'todo';
       if ((isTodo && CFG.reloadAfterTodo) || (!isTodo && CFG.reloadAfterEdit)) {
-        setTimeout(() => { try { location.reload(); } catch {} }, 350);
+        setTimeout(() => { fcSaveScroll(); try { location.reload(); } catch {} }, 350);
       }
     } else if (data.type === 'rejected') {
       let detail = data.message || 'Edit rejected';

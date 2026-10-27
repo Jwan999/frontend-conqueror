@@ -43,6 +43,56 @@ let _agentChild = null;
 function relPath(root, p) {
   return path.relative(root, p).replace(/\\/g, '/');
 }
+
+// True when two .vue sources have identical <script> and <script setup>
+// blocks (content + attrs). Used to recognise template-only writes.
+function sameScriptBlocks(a, b, compilerSfc) {
+  if (a === b) return true;
+  let da, db;
+  try {
+    da = compilerSfc.parse(a).descriptor;
+    db = compilerSfc.parse(b).descriptor;
+  } catch { return false; }
+  const same = (x, y) => {
+    if (!x || !y) return !x && !y;
+    return x.content === y.content && JSON.stringify(x.attrs) === JSON.stringify(y.attrs);
+  };
+  return same(da.script, db.script) && same(da.scriptSetup, db.scriptSetup);
+}
+
+// v0.16.0: Nuxt's `nuxt:pages-macros-transform` plugin adds the page's
+// `?macro=true` module and the generated routes module to EVERY hot update of
+// a page file. Updating the routes module makes the router swap its route
+// records and remount the whole page — component state gone, first-visit
+// animations replayed — even when only the template changed (an inserted TODO
+// comment, a literal text edit). Both modules are derived from the file path
+// and the script block (definePageMeta) only, so when the script blocks are
+// unchanged they can't have changed either: drop them and let
+// @vitejs/plugin-vue do its normal in-place template re-render. Script edits
+// keep Nuxt's behaviour untouched. No-op outside Nuxt.
+const NUXT_PAGE_META_PLUGIN = 'nuxt:pages-macros-transform';
+const WRAPPED = Symbol.for('frontend-conqueror.wrappedHmr');
+function wrapNuxtPageHmr(plugins, isTemplateOnly) {
+  const plugin = (plugins || []).find((p) => p && p.name === NUXT_PAGE_META_PLUGIN);
+  const hook = plugin && plugin.handleHotUpdate;
+  if (!hook || hook[WRAPPED]) return;
+  const original = typeof hook === 'function' ? hook : hook.handler;
+  if (typeof original !== 'function') return;
+  const handler = async function (ctx) {
+    const result = await original.call(this, ctx);
+    if (!Array.isArray(result) || !isTemplateOnly(ctx.file)) return result;
+    const kept = result.filter((m) => {
+      let id = (m && (m.id || m.url)) || '';
+      try { id = decodeURIComponent(id); } catch {}
+      return !/[?&]macro=true\b/.test(id) && !/^virtual:nuxt:.*routes\.mjs$/.test(id);
+    });
+    return kept.length ? kept : result;
+  };
+  const wrapped = typeof hook === 'function' ? handler : { ...hook, handler };
+  wrapped[WRAPPED] = true;
+  plugin.handleHotUpdate = wrapped;
+}
+
 function escapeAttr(s) {
   return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -1041,12 +1091,12 @@ module.exports = function frontendConquerorPlugin(options = {}) {
     //            POST /api/report-issue and GET /api/issues by this value.
     // Without `gate`, Test mode shows a "configure gate" toast.
     gate: options.gate || null,
-    // v0.14.0: reload the page after a successful overlay write. A TODO is a
-    // source comment with no rendered effect, but the write still triggers an
-    // HMR update that can strand pages with HMR-fragile imperative animations
-    // (canvas/WebGL) on a blank render — so reload after TODO by default. Edits
-    // usually want the live HMR result, so they don't reload unless asked.
-    reloadAfterTodo: options.reloadAfterTodo !== false,
+    // v0.14.0: reload the page after a successful overlay write, for pages
+    // with HMR-fragile imperative animations (canvas/WebGL). v0.16.0: off by
+    // default for TODOs too — a template-only write is now an in-place
+    // re-render (see handleHotUpdate) — and the overlay restores the scroll
+    // position if a reload does happen. Opt back in with `true`.
+    reloadAfterTodo: options.reloadAfterTodo === true,
     reloadAfterEdit: options.reloadAfterEdit === true,
   };
 
@@ -1063,6 +1113,13 @@ module.exports = function frontendConquerorPlugin(options = {}) {
   // (the cross-component case where a child renders a prop and we want to
   // match it to the parent's i18n call).
   const i18nReferencesPerFile = new Map();
+  // v0.16.0: last source seen per .vue file (absolute id → code), so
+  // handleHotUpdate can tell a template-only write from one that touches the
+  // script. See handleHotUpdate below.
+  const vueSourcePerFile = new Map();
+  // absolute .vue path → true when the latest change left the script blocks
+  // untouched (set by handleHotUpdate, read by wrapNuxtPageHmr).
+  const templateOnlyChange = new Map();
 
   function loadDeps() {
     deps.compilerDom = resolveDep('@vue/compiler-dom', projectRoot);
@@ -1119,6 +1176,7 @@ module.exports = function frontendConquerorPlugin(options = {}) {
       }
 
       loadDeps();
+      if (config.command === 'serve') wrapNuxtPageHmr(config.plugins, (file) => templateOnlyChange.get(file) === true);
 
       // Locales: use the caller's list if given, otherwise take what's on disk.
       // Either way, say out loud when a locale file exists that the active list
@@ -1285,6 +1343,7 @@ module.exports = function frontendConquerorPlugin(options = {}) {
       if (id.includes('?')) return null;
       if (!id.endsWith('.vue')) return null;
       const fileRel = relPath(projectRoot, id);
+      vueSourcePerFile.set(id, code);
 
       // Scan the script block for editable strings AND collect i18n references
       // for cross-component picker ranking.
@@ -1308,6 +1367,22 @@ module.exports = function frontendConquerorPlugin(options = {}) {
         if (out) return { code: out, map: null };
       } catch {}
       return null;
+    },
+
+    // v0.16.0: keep template-only writes (a TODO comment, a literal text edit)
+    // a plain Vue re-render instead of a page remount. Records, per changed
+    // .vue file, whether its <script>/<script setup> blocks are byte-identical
+    // to the last version we saw; the Nuxt wrapper installed in
+    // configResolved (wrapNuxtPageHmr) reads that verdict. Returns nothing,
+    // so the update itself is left to the other plugins.
+    async handleHotUpdate(ctx) {
+      if (!deps.compilerSfc || !ctx.file.endsWith('.vue')) return;
+      const prev = vueSourcePerFile.get(ctx.file);
+      let next;
+      try { next = await ctx.read(); } catch { templateOnlyChange.delete(ctx.file); return; }
+      vueSourcePerFile.set(ctx.file, next);
+      if (prev == null) templateOnlyChange.delete(ctx.file);
+      else templateOnlyChange.set(ctx.file, sameScriptBlocks(prev, next, deps.compilerSfc));
     },
   };
 };

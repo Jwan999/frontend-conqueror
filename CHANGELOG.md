@@ -10,6 +10,19 @@ When you read this in a project that depends on the plugin: each entry describes
 
 Nothing yet. Open issues are tracked at https://github.com/Jwan999/frontend-conqueror/issues.
 
+## [0.16.0] — 2026-10-27
+
+### Fixed
+- **Adding a TODO no longer reloads the page and throws you back to the top.** Since v0.14.0 `reloadAfterTodo` defaulted on, so every TODO ended in `location.reload()`. On a client-rendered page (Nuxt `ssr:false`, a long scroll-snap page) the content isn't there yet when the browser tries to restore scroll, so you landed at the top and had to find your place again. Even without that reload, on Nuxt every write to a page `.vue` **remounted the whole page**: Nuxt's `nuxt:pages-macros-transform` adds the page's `?macro=true` module and the generated `routes.mjs` to every hot update of a page file, and updating `routes.mjs` makes the router swap its route records — component state reset, on-mount animations replayed, on-mount hash scrolling re-run.
+  - **Template-only writes are now an in-place re-render.** The plugin records whether a changed `.vue` file's `<script>`/`<script setup>` blocks are byte-identical to the previous version and, when they are, drops the macro and routes modules from Nuxt's update (both are derived only from the file path and the script block, so they can't have changed). `@vitejs/plugin-vue` then does its normal template re-render: no remount, no reload, scroll and component state intact, and the re-rendered `data-edit-source` offsets stay correct for the next TODO/edit. Covers TODO comments and literal template text edits. Script edits keep Nuxt's behaviour untouched; plain Vite + Vue projects were already re-rendering and are unaffected.
+  - **The overlay keeps your place when a write still reloads or remounts.** After a write it remembers the scroll position; on a reload (the opt-in `reloadAfterTodo`/`reloadAfterEdit`, or Vite's own full reload after e.g. an i18n module with no HMR boundary) it restores it once the page is tall enough, and after a hot update that remounts (script-literal / i18n edits) it puts the page back if a remount jumped it (to the top, or to a hash an on-mount handler scrolls to). Only after the overlay's own writes, only for the same path, stops the moment you scroll/click/type, and accepts a nearby scroll-snap landing instead of fighting the page.
+
+### Changed
+- **`reloadAfterTodo` now defaults to `false`.** A TODO is an in-place re-render now, so there's nothing to reload for. Pages with HMR-fragile imperative animations (canvas/WebGL) can opt back in with `reloadAfterTodo: true` — the reload now restores the scroll position.
+
+### Migration
+- Re-pin to `#v0.16.0` and `npm install`, then **restart the dev server** (the plugin's HMR handling and the new default are read at startup; the overlay part takes effect on the next page load). If you relied on the post-TODO reload, pass `reloadAfterTodo: true`.
+
 ## [0.15.2] — 2026-08-17
 
 ### Fixed
